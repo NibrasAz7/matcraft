@@ -1,0 +1,14 @@
+[package]
+name = "matlang"
+description = "MatCraft language engine: lexer, parser and tree-walk interpreter for M-code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+matcore = { path = "../matcore" }
+matplot = { path = "../matplot" }
+flate2 = "1.1"

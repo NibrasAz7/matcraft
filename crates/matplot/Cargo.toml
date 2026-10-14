@@ -1,0 +1,16 @@
+[package]
+name = "matplot"
+description = "MatCraft plotting: figure model and headless SVG renderer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+png = "0.18"
+resvg = "0.45"
+flate2 = "1.1"

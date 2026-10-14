@@ -1,0 +1,13 @@
+[package]
+name = "matcraft_mcp"
+description = "MatCraft MCP server: JSON-RPC over stdio exposing the engine commands."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+matcraft_engine = { path = "../engine" }
+serde_json = "1"

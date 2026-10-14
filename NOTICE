@@ -1,0 +1,9 @@
+MatCraft
+Copyright 2026 The MatCraft contributors
+
+This product includes software developed for the ArtCraft ecosystem.
+Licensed under MIT OR Apache-2.0 — see LICENSE-MIT and LICENSE-APACHE.
+
+MatCraft is an original clean-room implementation of an M-code-compatible
+numerical environment. It contains no MathWorks code, documentation text,
+artwork or other proprietary material.
