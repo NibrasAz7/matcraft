@@ -3106,6 +3106,141 @@ impl Session {
                     _ => Err(LangError::new(format!("unhandled builtin '{name}'"), 0)),
                 }
             }
+            "deg2rad" | "rad2deg" | "sinc" | "db2pow" | "pow2db" | "uint8" | "rectpuls" | "tripuls" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_matrix()?;
+                let f: fn(f64) -> f64 = match name {
+                    "deg2rad" => |x| x * (std::f64::consts::PI / 180.0),
+                    "rad2deg" => |x| x * (180.0 / std::f64::consts::PI),
+                    "sinc" => |x| {
+                        if x == 0.0 {
+                            1.0
+                        } else {
+                            let t = std::f64::consts::PI * x;
+                            t.sin() / t
+                        }
+                    },
+                    "db2pow" => |x| 10f64.powf(x / 10.0),
+                    "pow2db" => |x| 10.0 * x.log10(),
+                    "uint8" => |x| x.round().clamp(0.0, 255.0),
+                    "rectpuls" => |x| if x.abs() <= 0.5 { 1.0 } else { 0.0 },
+                    _ => |x| (1.0 - x.abs()).max(0.0), // tripuls
+                };
+                Ok(Some(mat_or_num(m.map(f))))
+            }
+            // Constructor forms: bare `Inf`/`NaN`/`eps` resolve via constant();
+            // these arms cover `Inf(1,n)`, `NaN(size)`, `eps(x)`.
+            "inf" | "Inf" | "nan" | "NaN" => {
+                let v = self.eval_args(args)?;
+                let fill = if name == "inf" || name == "Inf" { f64::INFINITY } else { f64::NAN };
+                if v.is_empty() {
+                    return Ok(Some(Value::Num(fill)));
+                }
+                let (r, c) = self.dims(args)?;
+                check_elems(r.saturating_mul(c))?;
+                Ok(Some(mat_or_num(Matrix::from_col_major(r, c, vec![fill; r * c]).map_err(lang)?)))
+            }
+            "eps" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    None => Ok(Some(Value::Num(f64::EPSILON))),
+                    Some(val) => {
+                        let m = val.to_matrix()?;
+                        Ok(Some(mat_or_num(m.map(|x| x.abs() * f64::EPSILON))))
+                    }
+                }
+            }
+            "mkdir" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Str(s)) => {
+                        std::fs::create_dir_all(s).map_err(|e| LangError::new(format!("mkdir: {e}"), 0))?;
+                        Ok(Some(Value::Num(1.0)))
+                    }
+                    _ => Err(LangError::new("mkdir needs a directory name", 0)),
+                }
+            }
+            "randperm" => {
+                let v = self.eval_args(args)?;
+                let n = v.scalar_at(0)? as usize;
+                check_elems(n)?;
+                let k = if v.len() > 1 { v.scalar_at(1)? as usize } else { n };
+                if k > n {
+                    return Err(LangError::new("randperm: k cannot exceed n", 0));
+                }
+                let mut p: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+                // Fisher–Yates shuffle over the session PRNG.
+                for i in (1..n).rev() {
+                    let j = ((self.next_f64() * (i + 1) as f64) as usize).min(i);
+                    p.swap(i, j);
+                }
+                p.truncate(k);
+                Ok(Some(Value::Mat(Matrix::row_vector(p))))
+            }
+            "normrnd" => {
+                let v = self.eval_args(args)?;
+                let mu = v.scalar_at(0)?;
+                let sg = v.scalar_at(1)?;
+                let (r, c) = match v.len() {
+                    0..=2 => (1, 1),
+                    3 => (v.scalar_at(2)? as usize, 1),
+                    _ => (v.scalar_at(2)? as usize, v.scalar_at(3)? as usize),
+                };
+                check_elems(r.saturating_mul(c))?;
+                let mut data = Vec::with_capacity(r.saturating_mul(c));
+                for _ in 0..r.saturating_mul(c) {
+                    let mut acc = 0.0;
+                    for _ in 0..12 {
+                        acc += self.next_f64();
+                    }
+                    data.push(mu + sg * (acc - 6.0));
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major(r, c, data).map_err(lang)?)))
+            }
+            "assert" => {
+                let v = self.eval_args(args)?;
+                let ok = match v.first() {
+                    Some(val) => val.truthy()?,
+                    None => false,
+                };
+                if ok {
+                    Ok(None)
+                } else {
+                    let msg = match v.get(1) {
+                        Some(Value::Str(s)) => s.clone(),
+                        Some(val) => fmt_value(val, false).to_string(),
+                        None => "assertion failed".to_string(),
+                    };
+                    Err(LangError::new(msg, 0))
+                }
+            }
+            "rng" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    None => Ok(Some(Value::Num(self.rng as f64))),
+                    Some(Value::Str(s)) if s == "default" => {
+                        self.rng = 0x9E3779B97F4A7C15;
+                        Ok(None)
+                    }
+                    Some(Value::Str(s)) if s == "shuffle" => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let t = {
+                            #[allow(clippy::disallowed_methods)]
+                            let now = std::time::SystemTime::now();
+                            now.duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64 ^ d.as_secs()).unwrap_or(0x2545F4914F6CDD1D)
+                        };
+                        #[cfg(target_arch = "wasm32")]
+                        let t = 0x2545F4914F6CDD1Du64;
+                        self.rng = t | 1;
+                        Ok(None)
+                    }
+                    Some(val) => {
+                        let s = val.scalar()?;
+                        self.rng = (s as u64) | 1;
+                        Ok(None)
+                    }
+                }
+            }
             "disp" | "display" => {
                 let v = self.eval_args(args)?;
                 match v.first() {
@@ -4017,17 +4152,88 @@ impl Session {
                 let v = self.eval_args(args)?;
                 for x in &v {
                     if let Value::Str(s) = x {
-                        let dir = std::path::PathBuf::from(s);
-                        if name == "addpath" {
-                            if !self.paths.contains(&dir) {
-                                self.paths.push(dir);
+                        // `addpath(genpath(pwd))` passes a `;`-separated list
+                        // (MATLAB pathsep on all platforms here).
+                        for part in s.split(';') {
+                            if part.is_empty() {
+                                continue;
                             }
-                        } else {
-                            self.paths.retain(|p| p != &dir);
+                            let dir = std::path::PathBuf::from(part);
+                            if name == "addpath" {
+                                if !self.paths.contains(&dir) {
+                                    self.paths.push(dir);
+                                }
+                            } else {
+                                self.paths.retain(|p| p != &dir);
+                            }
                         }
                     }
                 }
                 Ok(None)
+            }
+            "genpath" => {
+                let v = self.eval_args(args)?;
+                let root = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("genpath needs a directory", 0)),
+                };
+                fn walk(d: &std::path::Path, out: &mut Vec<String>, depth: usize) {
+                    if depth > 32 {
+                        return;
+                    }
+                    if let Ok(rd) = std::fs::read_dir(d) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p.is_dir() {
+                                out.push(p.display().to_string());
+                                walk(&p, out, depth + 1);
+                            }
+                        }
+                    }
+                }
+                let mut dirs = Vec::new();
+                walk(std::path::Path::new(&root), &mut dirs, 0);
+                Ok(Some(Value::Str(dirs.join(";"))))
+            }
+            "fullfile" => {
+                let v = self.eval_args(args)?;
+                let mut p = std::path::PathBuf::new();
+                for x in &v {
+                    if let Value::Str(s) = x {
+                        p.push(s);
+                    }
+                }
+                Ok(Some(Value::Str(p.display().to_string())))
+            }
+            "csvread" => {
+                let v = self.eval_args(args)?;
+                let fname = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("csvread needs a filename", 0)),
+                };
+                let text = std::fs::read_to_string(&fname).map_err(|e| LangError::new(format!("csvread: {e}"), 0))?;
+                let mut rows: Vec<Vec<f64>> = Vec::new();
+                for line in text.lines() {
+                    let row: Vec<f64> = line
+                        .split([',', ';', '\t', ' '])
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.trim().parse::<f64>().unwrap_or(f64::NAN))
+                        .collect();
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                }
+                let r = rows.len();
+                let c = rows.iter().map(|x| x.len()).max().unwrap_or(0);
+                let mut data = vec![0.0; r * c];
+                for (i, row) in rows.iter().enumerate() {
+                    for (j, &val) in row.iter().enumerate() {
+                        if let Some(slot) = data.get_mut(j * r + i) {
+                            *slot = val;
+                        }
+                    }
+                }
+                Ok(Some(Value::Mat(Matrix::from_col_major(r, c, data).map_err(lang)?)))
             }
             "path" => {
                 for d in &self.paths {
@@ -4384,6 +4590,56 @@ impl Session {
                     "ylim" => fig.ylim = Some(lim),
                     _ => fig.zlim = Some(lim),
                 }
+                Ok(None)
+            }
+            "axis" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    None => {
+                        let fig = self.figure_mut();
+                        let (x0, x1) = fig.xlim.unwrap_or((f64::NAN, f64::NAN));
+                        let (y0, y1) = fig.ylim.unwrap_or((f64::NAN, f64::NAN));
+                        Ok(Some(Value::Mat(Matrix::row_vector(vec![x0, x1, y0, y1]))))
+                    }
+                    Some(Value::Str(s)) => {
+                        let fig = self.figure_mut();
+                        match s.as_str() {
+                            "ij" => fig.yrev = true,
+                            "xy" => fig.yrev = false,
+                            "auto" | "normal" | "tight" => {
+                                fig.xlim = None;
+                                fig.ylim = None;
+                                fig.zlim = None;
+                            }
+                            // equal/square/off/on/fill/image/vis3d/manual:
+                            // accepted; no visible effect (documented gap).
+                            _ => {}
+                        }
+                        Ok(None)
+                    }
+                    Some(val) => {
+                        let m = val.to_matrix()?;
+                        let d = m.data();
+                        if d.len() != 4 && d.len() != 6 {
+                            return Err(LangError::new("axis needs [x0 x1 y0 y1]", 0));
+                        }
+                        let fig = self.figure_mut();
+                        fig.xlim = Some((d[0], d[1]));
+                        fig.ylim = Some((d[2], d[3]));
+                        if d.len() == 6 {
+                            fig.zlim = Some((d[4], d[5]));
+                        }
+                        Ok(None)
+                    }
+                }
+            }
+            "box" => {
+                let v = self.eval_args(args)?;
+                let fig = self.figure_mut();
+                fig.boxed = match v.first() {
+                    Some(Value::Str(s)) => s != "off",
+                    _ => !fig.boxed,
+                };
                 Ok(None)
             }
             "zlabel" => {
@@ -7034,6 +7290,29 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "stairs",
     "xscale",
     "yscale",
+    "deg2rad",
+    "rad2deg",
+    "sinc",
+    "db2pow",
+    "pow2db",
+    "uint8",
+    "rectpuls",
+    "tripuls",
+    "randperm",
+    "normrnd",
+    "assert",
+    "rng",
+    "genpath",
+    "fullfile",
+    "csvread",
+    "axis",
+    "box",
+    "inf",
+    "Inf",
+    "nan",
+    "NaN",
+    "eps",
+    "mkdir",
 ];
 
 fn lang(e: MatError) -> LangError {
@@ -8074,6 +8353,56 @@ legend('sig'); grid on; saveas('{f}')"
         assert_eq!(fig.zlim, Some((0.0, 5.0)));
         assert_eq!(fig.zlabel.as_deref(), Some("h"));
         assert_eq!(fig.clim, Some((0.0, 2.0)));
+
+        // axis([..]) set + query, axis ij/xy, box off.
+        s.run("axis([0 10 -1 1]); v = axis; axis ij; box off").unwrap();
+        if let Some(Value::Mat(m)) = s.get("v") {
+            assert_eq!(m.data(), &[0.0, 10.0, -1.0, 1.0]);
+        } else {
+            panic!("axis query failed");
+        }
+        assert!(s.figs[0].yrev && !s.figs[0].boxed);
+        s.run("axis xy; box on").unwrap();
+        assert!(!s.figs[0].yrev && s.figs[0].boxed);
+    }
+
+    #[test]
+    fn corpus_gap_builtins() {
+        let mut s = Session::new();
+        // Parenthesised for-header (real-world syntax).
+        s.run("t = 0; for(i=1:4) t = t + i; end").unwrap();
+        assert_eq!(s.get("t").unwrap().scalar().unwrap(), 10.0);
+
+        // Cheap builtins surfaced by the GitHub corpus sweep.
+        s.run("d = deg2rad(180)").unwrap();
+        assert!((s.get("d").unwrap().scalar().unwrap() - std::f64::consts::PI).abs() < 1e-12);
+        s.run("x = sinc(0); y = sinc(1)").unwrap();
+        assert_eq!(s.get("x").unwrap().scalar().unwrap(), 1.0);
+        assert!(s.get("y").unwrap().scalar().unwrap().abs() < 1e-12);
+        s.run("u = uint8([-3 300 7.6])").unwrap();
+        if let Some(Value::Mat(m)) = s.get("u") {
+            assert_eq!(m.data(), &[0.0, 255.0, 8.0]);
+        }
+        s.run("p = sort(randperm(8))").unwrap();
+        if let Some(Value::Mat(m)) = s.get("p") {
+            assert_eq!(m.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        }
+        s.run("rng(5); a = rand; rng(5); b = rand").unwrap();
+        assert_eq!(s.get("a").unwrap().scalar().unwrap(), s.get("b").unwrap().scalar().unwrap());
+        assert!(s.run("assert(1 == 2)").is_err());
+        s.run("assert(1 == 1)").unwrap();
+        s.run("r = normrnd(3, 1, 2, 4)").unwrap();
+        if let Some(Value::Mat(m)) = s.get("r") {
+            assert_eq!(m.shape(), (2, 4));
+        }
+        s.run("f = fullfile('a', 'b', 'c.m')").unwrap();
+        if let Some(Value::Str(f)) = s.get("f") {
+            assert!(f.ends_with("c.m") && f.contains('b'));
+        }
+        s.run("rp = rectpuls(0.4); tp = tripuls(0.9); dp = db2pow(20)").unwrap();
+        assert_eq!(s.get("rp").unwrap().scalar().unwrap(), 1.0);
+        assert!((s.get("tp").unwrap().scalar().unwrap() - 0.1).abs() < 1e-12);
+        assert!((s.get("dp").unwrap().scalar().unwrap() - 100.0).abs() < 1e-9);
     }
 
     #[test]

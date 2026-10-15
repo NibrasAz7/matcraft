@@ -111,12 +111,12 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 
 | Group | Functions |
 | --- | --- |
-| Construction | `zeros ones eye rand randn randi linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware) |
+| Construction | `zeros ones eye rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware) |
 | Shape | `size numel length ndims` (multi-output `[r,c] = size(A)`) |
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
 | Running | `cumsum cumprod diff sort unique find` (`find` multi-output) |
-| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross` |
+| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` |
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
 | DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`) |
 | Solvers | `fzero fminsearch integral quad` — first arg is a function name string (`fzero('cos', 1)`) |
@@ -126,14 +126,14 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` |
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
-| Constants | `pi eps inf nan true false` |
-| Workspace | `who whos clear disp display format save load type` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table) |
-| Environment | `addpath rmpath path pwd cd dir ls exist which eval error warning clc home tic toc pause` |
+| Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
+| Workspace | `who whos clear disp display format save load type assert rng normrnd` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`) |
+| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists) |
 | Output | `fprintf sprintf` (`%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
 | Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`) |
 | Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed) |
 | Plotting | `plot scatter stem bar area stairs errorbar histogram` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column |
-| Axes | `hold on/off`, `grid on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
+| Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
 | Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
 | 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `mesh(Z)`/`mesh(X,Y,Z)` — orthographic projection under `view` |

@@ -170,3 +170,15 @@
   `colormap` (parula/jet/hot/gray), `colorbar`, `caxis`/`clim`; PNG
   (resvg) and PDF (embedded raster) export via `saveas`/`exportgraphics`
   extension or `print -dsvg/-dpng/-dpdf`.
+- Wild-corpus sweep (2025-10): 638 real-world `.m` files pulled from 32
+  GitHub repos across 8 domains, all last-pushed pre-2022; run through
+  `matcraft-cli run` (see `docs/wild-corpus.md`). Findings fixed this
+  round: `for(i=…)` parenthesised loop headers, `cd ..`/`cd ../x`
+  bare-dot command args, and the cheap-builtin tier — `deg2rad`
+  `rad2deg` `sinc` `randperm` `normrnd` `assert` `rng` `fullfile`
+  `genpath` `csvread` `mkdir` `eps()`/`Inf(n,m)`/`NaN(n)` constructors,
+  `axis`/`box`, `db2pow`/`pow2db`, `uint8`, `rectpuls`/`tripuls`,
+  `addpath` splitting `;`-lists. Ranked gaps surfaced: `@` anonymous
+  functions/handles (G31 — 91 parse failures), `classdef` OOP (G32),
+  N-D indexing (G22 tail), image I/O (G34). Initial GitHub import pushed
+  to `github.com/NibrasAz7/matcraft`.

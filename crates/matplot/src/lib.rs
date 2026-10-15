@@ -184,7 +184,7 @@ impl LineSpec {
 
 /// A snapshot of one axes' drawing state — the per-axes half of `Figure`,
 /// used to stash subplot tiles that are not currently selected.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Axes {
     pub series: Vec<Series>,
     pub title: Option<String>,
@@ -209,6 +209,8 @@ pub struct Axes {
     pub colorbar: bool,
     /// `axis ij`/`imagesc` — y axis increases downward (row 1 at top).
     pub yrev: bool,
+    /// `box on` (default) — draw the axes frame; `box off` hides it.
+    pub boxed: bool,
     pub drawn: usize,
 }
 
@@ -235,8 +237,37 @@ impl Axes {
         f.clim = self.clim;
         f.colorbar = self.colorbar;
         f.yrev = self.yrev;
+        f.boxed = self.boxed;
         f.drawn = self.drawn;
         f
+    }
+}
+
+impl Default for Axes {
+    fn default() -> Self {
+        // `boxed` defaults to true (`box on`); everything else zero/none.
+        Axes {
+            series: Vec::new(),
+            title: None,
+            xlabel: None,
+            ylabel: None,
+            legend: Vec::new(),
+            grid: false,
+            xlim: None,
+            ylim: None,
+            zlim: None,
+            zlabel: None,
+            hold: false,
+            xlog: false,
+            ylog: false,
+            view: (-37.5, 30.0),
+            cmap: Colormap::Parula,
+            clim: None,
+            colorbar: false,
+            yrev: false,
+            boxed: true,
+            drawn: 0,
+        }
     }
 }
 
@@ -290,6 +321,8 @@ pub struct Figure {
     pub colorbar: bool,
     /// `imagesc`/`axis ij` — y axis increases downward.
     pub yrev: bool,
+    /// `box on` (default) — draw the axes frame; `box off` hides it.
+    pub boxed: bool,
     /// `subplot` tiling; when set, `to_svg` renders one axes per tile.
     pub sub: Option<Subplot>,
     /// Series drawn so far; drives the default colour cycle.
@@ -382,6 +415,7 @@ impl Figure {
             clim: None,
             colorbar: false,
             yrev: false,
+            boxed: true,
             sub: None,
             drawn: 0,
         }
@@ -413,6 +447,7 @@ impl Figure {
             clim: self.clim,
             colorbar: self.colorbar,
             yrev: self.yrev,
+            boxed: self.boxed,
             drawn: self.drawn,
         }
     }
@@ -437,6 +472,7 @@ impl Figure {
         self.clim = a.clim;
         self.colorbar = a.colorbar;
         self.yrev = a.yrev;
+        self.boxed = a.boxed;
         self.drawn = a.drawn;
     }
 
@@ -840,11 +876,13 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
         ));
     }
 
-    // Axes box.
-    o.push_str(&format!(
-        "<rect x=\"{ax:.2}\" y=\"{ay:.2}\" width=\"{aw:.2}\" height=\"{ah:.2}\" \
+    // Axes box (`box off` hides the frame).
+    if fig.boxed {
+        o.push_str(&format!(
+            "<rect x=\"{ax:.2}\" y=\"{ay:.2}\" width=\"{aw:.2}\" height=\"{ah:.2}\" \
 fill=\"none\" stroke=\"{tick_col}\" stroke-width=\"1.2\"/>\n"
-    ));
+        ));
+    }
     // Clip subsequent drawing to the axes box.
     o.push_str(&format!("<clipPath id=\"{clip_id}\"><rect x=\"{ax:.2}\" y=\"{ay:.2}\" width=\"{aw:.2}\" height=\"{ah:.2}\"/></clipPath>\n"));
     o.push_str(&format!("<g clip-path=\"url(#{clip_id})\">\n"));

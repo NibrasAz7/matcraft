@@ -52,6 +52,10 @@ impl Parser {
         self.toks.get(self.pos + 1).map(|l| &l.tok).unwrap_or(&Tok::Eof)
     }
 
+    fn peek3(&self) -> &Tok {
+        self.toks.get(self.pos + 2).map(|l| &l.tok).unwrap_or(&Tok::Eof)
+    }
+
     /// Whitespace preceded the token at `pos`?
     fn ws_before(&self, pos: usize) -> bool {
         self.toks.get(pos).map(|l| l.ws_before).unwrap_or(false)
@@ -164,7 +168,11 @@ impl Parser {
         // Triggered when a statement starts with Ident followed by a word-ish
         // token (Ident/Num/Str), e.g. `format long`, `clear x`, `disp hello`.
         if let Tok::Ident(name) = self.peek().clone() {
-            if matches!(self.peek2(), Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+            // `cd ..` / `cd ../x`: a whitespace-separated `..`/`./`/`..\` is a
+            // command argument, not field access (glued `x.y` has no ws_before).
+            let dot_path =
+                matches!(self.peek2(), Tok::Dot) && self.ws_before(self.pos + 1) && matches!(self.peek3(), Tok::Dot | Tok::Slash | Tok::Backslash);
+            if matches!(self.peek2(), Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) || dot_path {
                 self.next();
                 let mut args = Vec::new();
                 loop {
@@ -185,6 +193,12 @@ impl Parser {
                         Tok::Minus => {
                             self.next();
                             "-".to_string()
+                        }
+                        // Leading `.` of a `..`/`./` path arg; the glued-continuation
+                        // loop below absorbs the rest (`..`, `../x`, `..\x`).
+                        Tok::Dot => {
+                            self.next();
+                            ".".to_string()
                         }
                         _ => break,
                     };
@@ -302,12 +316,20 @@ impl Parser {
 
     fn parse_for(&mut self, depth: usize) -> Result<Stmt, LangError> {
         self.next(); // 'for'
+                     // `for(i=1:n)` — MATLAB accepts parens around the loop header.
+        let paren = matches!(self.peek(), Tok::LParen);
+        if paren {
+            self.next();
+        }
         let var = match self.next() {
             Tok::Ident(n) => n,
             t => return self.err(format!("expected loop variable, found {t:?}")),
         };
         self.expect(&Tok::Eq)?;
         let iter = self.expr(depth)?;
+        if paren {
+            self.expect(&Tok::RParen)?;
+        }
         self.skip_inline_separators();
         let body = self.block(&["end"], depth)?;
         self.close_block()?;

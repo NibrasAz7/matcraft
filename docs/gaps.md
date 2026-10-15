@@ -36,6 +36,10 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | ~~G17~~ | ~~`~` ignore-output, comma-separated lists~~ | **Done:** `~` on `[a, ~, b] = f()` LHS and in function output/param lists; comma-separated lists — `c{1:3}` expands in call args (`f(c{:})`, `varargin`), `[s.f]`/`{c{:}}` literals, `[a,b] = c{1:2}` multi-assign, `A(c{:})` index positions. `end` in function files still open. |
 | ~~G17b~~ | ~~No char→double promotion~~ | **Done:** `Value::to_numeric` — chars promote to code-point doubles in arithmetic, comparisons, `'` transpose, `x(i)` numeric writes, `[…]` literals; `['a' 'b']`/`[72 'i']` stay char; `''` is `0×0`. Remaining: char arrays are still row-only (no 2-D char matrix → `char` on multi-element cellstr unsupported). |
 | ~~G17c~~ | ~~Cell-blind shape builtins~~ | **Done:** `reshape`/`repmat`/`fliplr`/`flipud`/`cat`/`horzcat`/`vertcat` on cells, `num2cell(A,dim)` + char, `char(cellstr)` (scalar), `c(:,1)=[]`/`c(1,:)=[]` row/col delete, `A(i)=[]` matrix deletion (bounds-checked, vectors keep orientation). |
+| G31 | No `@` handles / anonymous functions | **#1 corpus blocker** (91 of ~128 parse failures in `docs/wild-corpus.md`): `f = @(x) x.^2`, `@sin`, `fminsearch(@(x)…)`, `cellfun(@…, c)`. Needs `Value::Func` (handle) + closure capture of the defining scope. |
+| G32 | No `classdef` / OOP | `classdef Foo < handle`, `properties`/`methods`/`events`, `obj.prop`, `obj.method()`. Big lift; the corpus hits it rarely (2 files) but real-world MATLAB uses it. |
+| ~~G33~~ | ~~Corpus cheap wins~~ | **Done** (2025 sweep): `for(i=…)` paren headers, `cd ..`/`cd ../x` bare-dot command args, `deg2rad` `rad2deg` `sinc` `randperm` `normrnd` `assert` `rng` `fullfile` `genpath` `csvread` `mkdir` `eps()`/`Inf(n,m)`/`NaN(n)` constructors, `axis`/`box`, `db2pow`/`pow2db`, `uint8`, `rectpuls`/`tripuls`, `addpath` splits `;`-lists. |
+| G34 | Image I/O | `imread`/`imwrite`/`imshow`/`im2double` — 22 corpus hits; needs N-D arrays (G22) for HxWx3 and an image codec (PNG at least). |
 
 ## P3 — numerics depth
 

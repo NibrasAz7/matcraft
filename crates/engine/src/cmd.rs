@@ -32,7 +32,7 @@ pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
 /// functions` so both print the same catalogue. A test in this module keeps
 /// it in lock-step with `matlang::BUILTIN_NAMES`.
 pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
-    ("construction", "zeros ones eye rand randn randi linspace logspace"),
+    ("construction", "zeros ones eye rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
     ("size/shape", "size numel length ndims reshape squeeze transpose ctranspose repmat"),
     ("matrix ops", "diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90 meshgrid"),
     ("cells", "cell iscell iscellstr cell2mat num2cell celldisp"),
@@ -41,16 +41,16 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("linear algebra", "det inv norm dot cross eig svd qr lu chol rref pinv rank cond trace null orth"),
     ("reductions", "sum mean prod min max std var median any all"),
     ("running/sorting", "cumsum cumprod diff sort unique find"),
-    ("elementwise", "abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2"),
+    ("elementwise", "abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 deg2rad rad2deg db2pow pow2db uint8"),
     ("types/predicates", "isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isreal isa isequal isequaln"),
     ("complex", "complex real imag conj angle"),
     ("poly/signal", "polyval polyfit roots poly conv deconv interp1 trapz histcounts"),
-    ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin"),
+    ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls"),
     ("solvers", "fzero fminsearch integral quad"),
     ("strings", "num2str str2double str2num strcmp strcmpi strcat upper lower strtrim strrep strfind double logical char"),
-    ("workspace/env", "eval error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk disp display format fprintf sprintf who whos clear"),
-    ("files/path", "save load type addpath rmpath path pwd cd dir ls"),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim imagesc image pie contour plot3 surf mesh saveas exportgraphics print"),
+    ("workspace/env", "eval error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk disp display format fprintf sprintf who whos clear assert rng normrnd"),
+    ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile csvread mkdir"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image pie contour plot3 surf mesh saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.
