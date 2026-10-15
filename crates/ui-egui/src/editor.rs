@@ -16,11 +16,16 @@ pub struct Editor {
     pub text: String,
     /// One-line status under the buttons (saved/error notes).
     pub status: String,
+    /// Unsaved changes — the document tab shows `*` like MATLAB.
+    pub dirty: bool,
+    /// Set by the toolstrip's Run Selection; consumed on the next `ui` pass
+    /// (the selection range only exists while the TextEdit is drawn).
+    pub want_run_selection: bool,
 }
 
 impl Editor {
     pub fn new() -> Self {
-        Editor { path: String::new(), text: "% MatCraft script\n".to_string(), status: String::new() }
+        Editor { path: String::new(), text: "% MatCraft script\n".to_string(), status: String::new(), dirty: false, want_run_selection: false }
     }
 
     /// Load a file into the buffer (also used by `apps/matcraft file.m`).
@@ -30,6 +35,7 @@ impl Editor {
                 self.text = t;
                 self.path = path.to_string_lossy().to_string();
                 self.status.clear();
+                self.dirty = false;
             }
             Err(e) => self.status = format!("cannot open {}: {e}", path.display()),
         }
@@ -47,7 +53,10 @@ impl Editor {
             }
         }
         match std::fs::write(&self.path, &self.text) {
-            Ok(()) => self.status = format!("saved {}", self.path),
+            Ok(()) => {
+                self.status = format!("saved {}", self.path);
+                self.dirty = false;
+            }
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
@@ -57,6 +66,7 @@ impl Editor {
         self.path.clear();
         self.text = "% MatCraft script\n".to_string();
         self.status.clear();
+        self.dirty = false;
     }
 
     /// Draw the pane. Returns the command for the app to run.
@@ -104,8 +114,12 @@ impl Editor {
                 ui.fonts_mut(|f| f.layout_job(job))
             })
             .show(ui);
+        if output.response.changed() {
+            self.dirty = true;
+        }
         // F9 (or the button above) evaluates the highlighted selection.
-        if (ui.input(|i| i.key_pressed(egui::Key::F9)) && output.response.has_focus()) || matches!(cmd, Some(EditorCmd::RunSelection)) {
+        let want_sel = std::mem::take(&mut self.want_run_selection);
+        if (ui.input(|i| i.key_pressed(egui::Key::F9)) && output.response.has_focus()) || matches!(cmd, Some(EditorCmd::RunSelection)) || want_sel {
             if let Some(sel) = output.cursor_range.and_then(|cr| {
                 let n = self.text.chars().count();
                 let (a, b) = if cr.primary.index <= cr.secondary.index {

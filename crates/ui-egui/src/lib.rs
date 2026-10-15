@@ -14,6 +14,7 @@ pub mod figure;
 mod files;
 mod history;
 mod repl;
+mod ribbon;
 mod workspace;
 
 use std::sync::mpsc::Receiver;
@@ -27,6 +28,7 @@ use figure::Rasterizer;
 use files::FileCmd;
 use history::HistCmd;
 use repl::Repl;
+use ribbon::{RibbonCmd, Tab as RibbonTab};
 use workspace::WsCmd;
 
 /// One open document tab in the centre area.
@@ -91,11 +93,20 @@ pub struct MatApp {
     /// Workspace rename dialog: the variable being renamed + name field.
     ws_rename: Option<String>,
     ws_rename_buf: String,
+    /// Open toolstrip tab (HOME/PLOTS/EDITOR/VIEW).
+    ribbon_tab: RibbonTab,
+    /// Path-bar navigation: dirs visited back/forward plus recents.
+    cd_back: Vec<std::path::PathBuf>,
+    cd_fwd: Vec<std::path::PathBuf>,
+    cd_recent: std::collections::VecDeque<std::path::PathBuf>,
+    /// The Preferences window is open.
+    prefs_open: bool,
 }
 
 impl MatApp {
     /// `eframe::run_native` entry point.
-    pub fn new(_cc: &eframe::CreationContext<'_>, opts: MatAppOptions) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, opts: MatAppOptions) -> Self {
+        cc.egui_ctx.set_visuals(ribbon::studio_visuals());
         Self::with_options(opts)
     }
 
@@ -127,6 +138,11 @@ impl MatApp {
             hist_sel: std::collections::BTreeSet::new(),
             ws_rename: None,
             ws_rename_buf: String::new(),
+            ribbon_tab: RibbonTab::Home,
+            cd_back: Vec::new(),
+            cd_fwd: Vec::new(),
+            cd_recent: std::collections::VecDeque::new(),
+            prefs_open: false,
         };
         let version = match app.session.execute("engine.version", json!({})) {
             Ok(v) => v.get("version").and_then(Json::as_str).unwrap_or("?").to_string(),
@@ -163,6 +179,10 @@ impl MatApp {
             self.doc_sel = self.docs.len() - 1;
         }
         self.show_editor = true;
+        // MATLAB surfaces the EDITOR toolstrip tab when an editor is raised.
+        if matches!(doc, Doc::Edit(_)) {
+            self.ribbon_tab = RibbonTab::Editor;
+        }
     }
 
     /// Open `path` in the editor — focuses an existing tab for the same file.
@@ -192,17 +212,23 @@ impl MatApp {
     fn doc_title(&self, doc: Doc) -> String {
         match doc {
             Doc::Edit(i) => match self.editors.get(i) {
-                Some(e) if !e.path.is_empty() => {
-                    std::path::Path::new(&e.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| e.path.clone())
-                }
-                _ => {
-                    let n = self.editors.iter().take(i + 1).filter(|e| e.path.is_empty()).count();
-                    if n <= 1 {
-                        "untitled".to_string()
+                Some(e) => {
+                    let mut t = if !e.path.is_empty() {
+                        std::path::Path::new(&e.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| e.path.clone())
                     } else {
-                        format!("untitled{n}")
+                        let n = self.editors.iter().take(i + 1).filter(|e| e.path.is_empty()).count();
+                        if n <= 1 {
+                            "untitled".to_string()
+                        } else {
+                            format!("untitled{n}")
+                        }
+                    };
+                    if e.dirty || e.path.is_empty() {
+                        t.push('*');
                     }
+                    t
                 }
+                _ => "?".to_string(),
             },
             Doc::Fig(i) => format!("Figure {}", i + 1),
         }
@@ -353,10 +379,22 @@ impl MatApp {
     }
 
     /// `cd` into `dir` through the engine, keeping the path bar in sync.
-    fn cd_to(&mut self, dir: &std::path::Path) {
+    /// `record` pushes the outgoing dir onto the back stack — false for
+    /// back/forward navigation itself.
+    fn cd_to(&mut self, dir: &std::path::Path, record: bool) {
         let escaped = dir.display().to_string().replace('\'', "''");
         let out = self.exec_command("eval.line", json!({"code": format!("cd '{escaped}'")}));
         if out.get("ok").and_then(Json::as_bool) == Some(true) {
+            if record {
+                if let Ok(cur) = std::env::current_dir() {
+                    self.cd_back.push(cur);
+                }
+                self.cd_fwd.clear();
+            }
+            let d = dir.to_path_buf();
+            self.cd_recent.retain(|p| *p != d);
+            self.cd_recent.push_front(d);
+            self.cd_recent.truncate(12);
             self.file_sel = None;
             self.fcache.invalidate();
         } else if let Some(e) = out.get("error").and_then(Json::as_str) {
@@ -565,6 +603,46 @@ impl eframe::App for MatApp {
             }
         });
         ctx.set_zoom_factor(zoom);
+        // Desktop shortcuts: Ctrl+N/O/S/W, F5 run — gathered first so the
+        // actions can take `self` after the input borrow ends.
+        let (new_doc, open_doc, save_doc, run_doc, close_doc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::N),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::S),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::F5),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::W),
+            )
+        });
+        if new_doc {
+            self.new_editor_tab(None);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if open_doc {
+            if let Some(p) = rfd::FileDialog::new().add_filter("M-code", &["m"]).pick_file() {
+                self.open_editor(&p);
+            }
+        }
+        if save_doc {
+            if let Some(e) = self.cur_editor_mut() {
+                e.save();
+            }
+        }
+        if run_doc {
+            if let Some(e) = self.cur_editor() {
+                let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
+                self.run_editor_buffer(e.text.clone(), dir);
+            }
+        }
+        if close_doc {
+            if let Some(Doc::Fig(f)) = self.docs.get(self.doc_sel).copied() {
+                self.fig_docs_closed.insert(f);
+            }
+            if !self.docs.is_empty() {
+                self.docs.remove(self.doc_sel);
+                self.doc_sel = self.doc_sel.min(self.docs.len().saturating_sub(1));
+            }
+        }
         // Keep the app live while control requests may arrive.
         if self.control_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -581,72 +659,105 @@ impl eframe::App for MatApp {
         // the user is editing it right now.
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut run_lines: Vec<String> = Vec::new();
-        let mut cd_dirs: Vec<std::path::PathBuf> = Vec::new();
+        // (dir, record-in-back-history) — back/forward navigation passes false.
+        let mut cd_dirs: Vec<(std::path::PathBuf, bool)> = Vec::new();
 
-        // ---- toolbar ----------------------------------------------------
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MatCraft").strong());
-                ui.separator();
-                #[cfg(not(target_arch = "wasm32"))]
+        // ---- toolstrip: tabbed ribbon (HOME/PLOTS/EDITOR/VIEW) -----------
+        egui::Panel::top("toolstrip").show(ui, |ui| {
+            let has_editor = matches!(self.docs.get(self.doc_sel), Some(Doc::Edit(_))) && self.show_editor;
+            let rc = ribbon::ui(
+                ui,
+                &mut self.ribbon_tab,
+                self.ws_sel.as_deref(),
+                has_editor,
+                &mut ribbon::ViewFlags {
+                    left: &mut self.show_left,
+                    right: &mut self.show_right,
+                    cmdwin: &mut self.show_cmdwin,
+                    editor: &mut self.show_editor,
+                },
+            );
+            match rc {
+                Some(RibbonCmd::NewScript) => self.new_editor_tab(None),
+                Some(RibbonCmd::Open) =>
                 {
-                    if ui.button("New Script").clicked() {
-                        self.new_editor_tab(None);
-                    }
-                    if ui.button("Open…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("M-code", &["m"]).pick_file() {
-                            self.open_editor(&p);
-                        }
-                    }
-                    if ui.button("Save").clicked() {
-                        if let Some(e) = self.cur_editor_mut() {
-                            e.save();
-                        }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(p) = rfd::FileDialog::new().add_filter("M-code", &["m"]).pick_file() {
+                        self.open_editor(&p);
                     }
                 }
-                if ui.button("▶ Run").clicked() {
+                Some(RibbonCmd::Save) => {
+                    if let Some(e) = self.cur_editor_mut() {
+                        e.save();
+                    }
+                }
+                Some(RibbonCmd::Run) => {
                     if let Some(e) = self.cur_editor() {
                         let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
-                        self.run_editor_buffer(e.text.clone(), dir);
+                        let src = e.text.clone();
+                        self.run_editor_buffer(src, dir);
                     }
                 }
-                ui.separator();
-                if ui.selectable_label(self.show_editor, "Editor").clicked() {
-                    self.show_editor = !self.show_editor;
+                Some(RibbonCmd::RunSelection) => {
+                    if let Some(e) = self.cur_editor_mut() {
+                        e.want_run_selection = true;
+                    }
                 }
-                if ui.button("Reset session").clicked() {
-                    let _ = self.exec_command("session.reset", json!({}));
-                    self.repl.push("session reset\n");
+                Some(RibbonCmd::ClearWorkspace) => run_lines.push("clear".to_string()),
+                Some(RibbonCmd::SaveWorkspace) =>
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(p) = rfd::FileDialog::new().add_filter("MAT v5", &["mat"]).save_file() {
+                        let esc = p.display().to_string().replace('\'', "''");
+                        run_lines.push(format!("save '{esc}'"));
+                    }
                 }
-                ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_left, "Current Folder + Details");
-                    ui.checkbox(&mut self.show_right, "Workspace + History");
-                    ui.checkbox(&mut self.show_cmdwin, "Command Window");
-                    ui.checkbox(&mut self.show_editor, "Editor");
-                    ui.separator();
-                    if ui.button("Reset zoom").clicked() {
-                        ui.ctx().set_zoom_factor(1.0);
-                        ui.close();
+                Some(RibbonCmd::OpenVar) => {
+                    if let Some(n) = self.ws_sel.clone() {
+                        self.var_editor = Some(n);
+                        self.var_edits.clear();
                     }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("+").on_hover_text("zoom in — Ctrl+=").clicked() {
-                        ui.ctx().set_zoom_factor((ui.ctx().zoom_factor() * 1.1).min(3.0));
-                    }
-                    ui.weak(format!("{:.0}%", ui.ctx().zoom_factor() * 100.0));
-                    if ui.small_button("−").on_hover_text("zoom out — Ctrl+-").clicked() {
-                        ui.ctx().set_zoom_factor((ui.ctx().zoom_factor() / 1.1).max(0.5));
-                    }
-                });
-            });
-            // Path bar — the current folder as an editable breadcrumb.
+                }
+                Some(RibbonCmd::Eval(line)) => run_lines.push(line),
+                Some(RibbonCmd::Insert(s)) => self.repl.load_input(&s),
+                Some(RibbonCmd::Preferences) => self.prefs_open = true,
+                None => {}
+            }
+            // Path bar — back/forward, up, recent dirs, editable breadcrumb.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("▸").monospace());
+                if ui.add_enabled(!self.cd_back.is_empty(), egui::Button::new("◀").small()).on_hover_text("previous folder").clicked() {
+                    if let Some(d) = self.cd_back.pop() {
+                        self.cd_fwd.push(cwd.clone());
+                        cd_dirs.push((d, false));
+                    }
+                }
+                if ui.add_enabled(!self.cd_fwd.is_empty(), egui::Button::new("▶").small()).on_hover_text("next folder").clicked() {
+                    if let Some(d) = self.cd_fwd.pop() {
+                        self.cd_back.push(cwd.clone());
+                        cd_dirs.push((d, false));
+                    }
+                }
                 if ui.small_button("↑").on_hover_text("up one level").clicked() {
                     if let Some(p) = cwd.parent() {
-                        cd_dirs.push(p.to_path_buf());
+                        cd_dirs.push((p.to_path_buf(), true));
                     }
                 }
+                ui.menu_button("⌄", |ui| {
+                    ui.set_min_width(280.0);
+                    if self.cd_recent.is_empty() {
+                        ui.weak("(no recent folders)");
+                    }
+                    let mut pick = None;
+                    for d in &self.cd_recent {
+                        if ui.button(d.display().to_string()).clicked() {
+                            pick = Some(d.clone());
+                            ui.close();
+                        }
+                    }
+                    if let Some(d) = pick {
+                        cd_dirs.push((d, true));
+                    }
+                });
                 if !ui.memory(|m| m.has_focus(egui::Id::new("cwd_edit"))) {
                     let shown = cwd.display().to_string();
                     if self.cwd_text != shown {
@@ -662,7 +773,7 @@ impl eframe::App for MatApp {
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let t = self.cwd_text.trim().to_string();
                     if !t.is_empty() {
-                        cd_dirs.push(std::path::PathBuf::from(t));
+                        cd_dirs.push((std::path::PathBuf::from(t), true));
                     }
                 }
             });
@@ -675,7 +786,7 @@ impl eframe::App for MatApp {
                     files::details_ui(ui, &mut self.fcache, self.file_sel.as_deref());
                 });
                 match files::folder_ui(ui, &mut self.fcache, &cwd, &mut self.file_sel) {
-                    Some(FileCmd::Cd(d)) => cd_dirs.push(d),
+                    Some(FileCmd::Cd(d)) => cd_dirs.push((d, true)),
                     Some(FileCmd::Open(p)) => self.open_editor(&p),
                     Some(FileCmd::Run(p)) => {
                         if let Ok(src) = std::fs::read_to_string(&p) {
@@ -765,6 +876,12 @@ impl eframe::App for MatApp {
                     }
                     let title = self.doc_title(*d);
                     let resp = ui.selectable_label(self.doc_sel == i, title);
+                    if self.doc_sel == i {
+                        // Accent underline under the raised tab, like the
+                        // desktop's document bar.
+                        let r = resp.rect;
+                        ui.painter().hline(r.left() + 2.0..=r.right() - 2.0, r.bottom(), egui::Stroke::new(2.0, ribbon::ACCENT));
+                    }
                     if resp.clicked() {
                         self.doc_sel = i;
                         if matches!(d, Doc::Fig(_)) {
@@ -841,12 +958,45 @@ impl eframe::App for MatApp {
             }
         }
 
+        // Preferences window (HOME ▸ ENVIRONMENT).
+        if self.prefs_open {
+            let mut open = true;
+            egui::Window::new("Preferences")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.strong("Desktop");
+                    ui.separator();
+                    let mut zoom = ui.ctx().zoom_factor();
+                    ui.horizontal(|ui| {
+                        ui.label("Interface zoom");
+                        if ui.add(egui::Slider::new(&mut zoom, 0.5..=3.0).suffix("x")).changed() {
+                            ui.ctx().set_zoom_factor(zoom);
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Restore default layout").clicked() {
+                        self.show_left = true;
+                        self.show_right = true;
+                        self.show_cmdwin = true;
+                        self.show_editor = true;
+                        ui.ctx().set_zoom_factor(1.0);
+                    }
+                    ui.weak("Pane visibility lives on the VIEW tab; per-session for now.");
+                });
+            if !open {
+                self.prefs_open = false;
+            }
+        }
+
         // Variable Editor window (Workspace double-click / context menu).
         self.variable_editor(ui.ctx());
 
         // Deferred runs (single borrow of self per line).
-        for d in cd_dirs {
-            self.cd_to(&d);
+        for (d, record) in cd_dirs {
+            self.cd_to(&d, record);
         }
         for line in run_lines {
             self.run_line(&line);

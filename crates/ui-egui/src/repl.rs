@@ -154,7 +154,7 @@ impl Repl {
             } else {
                 &self.scrollback
             };
-            ui.add(egui::Label::new(egui::RichText::new(tail).monospace()).selectable(true).wrap());
+            ui.add(egui::Label::new(scrollback_job(tail, ui.visuals().text_color())).selectable(true).wrap());
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(">>").monospace().strong());
@@ -191,6 +191,37 @@ impl Repl {
         });
         line_out
     }
+}
+
+/// Colour the scrollback like the Command Window: `Error …` blocks in red
+/// (indented continuation lines stay red), `Warning …` in dark orange, the
+/// rest in the default text colour.
+fn scrollback_job(text: &str, default_color: egui::Color32) -> egui::text::LayoutJob {
+    let font = egui::FontId::monospace(13.0);
+    let err = egui::Color32::from_rgb(0xB0, 0x00, 0x00);
+    let warn = egui::Color32::from_rgb(0xB4, 0x5F, 0x06);
+    let mut job = egui::text::LayoutJob::default();
+    let mut in_error = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let color = if trimmed.starts_with(">> ") || trimmed.starts_with(">>\n") {
+            in_error = false;
+            default_color
+        } else if trimmed.starts_with("Error") {
+            in_error = true;
+            err
+        } else if trimmed.starts_with("Warning") {
+            in_error = false;
+            warn
+        } else if in_error && !line.starts_with(|c: char| c.is_alphanumeric()) && !trimmed.is_empty() {
+            err
+        } else {
+            in_error = false;
+            default_color
+        };
+        job.append(line, 0.0, egui::text::TextFormat { font_id: font.clone(), color, ..Default::default() });
+    }
+    job
 }
 
 impl Default for Repl {

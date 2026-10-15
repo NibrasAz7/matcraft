@@ -182,3 +182,16 @@
   functions/handles (G31 — 91 parse failures), `classdef` OOP (G32),
   N-D indexing (G22 tail), image I/O (G34). Initial GitHub import pushed
   to `github.com/NibrasAz7/matcraft`.
+- Studio toolstrip + chrome pass (2025-10): MATLAB-style tabbed ribbon
+  (HOME / PLOTS / EDITOR / VIEW) replacing the flat toolbar — captioned
+  section groups, contextual EDITOR tab auto-raised with the document,
+  PLOTS gallery acting on the Workspace selection (or a `f(` stub on the
+  command line). Path bar gains back/forward stacks + recent-folder
+  dropdown; document tabs show `*` for dirty buffers and an accent
+  underline for the raised tab; Command Window renders `Error` blocks in
+  red / `Warning` in dark orange; desktop shortcuts Ctrl+N/O/S/W, F5 run;
+  MATLAB-ish light palette + a minimal Preferences window (zoom, layout
+  reset). SimCraft spec landed as `../simcraft/` (README + ROADMAP +
+  AGENTS) — the Simulink-class sibling interconnected via `sim`,
+  `set_param`/`get_param`, workspace-exchange blocks and M-code
+  callbacks.
