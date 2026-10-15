@@ -40,6 +40,15 @@ enum Doc {
     Fig(usize),
 }
 
+/// What the interactive figure view needs from a figure: the axis flags
+/// and the resolved limits (axis space — log axes are log10-transformed).
+struct XyView {
+    xlog: bool,
+    ylog: bool,
+    yrev: bool,
+    lim: (f64, f64, f64, f64),
+}
+
 /// Construction options for [`MatApp`].
 #[derive(Default)]
 pub struct MatAppOptions {
@@ -84,6 +93,8 @@ pub struct MatApp {
     var_edits: std::collections::HashMap<(usize, usize), String>,
     /// Pan/zoom bounds of the figure viewer, per figure index.
     fig_scene: Option<(usize, egui::Rect)>,
+    /// Rubber-band anchor while box-zooming a figure axes.
+    fig_box_from: Option<egui::Pos2>,
     /// View-menu toggles for the docked panels.
     show_left: bool,
     show_right: bool,
@@ -132,6 +143,7 @@ impl MatApp {
             var_editor: None,
             var_edits: std::collections::HashMap::new(),
             fig_scene: None,
+            fig_box_from: None,
             show_left: true,
             show_right: true,
             show_cmdwin: true,
@@ -418,52 +430,244 @@ impl MatApp {
         self.fcache.invalidate();
     }
 
-    /// The currently displayed figure: a `Scene` gives drag-to-pan and
-    /// scroll-to-zoom around the rendered texture, with a small toolbar.
+    /// The currently displayed figure. A plain 2-D axes gets MATLAB-style
+    /// data-space interaction — drag pans the limits, scroll zooms at the
+    /// cursor, right/Shift-drag box-zooms and double-click restores `axis
+    /// auto`, each re-rendering with fresh ticks. Figures that aren't a
+    /// single x/y axes (3-D, subplots, pie-only) keep the pixel pan/zoom
+    /// `Scene`.
     fn figure_view(&mut self, ui: &mut egui::Ui, idx: usize) {
         let Some(tex) = self.fig_tex.get(idx).and_then(|t| t.as_ref()) else { return };
         let (id, size) = (tex.id(), tex.size_vec2());
-        if !matches!(&self.fig_scene, Some((i, _)) if *i == idx) {
+        let view = self.session.lang().figures().get(idx).and_then(|f| {
+            if matplot::is_xy_view(f) {
+                Some(XyView { xlog: f.xlog, ylog: f.ylog, yrev: f.yrev, lim: matplot::view_limits(f) })
+            } else {
+                None
+            }
+        });
+        if view.is_none() && !matches!(&self.fig_scene, Some((i, _)) if *i == idx) {
             self.fig_scene = Some((idx, egui::Rect::from_min_size(egui::Pos2::ZERO, size)));
         }
         let mut reset = false;
         let mut save_as = false;
+        let mut zoom_k = 0.0;
         ui.horizontal(|ui| {
             ui.weak(format!("Figure {}", idx + 1));
             ui.separator();
             if ui.small_button("+").on_hover_text("zoom in").clicked() {
-                if let Some((_, b)) = &mut self.fig_scene {
-                    *b = b.scale_from_center(0.8);
-                }
+                zoom_k = 0.8;
             }
             if ui.small_button("-").on_hover_text("zoom out").clicked() {
-                if let Some((_, b)) = &mut self.fig_scene {
-                    *b = b.scale_from_center(1.25);
-                }
+                zoom_k = 1.25;
             }
-            if ui.small_button("reset").on_hover_text("reset view").clicked() {
+            if ui.small_button("reset").on_hover_text(if view.is_some() { "axis auto — restore auto limits" } else { "reset view" }).clicked() {
                 reset = true;
             }
             ui.separator();
             if ui.small_button("Save As…").on_hover_text("saveas — SVG/PNG via extension").clicked() {
                 save_as = true;
             }
-            ui.weak("drag to pan · scroll to zoom");
+            if view.is_some() {
+                ui.weak("drag to pan · scroll to zoom · right-drag box zoom · double-click reset");
+            } else {
+                ui.weak("drag to pan · scroll to zoom");
+            }
         });
         ui.separator();
-        if reset {
-            self.fig_scene = Some((idx, egui::Rect::from_min_size(egui::Pos2::ZERO, size)));
-        }
         if save_as {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(p) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).add_filter("PNG", &["png"]).save_file() {
                 self.run_line(&format!("saveas('{}')", p.display().to_string().replace('\'', "''")));
             }
         }
+        if let Some(v) = view {
+            self.figure_xy(ui, idx, id, v, zoom_k, reset);
+            return;
+        }
+        if reset {
+            self.fig_scene = Some((idx, egui::Rect::from_min_size(egui::Pos2::ZERO, size)));
+        }
+        if zoom_k != 0.0 {
+            if let Some((_, b)) = &mut self.fig_scene {
+                *b = b.scale_from_center(zoom_k as f32);
+            }
+        }
         let Some((_, bounds)) = &mut self.fig_scene else { return };
         egui::Scene::new().zoom_range(0.05..=20.0).show(ui, bounds, |ui| {
             ui.image(egui::load::SizedTexture::new(id, size));
         });
+    }
+
+    /// Interactive single 2-D axes: the texture is fit to the dock and the
+    /// axes rectangle is sensed for pan / zoom / box-zoom / hover. New
+    /// limits go back through `xlim`/`ylim` so the change is real session
+    /// state — `gcf`, `saveas`, scripts and the control channel all see it.
+    fn figure_xy(&mut self, ui: &mut egui::Ui, idx: usize, id: egui::TextureId, view: XyView, zoom_k: f64, reset: bool) {
+        let XyView { xlog, ylog, yrev, lim } = view;
+        let (sw, sh) = matplot::svg_size();
+        let (sw, sh) = (sw as f32, sh.max(1.0) as f32);
+        let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let w = rect.width().min(rect.height() * sw / sh).max(1.0);
+        let h = w * sh / sw;
+        let img = egui::Rect::from_min_size(rect.center() - egui::vec2(w / 2.0, h / 2.0), egui::vec2(w, h));
+        ui.painter().image(id, img, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)), egui::Color32::WHITE);
+
+        // The axes rectangle in display space: SVG-space rect scaled by the
+        // fit factor.
+        let (ax, ay, aw, ah) = matplot::axes_rect();
+        let s = img.width() / sw;
+        let axr = egui::Rect::from_min_size(img.min + egui::vec2(ax as f32 * s, ay as f32 * s), egui::vec2(aw as f32 * s, ah as f32 * s));
+        if axr.width() < 4.0 || axr.height() < 4.0 {
+            return;
+        }
+        let (x0, x1, y0, y1) = lim;
+        let (span_x, span_y) = (x1 - x0, y1 - y0);
+        // Display-space position of a drawn (axis-space) point.
+        let to_px = |xv: f64, yv: f64| {
+            let fx = ((xv - x0) / span_x) as f32;
+            let fy = ((yv - y0) / span_y) as f32;
+            egui::pos2(axr.left() + fx * axr.width(), if yrev { axr.top() + fy * axr.height() } else { axr.bottom() - fy * axr.height() })
+        };
+        let to_data = |t: f64, log: bool| if log { 10f64.powf(t) } else { t };
+
+        let resp = ui.interact(axr, ui.id().with(("fig-ax", idx)), egui::Sense::click_and_drag());
+        let mut new_lim: Option<(f64, f64, f64, f64)> = None;
+        let mut auto = reset;
+
+        if resp.double_clicked() {
+            auto = true;
+        }
+        if zoom_k != 0.0 {
+            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            new_lim = Some((cx - (cx - x0) * zoom_k, cx + (x1 - cx) * zoom_k, cy - (cy - y0) * zoom_k, cy + (y1 - cy) * zoom_k));
+        }
+        // Scroll zooms both axes about the cursor — the MATLAB zoom tool /
+        // Plotly wheel behaviour.
+        if resp.hovered() {
+            let d = ui.input(|i| i.smooth_scroll_delta.y);
+            if d != 0.0 {
+                let k = (f64::from(-d) * 0.002).exp().clamp(0.02, 50.0);
+                if let Some(hp) = resp.hover_pos() {
+                    let fx = f64::from(hp.x - axr.left()) / f64::from(axr.width());
+                    let fy = f64::from(hp.y - axr.top()) / f64::from(axr.height());
+                    let xv = x0 + fx * span_x;
+                    let yv = if yrev { y0 + fy * span_y } else { y1 - fy * span_y };
+                    new_lim = Some((xv - (xv - x0) * k, xv + (x1 - xv) * k, yv - (yv - y0) * k, yv + (y1 - yv) * k));
+                }
+            }
+        }
+        // Primary drag pans; Shift+primary or secondary drag box-zooms.
+        let shift = ui.input(|i| i.modifiers.shift);
+        let box_drag = resp.dragged_by(egui::PointerButton::Secondary) || (resp.dragged_by(egui::PointerButton::Primary) && shift);
+        if resp.dragged_by(egui::PointerButton::Primary) && !shift {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let d = ui.input(|i| i.pointer.delta());
+            if d.x != 0.0 || d.y != 0.0 {
+                let dx = f64::from(d.x) / f64::from(axr.width()) * span_x;
+                let dy = f64::from(d.y) / f64::from(axr.height()) * span_y;
+                let ny = if yrev { -dy } else { dy };
+                new_lim = Some((x0 - dx, x1 - dx, y0 + ny, y1 + ny));
+            }
+        } else if box_drag {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+            if let Some(hp) = resp.interact_pointer_pos() {
+                let from = self.fig_box_from.get_or_insert(hp);
+                let r = egui::Rect::from_two_pos(*from, hp).intersect(axr);
+                ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(0x00, 0x72, 0xBD)), egui::StrokeKind::Outside);
+            }
+        } else if let Some(from) = self.fig_box_from.take() {
+            // Released — map the rubber band back to axis limits.
+            if let Some(hp) = ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos())) {
+                let r = egui::Rect::from_two_pos(from, hp).intersect(axr);
+                if r.width() > 6.0 && r.height() > 6.0 {
+                    let fx = |p: f32| f64::from(p - axr.left()) / f64::from(axr.width());
+                    let fy = |p: f32| f64::from(p - axr.top()) / f64::from(axr.height());
+                    let (xa, xb) = (x0 + fx(r.left()) * span_x, x0 + fx(r.right()) * span_x);
+                    let (ya, yb) = if yrev {
+                        (y0 + fy(r.top()) * span_y, y0 + fy(r.bottom()) * span_y)
+                    } else {
+                        (y1 - fy(r.bottom()) * span_y, y1 - fy(r.top()) * span_y)
+                    };
+                    new_lim = Some((xa.min(xb), xa.max(xb), ya.min(yb), ya.max(yb)));
+                }
+            }
+        }
+
+        // Hover: axis coordinates plus a plotly-style data tip on the
+        // nearest vertex within snapping distance.
+        if let Some(hp) = resp.hover_pos() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            // Spikelines through the cursor, clipped to the axes.
+            let clip = ui.painter().with_clip_rect(axr);
+            let spike = egui::Stroke::new(0.75, egui::Color32::from_gray(140));
+            clip.hline(axr.x_range(), hp.y, spike);
+            clip.vline(hp.x, axr.y_range(), spike);
+            let fx = f64::from(hp.x - axr.left()) / f64::from(axr.width());
+            let fy = f64::from(hp.y - axr.top()) / f64::from(axr.height());
+            let xd = to_data(x0 + fx * span_x, xlog);
+            let yd = to_data(if yrev { y0 + fy * span_y } else { y1 - fy * span_y }, ylog);
+            let mut text = format!("x: {}\ny: {}", matlang::fmt_num(xd, false), matlang::fmt_num(yd, false));
+            let mut marker: Option<egui::Pos2> = None;
+            if let Some(fig) = self.session.lang().figures().get(idx) {
+                let mut best = f32::INFINITY;
+                for s in &fig.series {
+                    if !matches!(
+                        s.kind,
+                        matplot::SeriesKind::Line
+                            | matplot::SeriesKind::Scatter
+                            | matplot::SeriesKind::Stairs
+                            | matplot::SeriesKind::Stem
+                            | matplot::SeriesKind::ErrorBar
+                    ) {
+                        continue;
+                    }
+                    // Snapping stays interactive: skip enormous series.
+                    if s.x.len() > 100_000 {
+                        continue;
+                    }
+                    for (px, py) in s.x.iter().zip(s.y.iter()) {
+                        let (txv, tyv) = (if xlog { px.log10() } else { *px }, if ylog { py.log10() } else { *py });
+                        if !txv.is_finite() || !tyv.is_finite() {
+                            continue;
+                        }
+                        let pos = to_px(txv, tyv);
+                        let d = hp.distance(pos);
+                        if d < best {
+                            best = d;
+                            marker = Some(pos);
+                            text = format!("x: {}\ny: {}", matlang::fmt_num(to_data(txv, xlog), false), matlang::fmt_num(to_data(tyv, ylog), false));
+                        }
+                    }
+                }
+                if best > 14.0 {
+                    marker = None;
+                    text = format!("x: {}\ny: {}", matlang::fmt_num(xd, false), matlang::fmt_num(yd, false));
+                }
+            }
+            if let Some(p) = marker {
+                ui.painter().circle_stroke(p, 5.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                ui.painter().circle_stroke(p, 5.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(0x00, 0x72, 0xBD)));
+            }
+            let galley = ui.painter().layout_no_wrap(text.clone(), egui::FontId::monospace(11.0), egui::Color32::WHITE);
+            let mut tp = hp + egui::vec2(14.0, -galley.size().y - 10.0);
+            tp.x = tp.x.min(axr.right() - galley.size().x - 6.0);
+            tp.y = tp.y.max(axr.top() + 4.0);
+            let tr = egui::Rect::from_min_size(tp - egui::vec2(4.0, 4.0), galley.size() + egui::vec2(8.0, 8.0));
+            ui.painter().rect_filled(tr, 3.0, egui::Color32::from_black_alpha(200));
+            ui.painter().rect_stroke(tr, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(120)), egui::StrokeKind::Outside);
+            ui.painter().galley(tp, galley, egui::Color32::WHITE);
+        }
+
+        if auto {
+            let _ = self.exec_command("eval.line", json!({"code": "axis auto"}));
+        } else if let Some((a, b, c, d)) = new_lim {
+            if [a, b, c, d].iter().all(|v| v.is_finite()) {
+                let code =
+                    format!("xlim([{:.6e} {:.6e}]); ylim([{:.6e} {:.6e}])", to_data(a, xlog), to_data(b, xlog), to_data(c, ylog), to_data(d, ylog));
+                let _ = self.exec_command("eval.line", json!({"code": code}));
+            }
+        }
     }
 
     /// Floating Variable Editor: a MATLAB-like grid of the variable's cells.

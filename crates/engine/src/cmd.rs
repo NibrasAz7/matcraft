@@ -32,7 +32,7 @@ pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
 /// functions` so both print the same catalogue. A test in this module keeps
 /// it in lock-step with `matlang::BUILTIN_NAMES`.
 pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
-    ("construction", "zeros ones eye rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
+    ("construction", "zeros ones eye magic rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
     ("size/shape", "size numel length ndims reshape squeeze transpose ctranspose repmat"),
     ("matrix ops", "diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90 meshgrid"),
     ("cells", "cell iscell iscellstr cell2mat num2cell celldisp"),

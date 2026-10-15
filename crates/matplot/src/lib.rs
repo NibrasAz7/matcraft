@@ -645,6 +645,84 @@ fn axes() -> (f64, f64, f64, f64) {
     (ML, MT, W - ML - MR, H - MT - MB)
 }
 
+/// The fixed SVG canvas size (width, height) `to_svg` emits, in px.
+pub fn svg_size() -> (f64, f64) {
+    (W, H)
+}
+
+/// The axes rectangle (x, y, w, h) in SVG pixels for the single-axes
+/// layout — interactive viewers map screen positions through it.
+pub fn axes_rect() -> (f64, f64, f64, f64) {
+    axes()
+}
+
+/// Whether the figure is a single 2-D axes that supports x/y view
+/// interaction — no subplot tiling, no pie-only or 3-D series.
+pub fn is_xy_view(fig: &Figure) -> bool {
+    fig.sub.is_none() && !fig.series.iter().any(Series::is_3d) && (fig.series.is_empty() || !fig.series.iter().all(|s| s.kind == SeriesKind::Pie))
+}
+
+/// Resolved 2-D view limits `(x0, x1, y0, y1)` in *drawn* (axis) space —
+/// log axes are already log10-transformed; explicit `xlim`/`ylim` win over
+/// the padded data extent. This is exactly what `draw_axes` maps through.
+pub fn view_limits(fig: &Figure) -> (f64, f64, f64, f64) {
+    view2d(fig)
+}
+
+/// The limit computation shared by `draw_axes` and [`view_limits`]: data
+/// extent (image cells padded a half-step, error bars, zero-baseline
+/// anchors) resolved through [`limits`], in transformed space.
+fn view2d(fig: &Figure) -> (f64, f64, f64, f64) {
+    let tx = |v: f64| if fig.xlog { v.log10() } else { v };
+    let ty = |v: f64| if fig.ylog { v.log10() } else { v };
+
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for s in &fig.series {
+        // Image grids: coordinate vectors hold cell centres — extend the
+        // range by half a cell so the image edge lands on the axis limit.
+        let (xpad, ypad) = if s.kind == SeriesKind::Image { (half_step(&s.x), half_step(&s.y)) } else { (0.0, 0.0) };
+        for &v in &s.x {
+            let t = tx(v);
+            if t.is_finite() {
+                xmin = xmin.min(t - xpad);
+                xmax = xmax.max(t + xpad);
+            }
+        }
+        let n = s.y.len();
+        for i in 0..n {
+            if let Some(&v) = s.y.get(i) {
+                let t = ty(v);
+                if t.is_finite() {
+                    ymin = ymin.min(t - ypad);
+                    ymax = ymax.max(t + ypad);
+                }
+                if let Some(err) = &s.err {
+                    if let Some(&e) = err.get(i) {
+                        for cand in [ty(v - e), ty(v + e)] {
+                            if cand.is_finite() {
+                                ymin = ymin.min(cand);
+                                ymax = ymax.max(cand);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Stems, bars and areas anchor to the zero baseline (linear axes
+        // only — zero is unreachable on a log axis).
+        if !fig.ylog && matches!(s.kind, SeriesKind::Stem | SeriesKind::Bar | SeriesKind::Area) {
+            ymin = ymin.min(0.0);
+            ymax = ymax.max(0.0);
+        }
+    }
+    let (x0, x1) = limits(xmin, xmax, fig.xlim.map(|(a, b)| (tx(a), tx(b))));
+    let (y0, y1) = limits(ymin, ymax, fig.ylim.map(|(a, b)| (ty(a), ty(b))));
+    (x0, x1, y0, y1)
+}
+
 /// Escape text for XML.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -789,50 +867,7 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
     let tx = |v: f64| if fig.xlog { v.log10() } else { v };
     let ty = |v: f64| if fig.ylog { v.log10() } else { v };
 
-    let mut xmin = f64::INFINITY;
-    let mut xmax = f64::NEG_INFINITY;
-    let mut ymin = f64::INFINITY;
-    let mut ymax = f64::NEG_INFINITY;
-    for s in &fig.series {
-        // Image grids: coordinate vectors hold cell centres — extend the
-        // range by half a cell so the image edge lands on the axis limit.
-        let (xpad, ypad) = if s.kind == SeriesKind::Image { (half_step(&s.x), half_step(&s.y)) } else { (0.0, 0.0) };
-        for &v in &s.x {
-            let t = tx(v);
-            if t.is_finite() {
-                xmin = xmin.min(t - xpad);
-                xmax = xmax.max(t + xpad);
-            }
-        }
-        let n = s.y.len();
-        for i in 0..n {
-            if let Some(&v) = s.y.get(i) {
-                let t = ty(v);
-                if t.is_finite() {
-                    ymin = ymin.min(t - ypad);
-                    ymax = ymax.max(t + ypad);
-                }
-                if let Some(err) = &s.err {
-                    if let Some(&e) = err.get(i) {
-                        for cand in [ty(v - e), ty(v + e)] {
-                            if cand.is_finite() {
-                                ymin = ymin.min(cand);
-                                ymax = ymax.max(cand);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Stems, bars and areas anchor to the zero baseline (linear axes
-        // only — zero is unreachable on a log axis).
-        if !fig.ylog && matches!(s.kind, SeriesKind::Stem | SeriesKind::Bar | SeriesKind::Area) {
-            ymin = ymin.min(0.0);
-            ymax = ymax.max(0.0);
-        }
-    }
-    let (x0, x1) = limits(xmin, xmax, fig.xlim.map(|(a, b)| (tx(a), tx(b))));
-    let (y0, y1) = limits(ymin, ymax, fig.ylim.map(|(a, b)| (ty(a), ty(b))));
+    let (x0, x1, y0, y1) = view2d(fig);
     let xspan = (x1 - x0).max(f64::EPSILON);
     let yspan = (y1 - y0).max(f64::EPSILON);
     let sx = |v: f64| ax + (tx(v) - x0) / xspan * aw;

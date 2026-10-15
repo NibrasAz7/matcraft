@@ -2374,6 +2374,12 @@ impl Session {
                 }
                 Ok(Some(Value::Mat(Matrix::row_vector(data))))
             }
+            "magic" => {
+                let v = self.eval_args(args)?;
+                let n = v.scalar_at(0)? as usize;
+                check_elems(n.saturating_mul(n))?;
+                Ok(Some(Value::Mat(magic_square(n))))
+            }
             "size" => {
                 let v = self.eval_args(args)?;
                 let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
@@ -6737,6 +6743,81 @@ fn check_elems(n: usize) -> Result<(), LangError> {
     Ok(())
 }
 
+/// `magic(n)`: an n-by-n magic square — every row, column and main
+/// diagonal sums to n(n²+1)/2. Odd orders use the Siamese method, doubly
+/// even orders the complement pattern, singly even orders Strachey's
+/// method on an odd-order base square. Order 2 has no magic square; the
+/// conventional placeholder `[1 3; 4 2]` is returned instead.
+fn magic_square(n: usize) -> Matrix {
+    let mut m = vec![0.0; n.saturating_mul(n)];
+    let put = |m: &mut [f64], r: usize, c: usize, v: f64| {
+        if let Some(e) = m.get_mut(c * n + r) {
+            *e = v;
+        }
+    };
+    if n % 2 == 1 {
+        // Siamese method: start at the middle of the top row and step
+        // up-right with wraparound; drop one row on an occupied cell.
+        let (mut r, mut c) = (0usize, n / 2);
+        for v in 1..=(n * n) {
+            put(&mut m, r, c, v as f64);
+            let (nr, nc) = ((r + n - 1) % n, (c + 1) % n);
+            if m.get(nc * n + nr).copied().unwrap_or(0.0) != 0.0 {
+                r = (r + 1) % n;
+            } else {
+                r = nr;
+                c = nc;
+            }
+        }
+    } else if n == 2 {
+        // Placeholder — its line sums are deliberately not all equal.
+        for (i, &v) in [1.0, 4.0, 3.0, 2.0].iter().enumerate() {
+            put(&mut m, i % 2, i / 2, v);
+        }
+    } else if n.is_multiple_of(4) {
+        // Doubly even: sequential fill, then complement the cells on the
+        // 4-by-4 block diagonals (r%4 == c%4 or r%4 + c%4 == 3).
+        let total = (n * n + 1) as f64;
+        for r in 0..n {
+            for c in 0..n {
+                let v = (r * n + c + 1) as f64;
+                put(&mut m, r, c, if r % 4 == c % 4 || r % 4 + c % 4 == 3 { total - v } else { v });
+            }
+        }
+    } else {
+        // Singly even (n = 2k, k odd): Strachey's method — fill four
+        // k-by-k quadrants from an odd-order base square with offsets
+        // TL +0, TR +2k², BL +3k², BR +k², then exchange columns:
+        // every left-half row swaps its first p cells TL↔BL except the
+        // middle row, which swaps cells p..2p; every right-half row
+        // swaps its last p−1 cells TR↔BR.
+        let k = n / 2;
+        let kk = (k * k) as f64;
+        let p = (k - 1) / 2;
+        let s = magic_square(k);
+        for r in 0..k {
+            for c in 0..k {
+                let sv = s.data().get(c * k + r).copied().unwrap_or(0.0);
+                put(&mut m, r, c, sv);
+                put(&mut m, r, c + k, sv + 2.0 * kk);
+                put(&mut m, r + k, c, sv + 3.0 * kk);
+                put(&mut m, r + k, c + k, sv + kk);
+            }
+        }
+        let mid = k / 2;
+        for r in 0..k {
+            let lo = if r == mid { p } else { 0 };
+            for c in lo..(lo + p) {
+                m.swap(c * n + r, c * n + r + k);
+            }
+            for c in (k + 1 - p)..k {
+                m.swap((c + k) * n + r, (c + k) * n + r + k);
+            }
+        }
+    }
+    Matrix::from_col_major(n, n, m).unwrap_or_else(|_| Matrix::zeros(0, 0))
+}
+
 /// MATLAB field names must be valid identifiers: a letter or `_` first, then
 /// letters/digits/`_`, and never a reserved word (`s.('for')` is rejected).
 fn valid_field_name(s: &str) -> bool {
@@ -7032,6 +7113,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "zeros",
     "ones",
     "eye",
+    "magic",
     "rand",
     "randn",
     "randi",
@@ -7778,6 +7860,50 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn magic_square_sums() {
+        for (src, want) in [("M = magic(3)", 15.0), ("M = magic(4)", 34.0), ("M = magic(5)", 65.0), ("M = magic(6)", 111.0), ("M = magic(10)", 505.0)]
+        {
+            let mut s = Session::new();
+            s.run(src).unwrap();
+            let Some(Value::Mat(m)) = s.get("M") else { panic!("expected a matrix") };
+            let n = m.rows();
+            assert_eq!(n, m.cols());
+            for i in 0..n {
+                let mut row = 0.0;
+                let mut col = 0.0;
+                for j in 0..n {
+                    row += m.get(i, j).unwrap();
+                    col += m.get(j, i).unwrap();
+                }
+                assert_eq!(row, want);
+                assert_eq!(col, want);
+            }
+            let d1: f64 = (0..n).map(|i| m.get(i, i).unwrap()).sum();
+            let d2: f64 = (0..n).map(|i| m.get(i, n - 1 - i).unwrap()).sum();
+            assert_eq!(d1, want);
+            assert_eq!(d2, want);
+        }
+        // magic(3) uses the Siamese arrangement.
+        let mut s = Session::new();
+        s.run("M = magic(3)").unwrap();
+        let Some(Value::Mat(m)) = s.get("M") else { panic!("expected a matrix") };
+        let want = [8.0, 1.0, 6.0, 3.0, 5.0, 7.0, 4.0, 9.0, 2.0];
+        for r in 0..3 {
+            for c in 0..3 {
+                assert_eq!(m.get(r, c), Some(want[r * 3 + c]));
+            }
+        }
+        // Order 2 has no magic square — the conventional placeholder.
+        let mut s = Session::new();
+        s.run("M = magic(2)").unwrap();
+        let Some(Value::Mat(m)) = s.get("M") else { panic!("expected a matrix") };
+        assert_eq!(m.get(0, 0), Some(1.0));
+        assert_eq!(m.get(0, 1), Some(3.0));
+        assert_eq!(m.get(1, 0), Some(4.0));
+        assert_eq!(m.get(1, 1), Some(2.0));
     }
 
     #[test]

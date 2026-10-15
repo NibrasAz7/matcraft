@@ -111,7 +111,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 
 | Group | Functions |
 | --- | --- |
-| Construction | `zeros ones eye rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware) |
+| Construction | `zeros ones eye magic rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists) |
 | Shape | `size numel length ndims` (multi-output `[r,c] = size(A)`) |
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
