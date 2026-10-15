@@ -18,39 +18,51 @@ x =
 
 ## Status
 
-**Studio + engine + language/numerics sweep landed** — the language core, a
-command engine with MCP, a real linear-algebra stack, headless 2D plotting,
-and a native Studio app: matrices, logical indexing, control flow, user
-`function`s with `varargin`/`varargout`, `eig`/`svd`/`qr`/`chol`/`pinv`,
-`plot`/`scatter`/`stem`/`bar`/`area`/`stairs`/`errorbar`/`histogram` with
-log axes and SVG export — ~190 builtins via `matcraft-cli`. The web app,
-packaging and toolbox crates are ahead. See [`ROADMAP.md`](ROADMAP.md).
+**Alpha** — Studio + engine + language/numerics + DSP + broad plotting are
+in. ~280 builtins, complex and sparse matrices, struct/cell arrays, `.mat`
+v5 I/O, 2D and 3D figures with SVG/PNG/PDF export, a MATLAB-style desktop
+Studio (ribbon toolstrip, docked panes, command window, workspace, editor,
+figure tabs), CLI + MCP + a JSON-lines control channel.
+
+**Compatibility, measured honestly:** in a sweep of 638 real-world `.m`
+files from 32 pre-2022 GitHub repos across 8 domains, ~87% parse cleanly —
+scripts fail first on missing toolbox builtins, then on `@` handles. See
+[`docs/wild-corpus.md`](docs/wild-corpus.md) and [`docs/gaps.md`](docs/gaps.md).
+Not yet: `@` anonymous functions/handles, `classdef` OOP, N-D indexing,
+image I/O, most toolbox functions, Simulink-style modeling (planned as the
+SimCraft sibling). See [`ROADMAP.md`](ROADMAP.md).
 
 ## What runs today
 
-- Dense column-major `f64` matrices: `+ - * / \ ' .* ./ .^ ^`, `A(i,j)`,
-  linear indexing incl. logical masks (`A(A>0)`), growth on assignment,
-  `a:b` / `a:s:b` ranges.
-- `if/elseif/else/end`, `for/end`, `while/end`, `switch/case/otherwise`,
+- Dense column-major `f64` matrices, `complex`, `sparse`, `cell`, `struct`
+  (incl. struct arrays): `+ - * / \ ' .* ./ .^ ^`, `A(i,j)`, logical masks
+  (`A(A>0)`), growth on assignment, `a:b`/`a:s:b` ranges.
+- `if/elseif/else/end`, `for`/`for(i=…)`, `while`, `switch`, `try/catch`,
   `break`/`continue`/`return`, `;` echo suppression, command syntax
-  (`save 'f.mat'`).
+  (`cd ..`, `save 'f.mat'`).
 - `function y = f(x)` / `function [a,b] = f(x)` — local scopes, hoisted
-  script-local functions, `<name>.m` function files (`addpath`/`path`),
+  script-local functions, `<name>.m` function files (`addpath`/`genpath`),
   `nargin`/`nargout`, `varargin`/`varargout`, recursion.
 - Linear algebra: `det inv norm eig svd qr lu chol rref pinv rank cond
-  trace null orth` — pure Rust, no external BLAS.
-- Figures: `plot scatter stem bar area stairs errorbar histogram` with
-  `'r--o'` specs, `semilogx`/`semilogy`/`loglog`, `hold`/`grid`/labels/
-  `legend`/`xlim`/`ylim`, `saveas`/`print` to SVG — headless, no window yet.
+  trace null orth` — pure Rust, no external BLAS; `eig` returns complex
+  pairs.
+- DSP: `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz
+  unwrap` + `hamming hann blackman bartlett rectwin triang kaiser
+  gausswin` windows.
+- Figures: `plot scatter stem bar area stairs errorbar histogram pie
+  imagesc contour plot3 surf mesh` with `'r--o'` specs, `semilog*`/`loglog`,
+  `meshgrid`, `view`/`zlim`/`zlabel`, `colormap`/`colorbar`/`caxis`, `grid`
+  `box` `axis`, `saveas`/`exportgraphics`/`print` to **SVG/PNG/PDF**.
+- `.mat` v5 `load`/`save`: numeric, complex, sparse, char.
 - Numerical methods: `fzero fminsearch integral quad interp1 trapz
-  polyval polyfit roots conv deconv`.
-- Automation: `matcraft-cli --cmd 'id {json}'` runs engine commands;
-  `matcraft-cli mcp` serves them over JSON-RPC (stdio).
-- **MatCraft Studio** (`matcraft`): command window, workspace inspector,
-  editor and figure dock — `matcraft --control 7979` exposes the JSON-lines
-  control channel (`engine.execute`, `ui.state`, `ui.render`,
-  `ui.screenshot`).
-- ~190 builtins total — `matcraft-cli functions` lists the catalogue.
+  polyval polyfit roots conv deconv` (complex roots).
+- Automation: `matcraft-cli --cmd 'id {json}'` engine commands;
+  `matcraft-cli mcp` JSON-RPC; Studio `--control 7979` JSON-lines
+  (`engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`).
+- **MatCraft Studio** (`matcraft`): HOME/PLOTS/EDITOR/VIEW toolstrip,
+  command window (colored errors, history, tab-completion), workspace
+  inspector + variable editor, editor with MATLAB-style syntax colors and
+  F5/F9, figure dock with pan/zoom, current-folder browser.
 
 ## Getting started
 
