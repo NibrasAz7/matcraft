@@ -10,8 +10,9 @@ fn main() -> ExitCode {
         "test" => run(&["test", "--workspace"]),
         "clippy" => run(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
         "layers" => layers(),
+        "wasm" => wasm(),
         other => {
-            eprintln!("unknown xtask '{other}' (have: ci, fmt, test, clippy, layers)");
+            eprintln!("unknown xtask '{other}' (have: ci, fmt, test, clippy, layers, wasm)");
             ExitCode::FAILURE
         }
     }
@@ -25,7 +26,43 @@ fn ci() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    layers()
+    if layers() != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
+    wasm()
+}
+
+/// wasm gate, mirroring the sibling apps' `xtask wasm`: every crate that
+/// ships to the browser must type-check for `wasm32-unknown-unknown`.
+/// The browser bundle itself is produced by `trunk build --release` in
+/// `apps/matcraft-web` (output: `dist/web/`).
+fn wasm() -> ExitCode {
+    match Command::new("rustup").args(["target", "list", "--installed"]).output() {
+        Ok(o) if o.status.success() => {
+            if !String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "wasm32-unknown-unknown") {
+                eprintln!("wasm32-unknown-unknown target missing — install with: rustup target add wasm32-unknown-unknown");
+                return ExitCode::FAILURE;
+            }
+        }
+        _ => eprintln!("could not query rustup targets; attempting the wasm check anyway"),
+    }
+    run(&[
+        "check",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "matcore",
+        "-p",
+        "matplot",
+        "-p",
+        "matlang",
+        "-p",
+        "matcraft_engine",
+        "-p",
+        "matcraft-ui-egui",
+        "-p",
+        "matcraft-web",
+    ])
 }
 
 fn run(args: &[&str]) -> ExitCode {
