@@ -9,6 +9,7 @@
 
 use matcore::{CMatrix, CNum, Matrix};
 
+use crate::interp::{CellArray, StructArray};
 use crate::Value;
 
 // mi* data types (subset we read/write).
@@ -23,10 +24,16 @@ const MI_UTF8: u32 = 16;
 const MI_UTF16: u32 = 17;
 
 // mx* array classes.
+const MX_CELL: u32 = 1;
+const MX_STRUCT: u32 = 2;
 const MX_CHAR: u32 = 4;
 const MX_SPARSE: u32 = 5;
 const MX_DOUBLE: u32 = 6;
 const MX_UINT8: u32 = 9;
+
+/// Cap on sub-elements read from a foreign cell/struct — corrupt dims
+/// must not drive unbounded allocation.
+const MAX_NESTED: usize = 10_000_000;
 
 const FLAG_COMPLEX: u32 = 0x0800;
 
@@ -100,6 +107,102 @@ fn sparse_element(name: &str, s: &matcore::SparseMat) -> Vec<u8> {
     m
 }
 
+/// Serialize one value as a `miMATRIX` payload (the pre-compression body).
+/// Shared by top-level variables and nested cell/struct elements — nested
+/// elements carry an empty name, per the MAT v5 spec.
+fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
+    match val {
+        Value::Num(x) => Ok(matrix_element(name, MX_DOUBLE, 0, &[1, 1], MI_DOUBLE, &x.to_le_bytes())),
+        Value::Mat(m) => {
+            let dims = [m.rows() as u32, m.cols() as u32];
+            let mut data = Vec::with_capacity(m.numel() * 8);
+            // `Matrix::data` is already column-major — direct dump.
+            for x in m.data() {
+                data.extend_from_slice(&x.to_le_bytes());
+            }
+            Ok(matrix_element(name, MX_DOUBLE, 0, &dims, MI_DOUBLE, &data))
+        }
+        Value::Str(s) => Ok(matrix_element(name, MX_CHAR, 0, &[1, s.chars().count() as u32], MI_UTF8, s.as_bytes())),
+        Value::Cplx(m) => {
+            // Complex arrays: complex flag set + two miDOUBLE elements
+            // (real part, then imaginary part), per the MAT v5 spec.
+            let mut pr = Vec::with_capacity(m.numel() * 8);
+            let mut pi = Vec::with_capacity(m.numel() * 8);
+            for z in m.data() {
+                pr.extend_from_slice(&z.re.to_le_bytes());
+                pi.extend_from_slice(&z.im.to_le_bytes());
+            }
+            let mut el = matrix_element(name, MX_DOUBLE, FLAG_COMPLEX, &[m.rows() as u32, m.cols() as u32], MI_DOUBLE, &pr);
+            push_tag(&mut el, MI_DOUBLE, &pi);
+            Ok(el)
+        }
+        Value::Sparse(s) => Ok(sparse_element(name, s)),
+        Value::Cell(c) => cell_element(name, c),
+        Value::Struct(s) => struct_element(name, s),
+        Value::Func(_) => Err(format!("cannot save '{name}' — function handles are not supported in .mat v5")),
+    }
+}
+
+/// mxCELL element: flags/dims/name, then one nested miMATRIX per element
+/// in column-major order (MAT v5 spec §mxCELL_CLASS).
+fn cell_element(name: &str, c: &crate::CellArray) -> Result<Vec<u8>, String> {
+    let mut m = Vec::new();
+    let mut af = Vec::with_capacity(8);
+    af.extend_from_slice(&MX_CELL.to_le_bytes());
+    af.extend_from_slice(&0u32.to_le_bytes());
+    push_tag(&mut m, MI_UINT32, &af);
+    let (rows, cols) = c.shape();
+    let mut dv = Vec::with_capacity(8);
+    dv.extend_from_slice(&(rows as u32).to_le_bytes());
+    dv.extend_from_slice(&(cols as u32).to_le_bytes());
+    push_tag(&mut m, MI_INT32, &dv);
+    push_tag(&mut m, MI_INT8, name.as_bytes());
+    for i in 0..c.numel() {
+        let v = c.get_linear(i).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let inner = value_element("", &v)?;
+        push_tag(&mut m, MI_MATRIX, &inner);
+    }
+    Ok(m)
+}
+
+/// mxSTRUCT element: flags/dims/name, then the Field Name Length element
+/// (miINT32 — longest field name + 1, room for the NUL terminator), the
+/// Field Names element (miINT8 — each name NUL-padded to fieldnamelen),
+/// then field values as nested miMATRIX elements — for each element in
+/// column order, one matrix per field (MAT v5 spec §mxSTRUCT_CLASS).
+fn struct_element(name: &str, s: &crate::interp::StructArray) -> Result<Vec<u8>, String> {
+    let mut m = Vec::new();
+    let mut af = Vec::with_capacity(8);
+    af.extend_from_slice(&MX_STRUCT.to_le_bytes());
+    af.extend_from_slice(&0u32.to_le_bytes());
+    push_tag(&mut m, MI_UINT32, &af);
+    let mut dv = Vec::with_capacity(8);
+    dv.extend_from_slice(&(s.rows() as u32).to_le_bytes());
+    dv.extend_from_slice(&(s.cols() as u32).to_le_bytes());
+    push_tag(&mut m, MI_INT32, &dv);
+    push_tag(&mut m, MI_INT8, name.as_bytes());
+    let fields = s.field_names();
+    // Spec: fieldnamelen = longest field name + 1 (NUL). MATLAB writes 32;
+    // any consistent value is legal — keep it tight.
+    let fnlen = fields.iter().map(|f| f.len() + 1).max().unwrap_or(0).max(1) as u32;
+    push_tag(&mut m, MI_INT32, &fnlen.to_le_bytes());
+    let mut fnb = Vec::with_capacity(fnlen as usize * fields.len());
+    for f in &fields {
+        let mut b = f.clone().into_bytes();
+        b.resize(fnlen as usize, 0);
+        fnb.extend_from_slice(&b);
+    }
+    push_tag(&mut m, MI_INT8, &fnb);
+    for i in 0..s.numel() {
+        for f in &fields {
+            let v = s.field_at(i, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let inner = value_element("", &v)?;
+            push_tag(&mut m, MI_MATRIX, &inner);
+        }
+    }
+    Ok(m)
+}
+
 /// Write all `vars` to `path` in MAT v5 binary form.
 pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
     let mut out = Vec::new();
@@ -112,38 +215,7 @@ pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
     out.extend_from_slice(b"MI"); // endian indicator: MI = little-endian
 
     for (name, val) in vars {
-        let inner = match val {
-            Value::Num(x) => matrix_element(name, MX_DOUBLE, 0, &[1, 1], MI_DOUBLE, &x.to_le_bytes()),
-            Value::Mat(m) => {
-                let dims = [m.rows() as u32, m.cols() as u32];
-                let mut data = Vec::with_capacity(m.numel() * 8);
-                // `Matrix::data` is already column-major — direct dump.
-                for x in m.data() {
-                    data.extend_from_slice(&x.to_le_bytes());
-                }
-                matrix_element(name, MX_DOUBLE, 0, &dims, MI_DOUBLE, &data)
-            }
-            Value::Str(s) => matrix_element(name, MX_CHAR, 0, &[1, s.chars().count() as u32], MI_UTF8, s.as_bytes()),
-            Value::Cplx(m) => {
-                // Complex arrays: complex flag set + two miDOUBLE elements
-                // (real part, then imaginary part), per the MAT v5 spec.
-                let mut pr = Vec::with_capacity(m.numel() * 8);
-                let mut pi = Vec::with_capacity(m.numel() * 8);
-                for z in m.data() {
-                    pr.extend_from_slice(&z.re.to_le_bytes());
-                    pi.extend_from_slice(&z.im.to_le_bytes());
-                }
-                let mut el = matrix_element(name, MX_DOUBLE, FLAG_COMPLEX, &[m.rows() as u32, m.cols() as u32], MI_DOUBLE, &pr);
-                push_tag(&mut el, MI_DOUBLE, &pi);
-                el
-            }
-            Value::Sparse(s) => sparse_element(name, s),
-            // mxCELL/mxSTRUCT elements are nested miMATRIX elements —
-            // deferred until cell/struct writing lands together.
-            Value::Cell(_) | Value::Struct(_) => {
-                return Err(format!("cannot save '{name}' — .mat v5 cell/struct support is not implemented yet"));
-            }
-        };
+        let inner = value_element(name, val)?;
         // For miMATRIX the byte count includes its own 8-byte padding.
         let mut inner = inner;
         inner.resize(inner.len() + (8 - inner.len() % 8) % 8, 0);
@@ -316,6 +388,77 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
             }
             let s = matcore::SparseMat::from_triplets(rows, cols, &is, &js, &pr).map_err(|e| format!("bad sparse data: {e}"))?;
             Ok((name, Value::Sparse(s)))
+        }
+        MX_CELL => {
+            // After the name: one nested miMATRIX per cell element, in
+            // column-major order. (t, p) read above is the first of them.
+            let n = rows.saturating_mul(cols);
+            if n > MAX_NESTED {
+                return Err("cell array too large".into());
+            }
+            let mut items = Vec::with_capacity(n);
+            let mut first = Some((t, p));
+            for _ in 0..n {
+                let (et, ep) = match first.take() {
+                    Some(x) => x,
+                    None => r.element().ok_or("truncated cell contents")?,
+                };
+                if et != MI_MATRIX {
+                    return Err("cell element is not an miMATRIX".into());
+                }
+                items.push(read_matrix(ep)?.1);
+            }
+            Ok((name, Value::Cell(CellArray::from_col_major(rows, cols, items))))
+        }
+        MX_STRUCT => {
+            // (t, p) read above is the Field Name Length element (miINT32).
+            if t != MI_INT32 || p.len() < 4 {
+                return Err("bad struct field-name length".into());
+            }
+            let fnlen = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+            if fnlen == 0 || fnlen > 65536 {
+                return Err("bad struct field-name length".into());
+            }
+            let (ft, fp) = r.element().ok_or("truncated struct field names")?;
+            if !matches!(ft, MI_INT8 | MI_UINT8 | MI_UTF8) {
+                return Err("bad struct field names".into());
+            }
+            let nfields = fp.len() / fnlen;
+            let mut names = Vec::with_capacity(nfields);
+            for i in 0..nfields {
+                let chunk = fp.get(i * fnlen..(i + 1) * fnlen).unwrap_or(&[]);
+                let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+                names.push(String::from_utf8_lossy(&chunk[..end]).into_owned());
+            }
+            let n = rows.saturating_mul(cols);
+            if n.saturating_mul(nfields) > MAX_NESTED {
+                return Err("struct array too large".into());
+            }
+            // Field values: per element (column order), one miMATRIX per
+            // field, in field-name order.
+            let mut vals: Vec<Vec<Value>> = (0..nfields).map(|_| Vec::with_capacity(n)).collect();
+            for _el in 0..n {
+                for f in 0..nfields {
+                    let (et, ep) = r.element().ok_or("truncated struct field data")?;
+                    if et != MI_MATRIX {
+                        return Err("struct field element is not an miMATRIX".into());
+                    }
+                    let (_, v) = read_matrix(ep)?;
+                    if let Some(slot) = vals.get_mut(f) {
+                        slot.push(v);
+                    }
+                }
+            }
+            let mut sa = StructArray::with_dims(rows, cols);
+            for (f, fname) in names.iter().enumerate() {
+                sa.add_field(fname);
+                if let Some(field_vals) = vals.get_mut(f) {
+                    for (i, v) in field_vals.drain(..).enumerate() {
+                        sa.set_field(i, fname, v).map_err(|e| e.message)?;
+                    }
+                }
+            }
+            Ok((name, Value::Struct(sa)))
         }
         _ => Err(format!("unsupported array class {class}")),
     }

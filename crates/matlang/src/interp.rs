@@ -24,6 +24,9 @@ const MAX_ELEMS: usize = 100_000_000;
 const MAX_CELL_ELEMS: usize = 10_000_000;
 /// `figure(n)` may not open an unbounded number of figures.
 const MAX_FIGURES: usize = 1_000;
+/// Nested function/handle calls are bounded — a runaway recursive script
+/// must error, not overflow the host stack.
+const MAX_CALL_DEPTH: usize = 256;
 
 /// Control-flow signal threading through statement execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +62,18 @@ pub enum Value {
     /// set; `StructArray::fields` stores each field's values per element
     /// (column-major element order), like MATLAB's field-oriented storage.
     Struct(StructArray),
+    /// Function handle — `@name` or an anonymous function `@(args) expr`.
+    Func(FuncHandle),
+}
+
+/// What a `Value::Func` refers to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuncHandle {
+    /// `@name` — resolved at call time: user function, then builtin.
+    Named(String),
+    /// `@(a, b) expr` — `env` is a snapshot of the workspace taken at
+    /// definition time (MATLAB anonymous-function semantics).
+    Closure { params: Vec<String>, body: Box<Expr>, env: HashMap<String, Value> },
 }
 
 /// A MATLAB struct array: `rows x cols` elements, each holding the same
@@ -336,6 +351,17 @@ impl CellArray {
         CellArray { rows, cols: 1, items }
     }
 
+    /// `rows x cols` cell from a column-major item list — used by the
+    /// .mat reader (items beyond `rows*cols` are dropped; short lists
+    /// pad with `[]`).
+    pub(crate) fn from_col_major(rows: usize, cols: usize, items: Vec<Value>) -> Self {
+        let mut ca = CellArray::new(rows, cols);
+        for (i, v) in items.into_iter().enumerate().take(rows.saturating_mul(cols)) {
+            ca.set_linear(i, v);
+        }
+        ca
+    }
+
     pub fn shape(&self) -> (usize, usize) {
         (self.rows, self.cols)
     }
@@ -560,6 +586,7 @@ impl Value {
             Value::Str(_) => Err(LangError::new("string used where a number was expected", 0)),
             Value::Cell(_) => Err(LangError::new("cell array used where a number was expected", 0)),
             Value::Struct(_) => Err(LangError::new("struct used where a number was expected", 0)),
+            Value::Func(_) => Err(LangError::new("function handle used where a number was expected", 0)),
         }
     }
 
@@ -598,6 +625,7 @@ impl Value {
             Value::Cell(c) => c.shape(),
             Value::Struct(s) => (s.rows(), s.cols()),
             Value::Sparse(s) => s.shape(),
+            Value::Func(_) => (1, 1),
         }
     }
 
@@ -628,6 +656,9 @@ pub struct Session {
     paths: Vec<std::path::PathBuf>,
     /// Argument/result counts of the innermost active call (`nargin`/`nargout`).
     call_ctx: Option<(usize, usize)>,
+    /// Nested call depth — bounded so runaway recursion errors out instead
+    /// of overflowing the host stack.
+    call_depth: usize,
     /// Open figures; index is the figure number minus one.
     figs: Vec<matplot::Figure>,
     /// Current figure number (1-based); 0 = none.
@@ -650,6 +681,7 @@ impl Session {
             funcs: HashMap::new(),
             paths,
             call_ctx: None,
+            call_depth: 0,
             last_err: None,
             figs: Vec::new(),
             cur_fig: 0,
@@ -726,13 +758,19 @@ impl Session {
 
     /// Parse and run `source`; returns everything the script echoed.
     pub fn run(&mut self, source: &str) -> Result<String, LangError> {
-        let stmts = crate::parser::parse(source)?;
-        self.hoist_functions(&stmts);
+        let stmts = crate::parser::parse_lines(source)?;
+        let bare: Vec<Stmt> = stmts.iter().map(|(_, s)| s.clone()).collect();
+        self.hoist_functions(&bare);
         let mut out = String::new();
-        for s in &stmts {
+        for (line, s) in &stmts {
             let flow = match self.exec_stmt(s, &mut out) {
                 Ok(f) => f,
-                Err(e) => {
+                Err(mut e) => {
+                    // Errors raised without position get the statement's line
+                    // so `Error: line N` messages link back to the source.
+                    if e.line == 0 {
+                        e.line = *line;
+                    }
                     self.last_err = Some(e.clone());
                     out.push_str(&self.print_buf);
                     self.print_buf.clear();
@@ -999,6 +1037,26 @@ impl Session {
                     }
                     return Ok(Flow::Normal);
                 };
+                // `[a,b] = f(x)` where `f` is a function handle variable.
+                if let Some(Value::Func(h)) = self.vars.get(fname).cloned() {
+                    let argv = self.eval_args(fargs)?;
+                    let outs = self.call_handle(&h, argv, names.len())?;
+                    for (i, n) in names.iter().enumerate() {
+                        let v = outs.get(i).cloned().ok_or_else(|| LangError::new(format!("function '{fname}' returned too few outputs"), 0))?;
+                        if n != "~" {
+                            self.vars.insert(n.clone(), v);
+                        }
+                    }
+                    if !suppress {
+                        for n in names {
+                            if let Some(v) = self.vars.get(n) {
+                                let long = self.fmt_long;
+                                out.push_str(&format!("{n} =\n\n{}\n\n", fmt_value(v, long)));
+                            }
+                        }
+                    }
+                    return Ok(Flow::Normal);
+                }
                 if !self.is_function(fname)? {
                     // Multi-output builtins: [M,I]=max(A), [V,D]=eig(A), …
                     match self.builtin_multi(fname, fargs, names.len())? {
@@ -1321,8 +1379,13 @@ impl Session {
             }
             Expr::Index(base, args) => {
                 // Chained subscript: `c{1}(2)`, `s.f(i)` — index the value
-                // the base expression produced.
+                // the base expression produced. A handle is called instead:
+                // `c{1}(x)` when `c{1}` is a function handle calls it.
                 let v = self.eval(base)?;
+                if let Value::Func(h) = v {
+                    let argv = self.eval_args(args)?;
+                    return Ok(self.call_handle(&h, argv, 1)?.into_iter().next());
+                }
                 self.index_into(&v, args).map(Some)
             }
             Expr::BraceIdx(base, args) => {
@@ -1418,6 +1481,12 @@ impl Session {
                 if self.vars.contains_key(name) {
                     let target = self.vars.get(name).cloned();
                     match target {
+                        // `f(args)` on a function handle calls it — handles
+                        // cannot be subscripted.
+                        Some(Value::Func(h)) => {
+                            let argv = self.eval_args(args)?;
+                            Ok(self.call_handle(&h, argv, 1)?.into_iter().next())
+                        }
                         Some(t) => self.index_into(&t, args).map(Some),
                         None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
                     }
@@ -1427,6 +1496,12 @@ impl Session {
                 } else {
                     self.builtin(name, args)
                 }
+            }
+            Expr::FuncRef(name) => Ok(Some(Value::Func(FuncHandle::Named(name.clone())))),
+            Expr::AnonFunc(params, body) => {
+                // The closure captures the whole visible workspace now —
+                // later edits to those variables don't reach it.
+                Ok(Some(Value::Func(FuncHandle::Closure { params: params.clone(), body: body.clone(), env: self.vars.clone() })))
             }
         }
     }
@@ -3315,6 +3390,122 @@ impl Session {
                 }
                 Ok(None)
             }
+            // --- function handles -----------------------------------------
+            "feval" => {
+                let v = self.eval_args(args)?;
+                let (target, rest) = match v.split_first() {
+                    Some((t, r)) => (t.clone(), r.to_vec()),
+                    None => return Err(LangError::new("feval needs a function handle or name", 0)),
+                };
+                let outs = self.call_feval_target(&target, rest, 1)?;
+                Ok(outs.into_iter().next())
+            }
+            "func2str" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Func(h)) => Ok(Some(Value::Str(func_text(h)))),
+                    _ => Err(LangError::new("func2str needs a function handle", 0)),
+                }
+            }
+            "str2func" => {
+                let v = self.eval_args(args)?;
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("str2func needs a string", 0)),
+                };
+                Ok(Some(Value::Func(str_to_func(&s)?)))
+            }
+            "functions" => {
+                let v = self.eval_args(args)?;
+                let h = match v.first() {
+                    Some(Value::Func(h)) => h,
+                    _ => return Err(LangError::new("functions needs a function handle", 0)),
+                };
+                let mut m = std::collections::BTreeMap::new();
+                match h {
+                    FuncHandle::Named(n) => {
+                        m.insert("function".into(), Value::Str(n.clone()));
+                        m.insert("type".into(), Value::Str("simple".into()));
+                        m.insert("file".into(), Value::Str(String::new()));
+                    }
+                    FuncHandle::Closure { .. } => {
+                        m.insert("function".into(), Value::Str(func_text(h)));
+                        m.insert("type".into(), Value::Str("anonymous".into()));
+                        m.insert("file".into(), Value::Str(String::new()));
+                    }
+                }
+                Ok(Some(Value::Struct(StructArray::from_map(m))))
+            }
+            "arrayfun" => {
+                // `arrayfun(fh, A)` — apply fh to each element, same-shaped
+                // result; non-scalar outputs error (needs the
+                // 'UniformOutput',false form, which is not implemented).
+                let v = self.eval_args(args)?;
+                let (target, rest) = match v.split_first() {
+                    Some((t, r)) => (t.clone(), r.to_vec()),
+                    None => return Err(LangError::new("arrayfun needs a function handle", 0)),
+                };
+                let src = match rest.first() {
+                    Some(Value::Cell(c)) => (0..c.numel()).map(|i| c.get_linear(i).cloned().unwrap_or_else(CellArray::empty)).collect::<Vec<_>>(),
+                    Some(other) => other.to_matrix()?.data().iter().map(|&x| Value::Num(x)).collect::<Vec<_>>(),
+                    None => return Err(LangError::new("arrayfun needs an array argument", 0)),
+                };
+                let (rows, cols) = rest.first().map(Value::dims).unwrap_or((0, 0));
+                let mut data = Vec::with_capacity(src.len());
+                for item in src {
+                    let outs = self.call_feval_target(&target, vec![item], 1)?;
+                    let out = outs.into_iter().next().ok_or_else(|| LangError::new("arrayfun: function returned no value", 0))?;
+                    data.push(
+                        out.scalar().map_err(|_| LangError::new("arrayfun: non-scalar output needs 'UniformOutput', false (not implemented)", 0))?,
+                    );
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major(rows, cols, data).map_err(lang)?)))
+            }
+            "cellfun" => {
+                // `cellfun(fh, C [, 'UniformOutput', false])` — apply fh to
+                // each cell's content. Default collects scalar results into
+                // a like-shaped double array; 'UniformOutput',false keeps a
+                // cell of whatever each call returned.
+                let v = self.eval_args(args)?;
+                let (target, rest) = match v.split_first() {
+                    Some((t, r)) => (t.clone(), r.to_vec()),
+                    None => return Err(LangError::new("cellfun needs a function handle", 0)),
+                };
+                let ca = match rest.first() {
+                    Some(Value::Cell(c)) => c.clone(),
+                    _ => return Err(LangError::new("cellfun needs a cell array", 0)),
+                };
+                let mut uniform = true;
+                if let Some(Value::Str(s)) = rest.get(1) {
+                    if s.eq_ignore_ascii_case("uniformoutput") {
+                        uniform = match rest.get(2) {
+                            Some(Value::Str(v)) => !v.eq_ignore_ascii_case("false"),
+                            Some(v) => v.scalar().map(|x| x != 0.0).unwrap_or(true),
+                            None => true,
+                        };
+                    }
+                }
+                let mut outs = Vec::with_capacity(ca.numel());
+                for i in 0..ca.numel() {
+                    let item = ca.get_linear(i).cloned().unwrap_or_else(CellArray::empty);
+                    let r = self.call_feval_target(&target, vec![item], 1)?;
+                    outs.push(r.into_iter().next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+                }
+                if !uniform {
+                    let (rows, cols) = ca.shape();
+                    let mut out = CellArray::new(rows, cols);
+                    for (i, val) in outs.into_iter().enumerate() {
+                        out.set_linear(i, val);
+                    }
+                    return Ok(Some(Value::Cell(out)));
+                }
+                let (rows, cols) = ca.shape();
+                let mut data = Vec::with_capacity(outs.len());
+                for val in &outs {
+                    data.push(val.scalar().map_err(|_| LangError::new("cellfun: non-scalar output needs 'UniformOutput', false", 0))?);
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major(rows, cols, data).map_err(lang)?)))
+            }
             // Inside a function: the counts of the innermost active call.
             "nargin" => Ok(Some(Value::Num(self.call_ctx.map(|c| c.0).unwrap_or(0) as f64))),
             "nargout" => Ok(Some(Value::Num(self.call_ctx.map(|c| c.1).unwrap_or(1) as f64))),
@@ -5054,9 +5245,26 @@ impl Session {
     /// Call a registered function: evaluate args, run its body in a fresh
     /// local scope, and return the bound outputs.
     fn call_function(&mut self, name: &str, arg_exprs: &[Expr], nargout: usize) -> Result<Vec<Value>, LangError> {
-        let def = self.funcs.get(name).cloned().ok_or_else(|| LangError::new(format!("unknown function '{name}'"), 0))?;
         let argv = self.eval_args(arg_exprs)?;
+        self.call_function_argv(name, argv, nargout)
+    }
 
+    /// `call_function` with pre-evaluated argument values — used by
+    /// `feval`/function-handle dispatch where args arrive as `Value`s.
+    fn call_function_argv(&mut self, name: &str, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
+        let def = self.funcs.get(name).cloned().ok_or_else(|| LangError::new(format!("unknown function '{name}'"), 0))?;
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(LangError::new("call depth limit exceeded (runaway recursion?)", 0));
+        }
+        self.call_depth += 1;
+        // On early return the depth must still be restored — route through
+        // a scope guard pattern: compute, then decrement before `?`.
+        let result = self.call_function_argv_inner(name, &def, argv, nargout);
+        self.call_depth = self.call_depth.saturating_sub(1);
+        result
+    }
+
+    fn call_function_argv_inner(&mut self, name: &str, def: &FuncDef, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
         // Fresh local scope: caller workspace is fully swapped out.
         let saved_vars = std::mem::take(&mut self.vars);
         let saved_ctx = self.call_ctx.replace((argv.len(), nargout));
@@ -5125,6 +5333,93 @@ impl Session {
         result
     }
 
+    /// Call a function handle with evaluated argument values; returns up to
+    /// `nout` outputs (an anonymous function always has exactly one).
+    fn call_handle(&mut self, h: &FuncHandle, argv: Vec<Value>, nout: usize) -> Result<Vec<Value>, LangError> {
+        match h {
+            FuncHandle::Named(name) => self.call_named(name, argv, nout),
+            FuncHandle::Closure { params, body, env } => {
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    return Err(LangError::new("call depth limit exceeded (runaway recursion?)", 0));
+                }
+                self.call_depth += 1;
+                // Child scope: the captured workspace plus bound params —
+                // the caller's variables are swapped out like a `function`
+                // call. Params shadow same-named captured variables.
+                let saved_vars = std::mem::replace(&mut self.vars, env.clone());
+                let saved_ctx = self.call_ctx.replace((argv.len(), 1));
+                for (i, p) in params.iter().enumerate() {
+                    let v = argv.get(i).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                    self.vars.insert(p.clone(), v);
+                }
+                let mut fbuf = std::mem::take(&mut self.print_buf);
+                let result = self.eval(body).map(|v| vec![v]);
+                fbuf.push_str(&self.print_buf);
+                self.print_buf = fbuf;
+                self.vars = saved_vars;
+                self.call_ctx = saved_ctx;
+                self.call_depth = self.call_depth.saturating_sub(1);
+                result
+            }
+        }
+    }
+
+    /// Call `name` (user function or builtin) with evaluated arg values.
+    fn call_named(&mut self, name: &str, argv: Vec<Value>, nout: usize) -> Result<Vec<Value>, LangError> {
+        if self.is_function(name)? {
+            return self.call_function_argv(name, argv, nout);
+        }
+        if self.is_builtin(name) {
+            return self.builtin_values(name, argv, nout);
+        }
+        Err(LangError::new(format!("'{name}' is not a function"), 0))
+    }
+
+    /// `feval`-style dispatch on a handle *or* a function-name char —
+    /// MATLAB's `feval` accepts both.
+    fn call_feval_target(&mut self, target: &Value, argv: Vec<Value>, nout: usize) -> Result<Vec<Value>, LangError> {
+        match target {
+            Value::Func(h) => self.call_handle(h, argv, nout),
+            Value::Str(s) => self.call_named(&s.clone(), argv, nout),
+            _ => Err(LangError::new("first argument must be a function handle or a function name", 0)),
+        }
+    }
+
+    /// Run a builtin whose arguments are already evaluated `Value`s. Each
+    /// value is bound to a hidden temporary name (unspellable in source —
+    /// it contains a control char) so the expr-driven builtin table can
+    /// consume it; the bindings are restored afterwards.
+    fn builtin_values(&mut self, name: &str, argv: Vec<Value>, nout: usize) -> Result<Vec<Value>, LangError> {
+        let mut exprs = Vec::with_capacity(argv.len());
+        let mut saved: Vec<(String, Option<Value>)> = Vec::with_capacity(argv.len());
+        for (i, v) in argv.into_iter().enumerate() {
+            let tmp = format!("\u{1}harg{i}");
+            saved.push((tmp.clone(), self.vars.insert(tmp.clone(), v)));
+            exprs.push(Expr::Ident(tmp));
+        }
+        // No `?` here — the temporaries must be restored even on error.
+        let out = if nout > 1 {
+            match self.builtin_multi(name, &exprs, nout) {
+                Ok(Some(outs)) => Ok(outs),
+                Ok(None) => self.builtin(name, &exprs).map(|o| o.into_iter().collect()),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.builtin(name, &exprs).map(|o| o.into_iter().collect())
+        };
+        for (tmp, old) in saved {
+            match old {
+                Some(v) => {
+                    self.vars.insert(tmp, v);
+                }
+                None => {
+                    self.vars.remove(&tmp);
+                }
+            }
+        }
+        out
+    }
+
     /// The `i`-th call argument as a matrix. Args go through `eval_args`
     /// so comma-separated lists (`f(c{:})`) expand before indexing —
     /// the position counts the flattened list, as M-code defines.
@@ -5139,6 +5434,14 @@ impl Session {
     /// multi-output form (caller reports "not a function").
     fn builtin_multi(&mut self, name: &str, args: &[Expr], nout: usize) -> Result<Option<Vec<Value>>, LangError> {
         let out = match name {
+            "feval" => {
+                // `[a,b] = feval(@f, x)` — multi-output call through a handle.
+                let v = self.eval_args(args)?;
+                match v.split_first() {
+                    Some((t, r)) => self.call_feval_target(t, r.to_vec(), nout)?,
+                    None => return Err(LangError::new("feval needs a function handle or name", 0)),
+                }
+            }
             "size" => {
                 let v = self.eval_args(args)?;
                 let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
@@ -5887,6 +6190,7 @@ impl Session {
                     Some(Value::Str(_)) => "char",
                     Some(Value::Cell(_)) => "cell",
                     Some(Value::Struct(_)) => "struct",
+                    Some(Value::Func(_)) => "function_handle",
                     None => "",
                 };
                 cls == actual || cls == "numeric" && actual == "double"
@@ -5951,28 +6255,20 @@ impl Session {
         Ok(Some(Value::Num(if b { 1.0 } else { 0.0 })))
     }
 
-    /// `fzero`/`fminsearch`/`integral`/`quad` on a named function (string
-    /// `'name'` or builtin). Function handles (`@f`) are roadmap; names work.
+    /// `fzero`/`fminsearch`/`integral`/`quad` on a function handle (`@f`,
+    /// `@(x) expr`) or a function-name char (`fzero('sin', 1)`).
     fn solve_scalar(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         let v = self.eval_args(args)?;
-        let fname = match v.first() {
-            Some(Value::Str(s)) => s.clone(),
+        let target = match v.first() {
+            Some(t @ (Value::Func(_) | Value::Str(_))) => t.clone(),
             Some(Value::Num(_)) | Some(Value::Mat(_)) => {
-                return Err(LangError::new(format!("{name}: first argument must be a function name (e.g. {name}('sin', 1))"), 0))
+                return Err(LangError::new(format!("{name}: first argument must be a function handle or name (e.g. {name}(@sin, 1))"), 0))
             }
-            _ => return Err(LangError::new(format!("{name} needs a function name"), 0)),
+            _ => return Err(LangError::new(format!("{name} needs a function handle or name"), 0)),
         };
         let f = |s: &mut Session, x: f64| -> Result<f64, LangError> {
-            let a = vec![Expr::Num(x)];
-            if s.funcs.contains_key(&fname) || s.is_function(&fname)? {
-                let outs = s.call_function(&fname, &a, 1)?;
-                outs.first().ok_or_else(|| LangError::new(format!("{fname} returned nothing"), 0))?.scalar()
-            } else {
-                match s.builtin(&fname, &a)? {
-                    Some(v) => v.scalar(),
-                    None => Err(LangError::new(format!("'{fname}' produced no value"), 0)),
-                }
-            }
+            let outs = s.call_feval_target(&target, vec![Value::Num(x)], 1)?;
+            outs.first().ok_or_else(|| LangError::new("function returned no value", 0))?.scalar()
         };
         match name {
             "fzero" => {
@@ -6257,6 +6553,7 @@ impl Session {
                         }
                         Value::Cell(_) => return Err(LangError::new(format!("cannot save cell array '{n}' to an ASCII file"), 0)),
                         Value::Struct(_) => return Err(LangError::new(format!("cannot save struct '{n}' to an ASCII file"), 0)),
+                        Value::Func(_) => return Err(LangError::new(format!("cannot save function handle '{n}' to an ASCII file"), 0)),
                     }
                 }
             }
@@ -7326,6 +7623,12 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "nargout",
     "narginchk",
     "nargoutchk",
+    "feval",
+    "func2str",
+    "str2func",
+    "functions",
+    "arrayfun",
+    "cellfun",
     "lasterror",
     "figure",
     "gcf",
@@ -7470,6 +7773,7 @@ pub fn describe(v: &Value) -> String {
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
+        Value::Func(_) => "1x1 function_handle".into(),
     }
 }
 
@@ -7491,6 +7795,7 @@ impl Scalar for Value {
             Value::Str(_) => Err(LangError::new("expected a scalar, got a string", 0)),
             Value::Cell(_) => Err(LangError::new("expected a scalar, got a cell array", 0)),
             Value::Struct(_) => Err(LangError::new("expected a scalar, got a struct", 0)),
+            Value::Func(_) => Err(LangError::new("expected a scalar, got a function handle", 0)),
             // A 1x1 sparse reads as its stored value (0 when empty).
             Value::Sparse(s) => {
                 if s.numel() == 1 {
@@ -7541,6 +7846,111 @@ pub fn fmt_num(v: f64, long: bool) -> String {
     }
 }
 
+/// Handle text form: `@sin` or `@(x,y)x.*y` — what `disp`, `func2str`
+/// and a handle's echo print.
+pub fn func_text(h: &FuncHandle) -> String {
+    match h {
+        FuncHandle::Named(n) => format!("@{n}"),
+        FuncHandle::Closure { params, body, .. } => format!("@({}){}", params.join(","), expr_text(body)),
+    }
+}
+
+/// Compact M-code text for an expression — used by `func2str`/`disp` for
+/// anonymous functions. Output re-parses to the same semantics (binary
+/// children are parenthesized rather than relying on precedence).
+fn expr_text(e: &Expr) -> String {
+    match e {
+        Expr::Num(v) => {
+            // Shortest round-trip float repr; `format!` gives it for f64.
+            format!("{v}")
+        }
+        Expr::CNum(v) => format!("{v}i"),
+        Expr::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Expr::Ident(n) => n.clone(),
+        Expr::Colon => ":".into(),
+        Expr::End => "end".into(),
+        Expr::Range(a, step, b) => match step {
+            Some(s) => format!("{}:{}:{}", pexpr(a), pexpr(s), pexpr(b)),
+            None => format!("{}:{}", pexpr(a), pexpr(b)),
+        },
+        Expr::Matrix(rows) => {
+            let rs: Vec<String> = rows.iter().map(|r| r.iter().map(expr_text).collect::<Vec<_>>().join(" ")).collect();
+            format!("[{}]", rs.join("; "))
+        }
+        Expr::CellMat(rows) => {
+            let rs: Vec<String> = rows.iter().map(|r| r.iter().map(expr_text).collect::<Vec<_>>().join(" ")).collect();
+            format!("{{{}}}", rs.join("; "))
+        }
+        Expr::BraceIndex(n, args) => format!("{}{{{}}}", n, expr_text_args(args)),
+        Expr::BraceIdx(b, args) => format!("{}{{{}}}", pexpr(b), expr_text_args(args)),
+        Expr::Field(b, f) => format!("{}.{}", pexpr(b), f),
+        Expr::DynField(b, n) => format!("{}.({})", pexpr(b), expr_text(n)),
+        Expr::Index(b, args) => format!("{}({})", pexpr(b), expr_text_args(args)),
+        Expr::CallOrIndex(n, args) => format!("{}({})", n, expr_text_args(args)),
+        Expr::Unary(op, e) => {
+            let o = match op {
+                UnOp::Neg => "-",
+                UnOp::Pos => "+",
+                UnOp::Not => "~",
+            };
+            format!("{}{}", o, pexpr(e))
+        }
+        Expr::Binary(op, a, b) => {
+            let o = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Backslash => "\\",
+                BinOp::Pow => "^",
+                BinOp::ElemMul => ".*",
+                BinOp::ElemDiv => "./",
+                BinOp::ElemPow => ".^",
+                BinOp::Eq => "==",
+                BinOp::Neq => "~=",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::And => "&",
+                BinOp::Or => "|",
+                BinOp::ScAnd => "&&",
+                BinOp::ScOr => "||",
+            };
+            format!("{} {o} {}", pexpr(a), pexpr(b))
+        }
+        Expr::Transpose(e, conj) => format!("{}{}", pexpr(e), if *conj { "'" } else { ".'" }),
+        Expr::FuncRef(n) => format!("@{n}"),
+        Expr::AnonFunc(params, body) => format!("@({}){}", params.join(","), expr_text(body)),
+    }
+}
+
+fn expr_text_args(args: &[Expr]) -> String {
+    args.iter().map(expr_text).collect::<Vec<_>>().join(",")
+}
+
+/// `expr_text` for a child position — non-atomic expressions get parens.
+fn pexpr(e: &Expr) -> String {
+    match e {
+        Expr::Binary(..) | Expr::Range(..) | Expr::Unary(..) => format!("({})", expr_text(e)),
+        _ => expr_text(e),
+    }
+}
+
+/// `str2func`: `'name'` or `'@name'` → a named handle; `'@(args) expr'` →
+/// a closure. Per M-code, a handle built from a string does NOT capture
+/// the caller's workspace — the closure env starts empty.
+fn str_to_func(s: &str) -> Result<FuncHandle, LangError> {
+    let t = s.trim();
+    let stmts = crate::parser::parse(t).map_err(|e| LangError::new(format!("str2func: {}", e.message), e.line))?;
+    match stmts.as_slice() {
+        [Stmt::Expr(Expr::AnonFunc(params, body), _)] => Ok(FuncHandle::Closure { params: params.clone(), body: body.clone(), env: HashMap::new() }),
+        [Stmt::Expr(Expr::FuncRef(n), _)] => Ok(FuncHandle::Named(n.clone())),
+        [Stmt::Expr(Expr::Ident(n), _)] if !t.starts_with('@') => Ok(FuncHandle::Named(n.clone())),
+        _ => Err(LangError::new("str2func: not a valid function specification", 0)),
+    }
+}
+
 /// One cell rendered compactly inside a `disp` of a cell array:
 /// `[1]` for scalars, `'a'` for chars, `2x2 double` for bigger matrices.
 fn fmt_cell_item(v: &Value, long: bool) -> String {
@@ -7558,6 +7968,7 @@ fn fmt_cell_item(v: &Value, long: bool) -> String {
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
+        Value::Func(h) => func_text(h),
     }
 }
 
@@ -7585,6 +7996,7 @@ pub fn fmt_value(v: &Value, long: bool) -> impl fmt::Display + '_ {
                     Ok(())
                 }
                 Value::Str(s) => write!(f, "{s}"),
+                Value::Func(h) => write!(f, "   {}", func_text(h)),
                 Value::Sparse(s) => {
                     // MATLAB's disp form for sparse: a (row, col) value list.
                     if s.nnz() == 0 {
@@ -7672,6 +8084,7 @@ fn split_format_args(v: &[Value]) -> Result<(String, Vec<FmtArg>), LangError> {
             Value::Cell(c) => args.push(FmtArg::Txt(format!("{}x{} cell", c.shape().0, c.shape().1))),
             Value::Struct(s) => args.push(FmtArg::Txt(format!("{}x{} struct", s.rows(), s.cols()))),
             Value::Sparse(s) => args.extend(s.full().data().iter().map(|&x| FmtArg::Num(x))),
+            Value::Func(h) => args.push(FmtArg::Txt(func_text(h))),
         }
     }
     Ok((fmt, args))

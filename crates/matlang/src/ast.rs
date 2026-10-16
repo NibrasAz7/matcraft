@@ -35,6 +35,11 @@ pub enum Expr {
     /// `f(...)` — a function call or `A(...)` indexing; resolved at eval time
     /// by whether the name is bound in the workspace.
     CallOrIndex(String, Vec<Expr>),
+    /// `@name` — a handle to a named function (builtin or user-defined).
+    FuncRef(String),
+    /// `@(a, b) expr` — an anonymous function; captures the workspace
+    /// visible at definition time (M-code semantics).
+    AnonFunc(Vec<String>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

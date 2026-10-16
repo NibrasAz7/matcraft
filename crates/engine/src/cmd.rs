@@ -47,6 +47,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("poly/signal", "polyval polyfit roots poly conv deconv interp1 trapz histcounts"),
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls"),
     ("solvers", "fzero fminsearch integral quad"),
+    ("function handles", "feval func2str str2func functions arrayfun cellfun"),
     ("strings", "num2str str2double str2num strcmp strcmpi strcat upper lower strtrim strrep strfind double logical char"),
     ("workspace/env", "eval error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk disp display format fprintf sprintf who whos clear assert rng normrnd"),
     ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile csvread mkdir"),
@@ -152,6 +153,7 @@ fn value_size(v: &Value) -> (usize, usize) {
         Value::Cell(c) => c.shape(),
         Value::Struct(s) => (s.rows(), s.cols()),
         Value::Sparse(s) => (s.rows(), s.cols()),
+        Value::Func(_) => (1, 1),
     }
 }
 
@@ -194,6 +196,7 @@ fn value_to_json(v: &Value, long: bool) -> Json {
                 (0..m.rows()).map(|r| Json::Array((0..m.cols()).map(|c| json!(m.get(r, c).unwrap_or(f64::NAN))).collect())).collect();
             json!({"class": class, "size": [r, c], "display": display, "data": rows, "sparse": true, "nnz": s.nnz()})
         }
+        Value::Func(_) => json!({"class": class, "size": [r, c], "display": display}),
     }
 }
 

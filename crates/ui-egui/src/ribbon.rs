@@ -36,6 +36,10 @@ pub enum RibbonCmd {
     Insert(String),
     /// Open the Preferences window.
     Preferences,
+    /// Open the editor's find/replace bar (Ctrl+F).
+    Find,
+    /// Open the Find in Files window (Ctrl+Shift+F).
+    FindFiles,
 }
 
 /// View-panel toggles the VIEW tab edits in place.
@@ -265,6 +269,18 @@ fn editor_tab(ui: &mut egui::Ui, has_editor: bool) -> Option<RibbonCmd> {
         }
         if ui.add_enabled(has_editor, egui::Button::new("Run Selection")).on_hover_text("evaluate the highlighted code — F9").clicked() {
             c = Some(RibbonCmd::RunSelection);
+        }
+        c
+    }) {
+        cmd = Some(c);
+    }
+    if let Some(c) = section(ui, "FIND", |ui| {
+        let mut c = None;
+        if ui.add_enabled(has_editor, egui::Button::new("Find")).on_hover_text("find in the editor buffer — Ctrl+F").clicked() {
+            c = Some(RibbonCmd::Find);
+        }
+        if ui.button("Find Files").on_hover_text("search *.m files under the current folder — Ctrl+Shift+F").clicked() {
+            c = Some(RibbonCmd::FindFiles);
         }
         c
     }) {

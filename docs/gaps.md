@@ -22,6 +22,7 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | G8 | No `apps/matcraft-web` | WASM build; never break wasm (`cargo xtask wasm`). `ui-egui` keeps net-free dispatch so it stays wasm-compatible. |
 | ~~G9~~ | ~~No `packaging/`~~ | **Done 2026-10-14:** `packaging/windows/` (WiX `.wxs` + `package.ps1` + `sign.ps1`), `winresource` icon via `build.rs`; MSI + portable zip built, installed to `C:\Program Files\MatCraft`, verified. macOS/Linux packaging still open. |
 | ~~G10~~ | ~~Not in the skill catalog~~ | **Done:** `artcraft-cli` SKILL.md row + gotchas, `references/commands/matcraft_commands.txt`, `_learn/matcraft_commands.txt`; `14-MatCraft-ForecastAnalysis` demo in the playground. |
+| G35 | No debugger hooks for Studio breakpoints | The editor gutter toggles per-editor `BTreeSet<usize>` marks, but `dbstop`/`dbclear`/`dbstatus`/`dbcont`/`dbstep` don't exist in `matlang`/`engine` — marks are visual only and have no effect until the interpreter gains a debug hook (pause-at-line in `interp` + `debug.*` engine commands). |
 
 ## P2 — language completeness
 

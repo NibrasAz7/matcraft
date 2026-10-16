@@ -20,12 +20,20 @@ use crate::LangError;
 const MAX_DEPTH: usize = 256;
 
 pub fn parse(source: &str) -> Result<Vec<Stmt>, LangError> {
+    Ok(parse_lines(source)?.into_iter().map(|(_, s)| s).collect())
+}
+
+/// Like [`parse`] but pairs each top-level statement with its 1-based source
+/// line — the interpreter stamps it onto runtime errors so `Error: line 3`
+/// messages can link back into the editor.
+pub fn parse_lines(source: &str) -> Result<Vec<(usize, Stmt)>, LangError> {
     let toks = crate::lexer::lex(source)?;
     let mut p = Parser { toks, pos: 0, elem_break: false };
     let mut out = Vec::new();
     p.skip_separators();
     while p.peek() != &Tok::Eof {
-        out.push(p.statement(0)?);
+        let line = p.line();
+        out.push((line, p.statement(0)?));
         p.skip_separators();
     }
     Ok(out)
@@ -712,6 +720,26 @@ impl Parser {
             }
             Tok::LBracket => Ok(Expr::Matrix(self.table_literal(depth, &Tok::RBracket)?)),
             Tok::LBrace => Ok(Expr::CellMat(self.table_literal(depth, &Tok::RBrace)?)),
+            Tok::At => match self.next() {
+                // `@name` — handle to a named function or builtin.
+                Tok::Ident(name) => Ok(Expr::FuncRef(name)),
+                // `@(a, b) expr` — anonymous function. The body grabs the
+                // longest valid expression (M-code rule); `,`/`;`/`)` end it.
+                Tok::LParen => {
+                    let mut params = Vec::new();
+                    loop {
+                        match self.next() {
+                            Tok::Ident(n) => params.push(n),
+                            Tok::Comma | Tok::Newline => {}
+                            Tok::RParen => break,
+                            t => return self.err(format!("expected parameter or ')' in anonymous function, found {t:?}")),
+                        }
+                    }
+                    let body = self.expr(depth + 1)?;
+                    Ok(Expr::AnonFunc(params, Box::new(body)))
+                }
+                t => self.err(format!("expected a name or '(args)' after '@', found {t:?}")),
+            },
             t => self.err(format!("unexpected {t:?}")),
         }
     }

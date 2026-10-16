@@ -12,6 +12,7 @@ pub mod control;
 mod editor;
 pub mod figure;
 mod files;
+mod findfiles;
 mod history;
 mod repl;
 mod ribbon;
@@ -26,6 +27,7 @@ use control::ControlRequest;
 use editor::{Editor, EditorCmd};
 use figure::Rasterizer;
 use files::FileCmd;
+use findfiles::FindFiles;
 use history::HistCmd;
 use repl::Repl;
 use ribbon::{RibbonCmd, Tab as RibbonTab};
@@ -112,13 +114,26 @@ pub struct MatApp {
     cd_recent: std::collections::VecDeque<std::path::PathBuf>,
     /// The Preferences window is open.
     prefs_open: bool,
+    /// Find in Files window (Ctrl+Shift+F).
+    find_files: FindFiles,
+    /// Figures shown as floating windows instead of document tabs.
+    fig_popped: std::collections::BTreeSet<usize>,
+    /// Write `layout.json` on drop (set by the eframe entry point).
+    persist_layout: bool,
+    /// Zoom factor restored from `layout.json`, applied on the first frame.
+    want_zoom: Option<f32>,
+    /// Last seen interface zoom — saved with the layout on drop.
+    last_zoom: f32,
 }
 
 impl MatApp {
     /// `eframe::run_native` entry point.
     pub fn new(cc: &eframe::CreationContext<'_>, opts: MatAppOptions) -> Self {
         cc.egui_ctx.set_visuals(ribbon::studio_visuals());
-        Self::with_options(opts)
+        let mut app = Self::with_options(opts);
+        app.persist_layout = true;
+        app.restore_layout();
+        app
     }
 
     /// Build the app without an eframe context — for tests and tools.
@@ -155,6 +170,11 @@ impl MatApp {
             cd_fwd: Vec::new(),
             cd_recent: std::collections::VecDeque::new(),
             prefs_open: false,
+            find_files: FindFiles::default(),
+            fig_popped: std::collections::BTreeSet::new(),
+            persist_layout: false,
+            want_zoom: None,
+            last_zoom: 1.0,
         };
         let version = match app.session.execute("engine.version", json!({})) {
             Ok(v) => v.get("version").and_then(Json::as_str).unwrap_or("?").to_string(),
@@ -218,6 +238,33 @@ impl MatApp {
         }
         self.editors.push(e);
         self.raise_doc(Doc::Edit(self.editors.len() - 1));
+    }
+
+    /// Open `path` and jump to a 1-based line (error links, Find in Files).
+    fn open_editor_at(&mut self, path: &std::path::Path, line: usize) {
+        self.open_editor(path);
+        if line > 0 {
+            if let Some(e) = self.cur_editor_mut() {
+                e.want_line = Some(line);
+            }
+        }
+    }
+
+    /// A scrollback file link was clicked: resolve `file` (absolute, cwd or
+    /// the function search path) and open it at `line` (0 = no line).
+    fn open_link(&mut self, file: &str, line: usize) {
+        let p = std::path::Path::new(file);
+        let resolved = if p.is_absolute() || p.exists() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .ok()
+                .map(|d| d.join(p))
+                .filter(|d| d.exists())
+                .or_else(|| self.session.lang().paths().iter().map(|d| d.join(p)).find(|d| d.exists()))
+                .unwrap_or_else(|| p.to_path_buf())
+        };
+        self.open_editor_at(&resolved, line);
     }
 
     /// A tab's display name: file name, `untitled n`, or `Figure n`.
@@ -375,6 +422,7 @@ impl MatApp {
         let n = self.fig_tex.len();
         self.docs.retain(|d| !matches!(d, Doc::Fig(i) if *i >= n));
         self.fig_docs_closed.retain(|i| *i < n);
+        self.fig_popped.retain(|i| *i < n);
         for i in 0..n {
             if self.fig_docs_closed.contains(&i) || self.docs.iter().any(|d| matches!(d, Doc::Fig(j) if *j == i)) {
                 continue;
@@ -414,13 +462,66 @@ impl MatApp {
         }
     }
 
+    /// `%APPDATA%\matcraft\layout.json` on Windows, `$HOME/.matcraft` elsewhere.
+    fn layout_path() -> Option<std::path::PathBuf> {
+        if let Some(d) = std::env::var_os("APPDATA") {
+            return Some(std::path::PathBuf::from(d).join("matcraft").join("layout.json"));
+        }
+        std::env::var_os("HOME").map(|d| std::path::PathBuf::from(d).join(".matcraft").join("layout.json"))
+    }
+
+    /// The persisted desktop state: panel toggles, zoom, working directory.
+    fn layout_json(&self, zoom: f32, cwd: &std::path::Path) -> Json {
+        json!({
+            "show_left": self.show_left,
+            "show_right": self.show_right,
+            "show_cmdwin": self.show_cmdwin,
+            "show_editor": self.show_editor,
+            "zoom": zoom,
+            "cwd": cwd.display().to_string(),
+        })
+    }
+
+    /// Read `layout.json` and apply it (called from `MatApp::new`).
+    fn restore_layout(&mut self) {
+        let Some(v) = Self::layout_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<Json>(&s).ok()) else {
+            return;
+        };
+        self.apply_layout(&v);
+    }
+
+    /// Apply a parsed layout object (split out so tests need no filesystem).
+    fn apply_layout(&mut self, v: &Json) {
+        for (key, field) in [
+            ("show_left", &mut self.show_left),
+            ("show_right", &mut self.show_right),
+            ("show_cmdwin", &mut self.show_cmdwin),
+            ("show_editor", &mut self.show_editor),
+        ] {
+            if let Some(b) = v.get(key).and_then(Json::as_bool) {
+                *field = b;
+            }
+        }
+        self.want_zoom = v.get("zoom").and_then(Json::as_f64).map(|z| z as f32);
+        if let Some(d) = v.get("cwd").and_then(Json::as_str) {
+            let p = std::path::PathBuf::from(d);
+            if p.is_dir() {
+                self.cd_to(&p, false);
+            }
+        }
+    }
+
     /// Evaluate the editor buffer in the session (toolbar ▶ Run and the
-    /// editor pane's own Run share this).
-    fn run_editor_buffer(&mut self, source: String, dir: Option<std::path::PathBuf>) {
+    /// editor pane's own Run share this). `path` is echoed like `run 'path'`
+    /// so error links in the Command Window point back at the file.
+    fn run_editor_buffer(&mut self, source: String, dir: Option<std::path::PathBuf>, path: Option<String>) {
         if let Some(d) = dir {
             let _ = self.exec_command("path.add", json!({"dir": d.to_string_lossy()}));
         }
-        self.repl.push(">> run editor buffer\n");
+        match &path {
+            Some(p) => self.repl.push(&format!(">> run '{}'\n", p.replace('\'', "''"))),
+            None => self.repl.push(">> run editor buffer\n"),
+        }
         let out = self.exec_command("eval.line", json!({"code": source}));
         if let Some(o) = out.get("output").and_then(Json::as_str).filter(|s| !s.is_empty()) {
             self.repl.push(o);
@@ -436,7 +537,7 @@ impl MatApp {
     /// auto`, each re-rendering with fresh ticks. Figures that aren't a
     /// single x/y axes (3-D, subplots, pie-only) keep the pixel pan/zoom
     /// `Scene`.
-    fn figure_view(&mut self, ui: &mut egui::Ui, idx: usize) {
+    fn figure_view(&mut self, ui: &mut egui::Ui, idx: usize, popped: bool) {
         let Some(tex) = self.fig_tex.get(idx).and_then(|t| t.as_ref()) else { return };
         let (id, size) = (tex.id(), tex.size_vec2());
         let view = self.session.lang().figures().get(idx).and_then(|f| {
@@ -452,6 +553,8 @@ impl MatApp {
         let mut reset = false;
         let mut save_as = false;
         let mut zoom_k = 0.0;
+        let mut pop = false;
+        let mut dock = false;
         ui.horizontal(|ui| {
             ui.weak(format!("Figure {}", idx + 1));
             ui.separator();
@@ -468,6 +571,13 @@ impl MatApp {
             if ui.small_button("Save As…").on_hover_text("saveas — SVG/PNG via extension").clicked() {
                 save_as = true;
             }
+            if popped {
+                if ui.small_button("Dock").on_hover_text("dock back into the document tabs").clicked() {
+                    dock = true;
+                }
+            } else if ui.small_button("Pop Out").on_hover_text("open in a separate window").clicked() {
+                pop = true;
+            }
             if view.is_some() {
                 ui.weak("drag to pan · scroll to zoom · right-drag box zoom · double-click reset");
             } else {
@@ -475,6 +585,14 @@ impl MatApp {
             }
         });
         ui.separator();
+        if pop {
+            self.fig_popped.insert(idx);
+            return;
+        }
+        if dock {
+            self.fig_popped.remove(&idx);
+            return;
+        }
         if save_as {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(p) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).add_filter("PNG", &["png"]).save_file() {
@@ -756,6 +874,9 @@ impl MatApp {
                 matlang::Value::Cell(c) => {
                     ui.weak(format!("{}x{} cell — cell contents are read-only here (edit via c{{i}} = …)", c.shape().0, c.shape().1));
                 }
+                matlang::Value::Func(_) => {
+                    ui.weak("function handle — read-only (edit by reassigning the variable)");
+                }
                 // Sparse was materialized to dense above — never reached.
                 matlang::Value::Sparse(_) => {}
                 matlang::Value::Struct(m) => {
@@ -807,15 +928,18 @@ impl eframe::App for MatApp {
             }
         });
         ctx.set_zoom_factor(zoom);
-        // Desktop shortcuts: Ctrl+N/O/S/W, F5 run — gathered first so the
-        // actions can take `self` after the input borrow ends.
-        let (new_doc, open_doc, save_doc, run_doc, close_doc) = ctx.input_mut(|i| {
+        self.last_zoom = zoom;
+        // Desktop shortcuts: Ctrl+N/O/S/W/F, Ctrl+Shift+F, F5 run — gathered
+        // first so the actions can take `self` after the input borrow ends.
+        let (new_doc, open_doc, save_doc, run_doc, close_doc, find, find_files) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::N),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::S),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F5),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::W),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::F),
+                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::F),
             )
         });
         if new_doc {
@@ -835,8 +959,19 @@ impl eframe::App for MatApp {
         if run_doc {
             if let Some(e) = self.cur_editor() {
                 let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
-                self.run_editor_buffer(e.text.clone(), dir);
+                let path = (!e.path.is_empty()).then(|| e.path.clone());
+                self.run_editor_buffer(e.text.clone(), dir, path);
             }
+        }
+        if find && matches!(self.docs.get(self.doc_sel), Some(Doc::Edit(_))) {
+            if let Some(e) = self.cur_editor_mut() {
+                e.find.open = true;
+                e.find.want_focus = true;
+            }
+        }
+        if find_files {
+            self.find_files.open = true;
+            self.find_files.want_focus = true;
         }
         if close_doc {
             if let Some(Doc::Fig(f)) = self.docs.get(self.doc_sel).copied() {
@@ -862,9 +997,16 @@ impl eframe::App for MatApp {
         // command window stays in sync; mirror it into the path bar unless
         // the user is editing it right now.
         let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(z) = self.want_zoom.take() {
+            ui.ctx().set_zoom_factor(z);
+        }
         let mut run_lines: Vec<String> = Vec::new();
         // (dir, record-in-back-history) — back/forward navigation passes false.
         let mut cd_dirs: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        // Scrollback file links clicked this frame.
+        let mut link_open: Option<(String, usize)> = None;
+        // Figure tab asked to pop out into a floating window.
+        let mut pop_fig: Option<usize> = None;
 
         // ---- toolstrip: tabbed ribbon (HOME/PLOTS/EDITOR/VIEW) -----------
         egui::Panel::top("toolstrip").show(ui, |ui| {
@@ -899,7 +1041,8 @@ impl eframe::App for MatApp {
                     if let Some(e) = self.cur_editor() {
                         let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
                         let src = e.text.clone();
-                        self.run_editor_buffer(src, dir);
+                        let path = (!e.path.is_empty()).then(|| e.path.clone());
+                        self.run_editor_buffer(src, dir, path);
                     }
                 }
                 Some(RibbonCmd::RunSelection) => {
@@ -925,6 +1068,16 @@ impl eframe::App for MatApp {
                 Some(RibbonCmd::Eval(line)) => run_lines.push(line),
                 Some(RibbonCmd::Insert(s)) => self.repl.load_input(&s),
                 Some(RibbonCmd::Preferences) => self.prefs_open = true,
+                Some(RibbonCmd::Find) => {
+                    if let Some(e) = self.cur_editor_mut() {
+                        e.find.open = true;
+                        e.find.want_focus = true;
+                    }
+                }
+                Some(RibbonCmd::FindFiles) => {
+                    self.find_files.open = true;
+                    self.find_files.want_focus = true;
+                }
                 None => {}
             }
             // Path bar — back/forward, up, recent dirs, editable breadcrumb.
@@ -994,7 +1147,8 @@ impl eframe::App for MatApp {
                     Some(FileCmd::Open(p)) => self.open_editor(&p),
                     Some(FileCmd::Run(p)) => {
                         if let Ok(src) = std::fs::read_to_string(&p) {
-                            self.run_editor_buffer(src, p.parent().map(|d| d.to_path_buf()));
+                            let path = p.to_string_lossy().to_string();
+                            self.run_editor_buffer(src, p.parent().map(|d| d.to_path_buf()), Some(path));
                         }
                     }
                     None => {}
@@ -1063,8 +1217,12 @@ impl eframe::App for MatApp {
                         });
                     });
                     ui.separator();
-                    if let Some(line) = self.repl.ui(ui, &words) {
+                    let rout = self.repl.ui(ui, &words);
+                    if let Some(line) = rout.line {
                         run_lines.push(line);
+                    }
+                    if let Some((file, line)) = rout.open {
+                        link_open = Some((file, line));
                     }
                 });
             }
@@ -1092,6 +1250,9 @@ impl eframe::App for MatApp {
                             self.fig_scene = None;
                         }
                     }
+                    if matches!(d, Doc::Fig(_)) && ui.small_button("↗").on_hover_text("pop out to a separate window").clicked() {
+                        pop_fig = Some(i);
+                    }
                     if ui.small_button("x").on_hover_text("close tab").clicked() {
                         close_doc = Some(i);
                     }
@@ -1106,16 +1267,26 @@ impl eframe::App for MatApp {
                 self.docs.remove(i);
                 self.doc_sel = self.doc_sel.saturating_sub(if i <= self.doc_sel { 1 } else { 0 }).min(self.docs.len().saturating_sub(1));
             }
+            if let Some(i) = pop_fig {
+                if let Some(Doc::Fig(f)) = docs.get(i) {
+                    self.fig_popped.insert(*f);
+                }
+            }
             match docs.get(self.doc_sel) {
                 Some(Doc::Edit(ei)) if self.show_editor => {
                     let ei = *ei;
                     if let Some(e) = self.editors.get_mut(ei) {
-                        if let Some(EditorCmd::Run { source, dir }) = e.ui(ui) {
-                            self.run_editor_buffer(source, dir);
+                        if let Some(EditorCmd::Run { source, dir, path }) = e.ui(ui, ei) {
+                            self.run_editor_buffer(source, dir, path);
                         }
                     }
                 }
-                Some(Doc::Fig(fi)) => self.figure_view(ui, *fi),
+                Some(Doc::Fig(fi)) if self.fig_popped.contains(fi) => {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak(format!("Figure {} is undocked — close or Dock its window to return it here", fi + 1));
+                    });
+                }
+                Some(Doc::Fig(fi)) => self.figure_view(ui, *fi, false),
                 _ => {
                     ui.centered_and_justified(|ui| {
                         ui.weak("no open documents — New Script or plot(1:10)");
@@ -1198,12 +1369,142 @@ impl eframe::App for MatApp {
         // Variable Editor window (Workspace double-click / context menu).
         self.variable_editor(ui.ctx());
 
+        // Undocked figure windows (Pop Out / "↗" on the doc tab). Closing
+        // the window docks the figure back into its tab.
+        let popped: Vec<usize> = self.fig_popped.iter().copied().collect();
+        for i in popped {
+            if i >= self.fig_tex.len() {
+                self.fig_popped.remove(&i);
+                continue;
+            }
+            let mut open = true;
+            egui::Window::new(format!("Figure {}", i + 1)).open(&mut open).default_size([620.0, 460.0]).resizable(true).show(ui.ctx(), |ui| {
+                self.figure_view(ui, i, true);
+            });
+            if !open {
+                self.fig_popped.remove(&i);
+            }
+        }
+
+        // Find in Files window (Ctrl+Shift+F, EDITOR ▸ FIND).
+        if self.find_files.open {
+            let mut open = true;
+            let mut hit = None;
+            egui::Window::new("Find in Files").open(&mut open).default_size([440.0, 300.0]).show(ui.ctx(), |ui| {
+                hit = findfiles::ui(ui, &mut self.find_files, &cwd);
+            });
+            if !open {
+                self.find_files.open = false;
+            }
+            if let Some((p, line)) = hit {
+                self.open_editor_at(&p, line);
+            }
+        }
+
         // Deferred runs (single borrow of self per line).
+        if let Some((file, line)) = link_open {
+            self.open_link(&file, line);
+        }
         for (d, record) in cd_dirs {
             self.cd_to(&d, record);
         }
         for line in run_lines {
             self.run_line(&line);
         }
+    }
+}
+
+impl Drop for MatApp {
+    /// Persist the desktop layout (`layout.json`) — panel toggles, zoom,
+    /// working directory — so the next session restores it. Only the real
+    /// eframe app opts in (`MatApp::new`), so headless tests never write.
+    fn drop(&mut self) {
+        if !self.persist_layout {
+            return;
+        }
+        let Some(p) = Self::layout_path() else { return };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let json = self.layout_json(self.last_zoom, &cwd);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, serde_json::to_string_pretty(&json).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_layout_restores_toggles_and_zoom() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        assert!(!app.persist_layout);
+        app.apply_layout(&json!({"show_left": false, "show_cmdwin": false, "zoom": 1.5}));
+        assert!(!app.show_left);
+        assert!(!app.show_cmdwin);
+        assert!(app.show_right);
+        assert_eq!(app.want_zoom, Some(1.5));
+    }
+
+    #[test]
+    fn open_editor_at_raises_tab_and_marks_line() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let tmp = std::env::temp_dir().join("matcraft_open_at_test.m");
+        std::fs::write(&tmp, "x = 1;\ny = 2;\n").unwrap();
+        app.open_editor_at(&tmp, 2);
+        let doc = app.docs.get(app.doc_sel).copied();
+        let ei = match doc {
+            Some(Doc::Edit(i)) => i,
+            _ => panic!("expected an editor doc"),
+        };
+        assert_eq!(app.editors.get(ei).map(|e| e.want_line), Some(Some(2)));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_link_resolves_against_search_path() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let dir = std::env::temp_dir().join("matcraft_linkpath_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("myfun.m");
+        std::fs::write(&f, "function y = myfun(x)\ny = x;\n").unwrap();
+        app.session.lang_mut().add_path(dir.clone());
+        app.open_link("myfun.m", 2);
+        let doc = app.docs.get(app.doc_sel).copied();
+        let ei = match doc {
+            Some(Doc::Edit(i)) => i,
+            _ => panic!("expected an editor doc"),
+        };
+        let e = app.editors.get(ei);
+        assert_eq!(e.map(|e| e.path.as_str()), Some(f.to_string_lossy().as_ref()));
+        assert_eq!(e.map(|e| e.want_line), Some(Some(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn figure_popout_syncs_with_tab() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let _ = app.exec_command("eval.line", json!({"code": "plot(1:5)"}));
+        app.rebuild_figures(&egui::Context::default());
+        assert!(app.docs.iter().any(|d| matches!(d, Doc::Fig(0))));
+        app.fig_popped.insert(0);
+        // "Closing" the figure removes the tab AND the popout together.
+        let _ = app.exec_command("eval.line", json!({"code": "close all"}));
+        app.rebuild_figures(&egui::Context::default());
+        assert!(app.fig_popped.is_empty());
+    }
+
+    #[test]
+    fn editor_run_echo_leaves_a_file_link() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let tmp = std::env::temp_dir().join("matcraft_echo_link_test.m");
+        std::fs::write(&tmp, "x = 1;\n").unwrap();
+        app.run_editor_buffer("no_such_fn(1);".to_string(), None, Some(tmp.to_string_lossy().to_string()));
+        assert!(app.repl.scrollback.contains(">> run '"));
+        // The error's bare `line 1` links back to the echoed file.
+        let links = repl::find_links(&app.repl.scrollback);
+        assert!(links.iter().any(|l| l.file.ends_with("matcraft_echo_link_test.m") && l.line == 1));
+        let _ = std::fs::remove_file(&tmp);
     }
 }

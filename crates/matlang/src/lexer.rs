@@ -52,6 +52,8 @@ pub enum Tok {
     Amp,
     /// `|` element-wise or.
     Pipe,
+    /// `@` — function handle (`@sin`) or anonymous function (`@(x) expr`).
+    At,
     /// `&&` short-circuit and.
     AmpAmp,
     /// `||` short-circuit or.
@@ -334,6 +336,10 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                     i += 1;
                     push!(Tok::Pipe);
                 }
+            }
+            '@' => {
+                i += 1;
+                push!(Tok::At);
             }
             _ => {
                 return Err(LangError::new(format!("unexpected character '{c}'"), line));
