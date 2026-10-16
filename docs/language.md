@@ -128,7 +128,8 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
 | Workspace | `who whos clear disp display format save load type assert rng normrnd` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`) |
-| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists) |
+| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval run error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`) |
+| Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
 | Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`) |
 | Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed) |
@@ -190,3 +191,7 @@ Notes:
   (unassigned output args error) or closures/function handles.
 - Char arrays are row-only — `char` on a multi-element cellstr needs a
   2-D char matrix, which the `Str` value can't represent yet.
+- The debugger stops at top-level statement granularity: `dbstop in f at N`
+  inside a `for`/`if`/`function` body can't suspend there (nested
+  statements carry no line info yet), and a pause raised inside a
+  function call abandons that call frame on `dbcont`.

@@ -27,6 +27,19 @@ const MAX_FIGURES: usize = 1_000;
 /// Nested function/handle calls are bounded — a runaway recursive script
 /// must error, not overflow the host stack.
 const MAX_CALL_DEPTH: usize = 256;
+/// `run` nesting is bounded likewise — a script that `run`s itself must
+/// error, not overflow the host stack. Each level nests a full
+/// parse+eval chain (exec_stmt/builtin carry large debug stack frames),
+/// so the cap is far tighter than `MAX_CALL_DEPTH` — scripts essentially
+/// never legitimately nest `run` this deep.
+const MAX_RUN_DEPTH: usize = 4;
+
+/// `LangError::id` signalling "the debugger suspended execution" rather
+/// than a real error. When `Session::run` returns an error with this id,
+/// inspect [`Session::pause_info`] and drive the session on with
+/// [`Session::resume`]/[`Session::step`] or abandon it with
+/// [`Session::quit_debug`].
+pub const DEBUG_PAUSE_ID: &str = "matcraft:debug:pause";
 
 /// Control-flow signal threading through statement execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,6 +48,48 @@ enum Flow {
     Break,
     Continue,
     Return,
+}
+
+/// A `dbstop` breakpoint: a file name/path plus a 1-based line. A `None`
+/// line means "first executable statement" (`dbstop in file`). A line
+/// that isn't a statement start (comment, blank, block-interior) slides
+/// forward to the next statement, like M-code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Breakpoint {
+    pub file: String,
+    pub line: Option<usize>,
+}
+
+/// Where the debugger is suspended — see [`Session::pause_info`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PauseInfo {
+    /// File being executed ("" = interactive/eval'd input).
+    pub file: String,
+    /// 1-based line of the next statement to run.
+    pub line: usize,
+    /// The error a `dbstop if error` pause caught, when applicable.
+    pub error: Option<LangError>,
+}
+
+/// A suspended execution context — the remaining top-level statements of
+/// a file stopped by the debugger. Kept on `Session::pause_stack`,
+/// innermost first; `dbcont` drains them in order.
+#[derive(Debug, Clone)]
+struct PausedExec {
+    /// Display name/path of the file ("" for eval'd source).
+    file: String,
+    /// Pending `(line, stmt)` pairs; `[0]` is where execution resumes.
+    stmts: Vec<(usize, Stmt)>,
+    /// Line reported for the pause (next statement, or the failing one).
+    line: usize,
+    /// False when `[0]` is the statement we paused *at* (a breakpoint hit
+    /// or a `dbstep` stop) — `dbcont` runs it without re-firing. True for
+    /// unwind continuations, whose first pending statement was never
+    /// breakpoint-checked.
+    needs_bp_check: bool,
+    /// `dbstop if error` pause: the error that triggered it. `dbcont`
+    /// re-raises it — execution can't continue past a failed statement.
+    error: Option<LangError>,
 }
 
 /// A parsed `function` definition.
@@ -665,6 +720,18 @@ pub struct Session {
     cur_fig: usize,
     /// Most recent error (caught or not) — backs `lasterror` and `catch e`.
     last_err: Option<LangError>,
+    /// `dbstop` breakpoints, in registration order.
+    breakpoints: Vec<Breakpoint>,
+    /// `dbstop if error` — errors pause the run instead of propagating.
+    stop_on_error: bool,
+    /// Suspended executions, innermost first (`dbcont` drains them).
+    pause_stack: Vec<PausedExec>,
+    /// Stack entries pushed during the in-progress pause unwind — each
+    /// enclosing frame stashes its tail at this index so ordering stays
+    /// innermost → outermost even when outer contexts already waited.
+    pause_unwind: usize,
+    /// `run` nesting depth — bounded so a self-running script errors.
+    run_depth: usize,
     /// Stopwatch for `tic`/`toc`. `Instant` doesn't exist on wasm.
     #[cfg(not(target_arch = "wasm32"))]
     tic: Option<std::time::Instant>,
@@ -683,6 +750,11 @@ impl Session {
             call_ctx: None,
             call_depth: 0,
             last_err: None,
+            breakpoints: Vec::new(),
+            stop_on_error: false,
+            pause_stack: Vec::new(),
+            pause_unwind: 0,
+            run_depth: 0,
             figs: Vec::new(),
             cur_fig: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -756,33 +828,288 @@ impl Session {
         self.figs.get(n.wrapping_sub(1)).map(matplot::to_svg)
     }
 
+    /// Breakpoints registered by `dbstop`, in registration order.
+    pub fn breakpoints(&self) -> &[Breakpoint] {
+        &self.breakpoints
+    }
+
+    /// Whether `dbstop if error` is armed — errors pause the run instead
+    /// of propagating out of it.
+    pub fn stops_on_error(&self) -> bool {
+        self.stop_on_error
+    }
+
+    /// True while the debugger holds suspended execution (a `dbstop`
+    /// breakpoint or a `dbstop if error` stop). Drive it with
+    /// [`Session::resume`]/[`Session::step`], or abandon it with
+    /// [`Session::quit_debug`].
+    pub fn is_paused(&self) -> bool {
+        !self.pause_stack.is_empty()
+    }
+
+    /// Where the innermost suspended context is stopped — `None` when not
+    /// paused. `error` carries the caught error on `dbstop if error`
+    /// stops.
+    pub fn pause_info(&self) -> Option<PauseInfo> {
+        self.pause_stack.first().map(|p| PauseInfo { file: p.file.clone(), line: p.line, error: p.error.clone() })
+    }
+
+    /// Abandon every suspended context (`dbquit`).
+    pub fn quit_debug(&mut self) {
+        self.pause_stack.clear();
+    }
+
+    /// Resume a debug-paused execution (`dbcont`): runs the innermost
+    /// suspended context, then any outer ones it unwound through, until
+    /// the next breakpoint or completion. Returns everything echoed
+    /// since the resume. Errors when nothing is paused; a
+    /// `dbstop if error` stop re-raises its error — M-code cannot
+    /// continue past a failed statement (`dbquit` instead).
+    pub fn resume(&mut self) -> Result<String, LangError> {
+        self.resume_inner(false)
+    }
+
+    /// Single-step a paused execution (`dbstep`): runs the one statement
+    /// the innermost context is stopped at, then pauses at the next.
+    pub fn step(&mut self) -> Result<String, LangError> {
+        self.resume_inner(true)
+    }
+
     /// Parse and run `source`; returns everything the script echoed.
     pub fn run(&mut self, source: &str) -> Result<String, LangError> {
         let stmts = crate::parser::parse_lines(source)?;
         let bare: Vec<Stmt> = stmts.iter().map(|(_, s)| s.clone()).collect();
         self.hoist_functions(&bare);
         let mut out = String::new();
-        for (line, s) in &stmts {
-            let flow = match self.exec_stmt(s, &mut out) {
-                Ok(f) => f,
-                Err(mut e) => {
-                    // Errors raised without position get the statement's line
-                    // so `Error: line N` messages link back to the source.
-                    if e.line == 0 {
-                        e.line = *line;
-                    }
-                    self.last_err = Some(e.clone());
-                    out.push_str(&self.print_buf);
-                    self.print_buf.clear();
-                    return Err(e);
+        match self.exec_lines("", &stmts, false, &mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                if e.id == DEBUG_PAUSE_ID {
+                    // Echo produced before the pause survives — it rejoins
+                    // print_buf and surfaces when execution resumes.
+                    self.print_buf = format!("{out}{}", self.print_buf);
                 }
-            };
-            out.push_str(&self.print_buf);
-            self.print_buf.clear();
-            match flow {
+                Err(e)
+            }
+        }
+    }
+
+    /// `run 'file.m'`: resolve `name` on the search path and execute it
+    /// in this session, sharing the workspace like M-code's `run`.
+    /// Errors are reported as `Error in <file> (line N): …`.
+    fn run_file(&mut self, name: &str) -> Result<String, LangError> {
+        if self.run_depth >= MAX_RUN_DEPTH {
+            return Err(LangError::new("run recursion limit exceeded", 0));
+        }
+        let path = self.find_m_file(name).ok_or_else(|| LangError::new(format!("cannot find '{name}' on the search path"), 0))?;
+        let src = std::fs::read_to_string(&path).map_err(|e| LangError::new(format!("cannot read {}: {e}", path.display()), 0))?;
+        let label = path.display().to_string();
+        let stmts = crate::parser::parse_lines(&src).map_err(|mut e| {
+            e.message = format!("Error in {label} (line {}): {}", e.line, e.message);
+            e
+        })?;
+        let bare: Vec<Stmt> = stmts.iter().map(|(_, s)| s.clone()).collect();
+        self.hoist_functions(&bare);
+        self.run_depth += 1;
+        let mut out = String::new();
+        let r = self.exec_lines(&label, &stmts, false, &mut out);
+        self.run_depth = self.run_depth.saturating_sub(1);
+        match r {
+            Ok(()) => Ok(out),
+            Err(mut e) => {
+                if e.id == DEBUG_PAUSE_ID {
+                    // The script's pre-pause echo survives the suspension.
+                    self.print_buf = format!("{out}{}", self.print_buf);
+                } else if !e.message.starts_with("Error in ") {
+                    // A deeper `run` error is already stamped — don't wrap
+                    // it twice.
+                    e.message = format!("Error in {label} (line {}): {}", e.line, e.message);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Resolve `<name>` (literal path first) or `<name>.m` on the search
+    /// path — the same rule `which`/`type` use.
+    fn find_m_file(&self, name: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(name);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        for dir in &self.paths {
+            let f = dir.join(name);
+            if f.is_file() {
+                return Some(f);
+            }
+            let f = dir.join(format!("{name}.m"));
+            if f.is_file() {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Execute `(line, stmt)` pairs as file `file` ("" for interactive
+    /// input), honouring `dbstop` breakpoints: on a hit the remaining
+    /// tail is stashed on `pause_stack` and a [`DEBUG_PAUSE_ID`] error
+    /// unwinds through every enclosing `exec_lines` — each stashing its
+    /// own tail — so `resume` can pick them up innermost first.
+    /// `skip_first_bp` is set by `resume`: the paused-at statement was
+    /// already stopped for, so `dbcont` runs it without re-firing.
+    fn exec_lines(&mut self, file: &str, stmts: &[(usize, Stmt)], skip_first_bp: bool, out: &mut String) -> Result<(), LangError> {
+        let mut prev_line = 0usize;
+        for (i, (line, s)) in stmts.iter().enumerate() {
+            let line = *line;
+            if !(i == 0 && skip_first_bp) && self.break_at(file, prev_line, line) {
+                self.pause_stack.insert(0, PausedExec { file: file.into(), stmts: stmts[i..].to_vec(), line, needs_bp_check: false, error: None });
+                self.pause_unwind = 1;
+                out.push_str(&self.print_buf);
+                self.print_buf.clear();
+                return Err(self.pause_error(file, line, None));
+            }
+            prev_line = line;
+            match self.exec_top_stmt(file, line, s, &stmts[i + 1..], out)? {
                 Flow::Normal => {}
                 Flow::Return => break,
                 Flow::Break | Flow::Continue => return Err(LangError::new("break/continue outside a loop", 0)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared per-statement handling for `exec_lines`/`resume_drive`:
+    /// execute `s`, then translate errors per debugger state — a pause
+    /// propagating from a deeper file stashes `tail` (the not-yet-run
+    /// remainder) behind the new pause entry, `dbstop if error` converts
+    /// the error itself into a pause, otherwise `last_err` is recorded.
+    fn exec_top_stmt(&mut self, file: &str, line: usize, s: &Stmt, tail: &[(usize, Stmt)], out: &mut String) -> Result<Flow, LangError> {
+        let flow = match self.exec_stmt(s, out) {
+            Ok(f) => f,
+            Err(mut e) => {
+                if e.id == DEBUG_PAUSE_ID {
+                    if !tail.is_empty() {
+                        let at = self.pause_unwind.min(self.pause_stack.len());
+                        let stop = tail.first().map(|(l, _)| *l).unwrap_or(line);
+                        self.pause_stack
+                            .insert(at, PausedExec { file: file.into(), stmts: tail.to_vec(), line: stop, needs_bp_check: true, error: None });
+                        self.pause_unwind += 1;
+                    }
+                    return Err(e);
+                }
+                // Errors raised without position get the statement's line
+                // so `Error in <file> (line N)` messages link back to the
+                // source.
+                if e.line == 0 {
+                    e.line = line;
+                }
+                if self.stop_on_error {
+                    self.pause_stack
+                        .insert(0, PausedExec { file: file.into(), stmts: tail.to_vec(), line, needs_bp_check: false, error: Some(e.clone()) });
+                    self.pause_unwind = 1;
+                    out.push_str(&self.print_buf);
+                    self.print_buf.clear();
+                    return Err(self.pause_error(file, line, Some(&e)));
+                }
+                self.last_err = Some(e.clone());
+                out.push_str(&self.print_buf);
+                self.print_buf.clear();
+                return Err(e);
+            }
+        };
+        out.push_str(&self.print_buf);
+        self.print_buf.clear();
+        Ok(flow)
+    }
+
+    /// True when a `dbstop` breakpoint covers `(prev_line, line]` in
+    /// `file`. `dbstop in f at N` slides forward to the next statement
+    /// when `N` isn't a statement start (comment/blank/block-interior
+    /// lines); `dbstop in f` alone stops at the first statement.
+    fn break_at(&self, file: &str, prev_line: usize, line: usize) -> bool {
+        if file.is_empty() {
+            return false;
+        }
+        self.breakpoints.iter().any(|b| {
+            let l = b.line.unwrap_or(1);
+            bp_file_matches(&b.file, file) && l > prev_line && l <= line
+        })
+    }
+
+    /// The [`DEBUG_PAUSE_ID`] error callers see when execution suspends.
+    fn pause_error(&self, file: &str, line: usize, cause: Option<&LangError>) -> LangError {
+        let loc = if file.is_empty() { format!("line {line}") } else { format!("{file} line {line}") };
+        match cause {
+            Some(e) => LangError::with_id(DEBUG_PAUSE_ID, format!("Paused on error at {loc}: {}", e.message), line),
+            None => LangError::with_id(DEBUG_PAUSE_ID, format!("Execution paused at {loc}"), line),
+        }
+    }
+
+    fn resume_inner(&mut self, single_step: bool) -> Result<String, LangError> {
+        if self.pause_stack.is_empty() {
+            let which = if single_step { "dbstep" } else { "dbcont" };
+            return Err(LangError::new(format!("{which} requires a paused execution"), 0));
+        }
+        let mut out = String::new();
+        match self.resume_drive(single_step, &mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                // Whatever echoed before the re-pause still reaches the
+                // caller: it rejoins print_buf, which the surrounding run
+                // flushes into its output.
+                self.print_buf = format!("{out}{}", self.print_buf);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drain `pause_stack` innermost-first until it empties (Ok) or a new
+    /// pause unwinds again (Err with [`DEBUG_PAUSE_ID`]). In
+    /// `single_step` mode only the very next statement runs before
+    /// pausing again.
+    fn resume_drive(&mut self, single_step: bool, out: &mut String) -> Result<(), LangError> {
+        while let Some(p) = self.pause_stack.first().cloned() {
+            self.pause_stack.remove(0);
+            if let Some(e) = p.error {
+                // A `dbstop if error` stop can't step or continue past the
+                // failing statement — the error propagates and the whole
+                // debug session ends.
+                self.pause_stack.clear();
+                self.last_err = Some(e.clone());
+                return Err(e);
+            }
+            if !single_step {
+                self.exec_lines(&p.file, &p.stmts, !p.needs_bp_check, out)?;
+                continue;
+            }
+            // dbstep: run only the paused-at statement, then stop again.
+            let (line, s) = match p.stmts.first() {
+                Some(x) => x.clone(),
+                None => continue,
+            };
+            let tail = &p.stmts[1..];
+            let flow = self.exec_top_stmt(&p.file, line, &s, tail, out)?;
+            if flow != Flow::Return && !tail.is_empty() {
+                let stop = tail.first().map(|(l, _)| *l).unwrap_or(line);
+                self.pause_stack.insert(0, PausedExec { file: p.file.clone(), stmts: tail.to_vec(), line: stop, needs_bp_check: false, error: None });
+                return Err(self.pause_error(&p.file, stop, None));
+            }
+            // Fell off the end of this file — step on in the next outer
+            // context, like M-code's `dbstep out`.
+        }
+        Ok(())
+    }
+
+    /// Collect debugger-command arguments as strings — `Num` renders its
+    /// digits so `dbstop('in','f','at',3)` and `dbstop in f at 3` agree.
+    fn db_args(&mut self, args: &[Expr]) -> Result<Vec<String>, LangError> {
+        let v = self.eval_args(args)?;
+        let mut out = Vec::with_capacity(v.len());
+        for x in &v {
+            match x {
+                Value::Str(s) => out.push(s.clone()),
+                Value::Num(n) => out.push(fmt_num(*n, false)),
+                _ => return Err(LangError::new("debugger arguments must be strings", 0)),
             }
         }
         Ok(out)
@@ -886,6 +1213,11 @@ impl Session {
                         }
                     }
                     Err(e) => {
+                        // A debugger pause is not a catchable error — let
+                        // it unwind so `dbcont` resumes from the stop.
+                        if e.id == DEBUG_PAUSE_ID {
+                            return Err(e);
+                        }
                         // The exception object: `e.message`, `e.identifier`.
                         self.last_err = Some(e.clone());
                         if let Some(var) = catch_var {
@@ -4264,6 +4596,73 @@ impl Session {
                     _ => Err(LangError::new("eval needs a string", 0)),
                 }
             }
+            "run" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Str(f)) => {
+                        let out = self.run_file(&f.clone())?;
+                        self.print_buf.push_str(&out);
+                        Ok(None)
+                    }
+                    _ => Err(LangError::new("run needs a filename", 0)),
+                }
+            }
+            // --- debugger ---------------------------------------------------
+            "dbstop" => {
+                let a = self.db_args(args)?;
+                match a.as_slice() {
+                    [i, f] if i == "in" => self.breakpoints.push(Breakpoint { file: f.clone(), line: None }),
+                    [i, f, at, n] if i == "in" && at == "at" => {
+                        let l: usize = n.parse().map_err(|_| LangError::new(format!("dbstop: bad line '{n}'"), 0))?;
+                        self.breakpoints.push(Breakpoint { file: f.clone(), line: Some(l) });
+                    }
+                    [i, e] if i == "if" && e == "error" => self.stop_on_error = true,
+                    _ => return Err(LangError::new("usage: dbstop in <file> [at <line>] | dbstop if error", 0)),
+                }
+                Ok(None)
+            }
+            "dbclear" => {
+                let a = self.db_args(args)?;
+                match a.as_slice() {
+                    [i, f] if i == "in" => self.breakpoints.retain(|b| !bp_file_matches(f, &b.file)),
+                    [i, f, at, n] if i == "in" && at == "at" => {
+                        let l: usize = n.parse().map_err(|_| LangError::new(format!("dbclear: bad line '{n}'"), 0))?;
+                        self.breakpoints.retain(|b| !(bp_file_matches(f, &b.file) && b.line == Some(l)));
+                    }
+                    [i, e] if i == "if" && e == "error" => self.stop_on_error = false,
+                    [all] if all == "all" => {
+                        self.breakpoints.clear();
+                        self.stop_on_error = false;
+                    }
+                    _ => return Err(LangError::new("usage: dbclear in <file> [at <line>] | dbclear all | dbclear if error", 0)),
+                }
+                Ok(None)
+            }
+            "dbstatus" => {
+                let a = self.db_args(args)?;
+                if a.len() > 1 {
+                    return Err(LangError::new("usage: dbstatus [file]", 0));
+                }
+                let lines: Vec<String> = self
+                    .breakpoints
+                    .iter()
+                    .filter(|b| a.first().map(|f| bp_file_matches(f, &b.file)).unwrap_or(true))
+                    .map(|b| format!("Breakpoint for {} is on line {}.\n", b.file, b.line.unwrap_or(1)))
+                    .collect();
+                for l in lines {
+                    self.print_buf.push_str(&l);
+                }
+                Ok(None)
+            }
+            "dbcont" | "dbstep" => {
+                let out = self.resume_inner(name == "dbstep")?;
+                self.print_buf.push_str(&out);
+                Ok(None)
+            }
+            "dbquit" => {
+                self.quit_debug();
+                Ok(None)
+            }
             "error" => {
                 let v = self.eval_args(args)?;
                 // `error('id:tag', 'message')` carries an identifier; a first
@@ -7601,6 +8000,13 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "tic",
     "toc",
     "pause",
+    "run",
+    "dbstop",
+    "dbclear",
+    "dbstatus",
+    "dbcont",
+    "dbstep",
+    "dbquit",
     "save",
     "load",
     "type",
@@ -7732,6 +8138,23 @@ fn push_num_var(loaded: &mut Vec<(String, Value)>, n: String, kind: u8, rows: Ve
         let v2 = if m.is_scalar() { Value::Num(m.as_scalar().unwrap_or(0.0)) } else { Value::Mat(m) };
         loaded.push((n, v2));
     }
+}
+
+/// `dbstop in <spec>` matches a running file by full path, file name or
+/// stem — `in foo` ≡ `in foo.m` — like the `which` lookup. A `spec`
+/// with directory parts may also suffix-match the resolved path.
+fn bp_file_matches(spec: &str, file: &str) -> bool {
+    if spec == file {
+        return true;
+    }
+    let norm = |s: &str| s.replace('\\', "/");
+    let (ns, nf) = (norm(spec), norm(file));
+    if ns.contains('/') && nf.ends_with(ns.as_str()) {
+        return true;
+    }
+    let p = std::path::Path::new(file);
+    let stem = spec.strip_suffix(".m").unwrap_or(spec);
+    p.file_name().and_then(|s| s.to_str()) == Some(spec) || p.file_stem().and_then(|s| s.to_str()) == Some(stem)
 }
 
 /// Minimal `*`-wildcard matcher for `dir`/`ls` patterns.
@@ -10313,5 +10736,194 @@ legend('sig'); grid on; saveas('{f}')"
             }
             other => panic!("expected complex roots, got {other:?}"),
         }
+    }
+
+    // --- run / debugger ----------------------------------------------------
+
+    /// Scratch dir + `.m` fixture for `run`/`dbstop` tests.
+    fn m_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("matcraft_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn rm_dir(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_executes_script_in_current_session() {
+        let dir = m_dir("runshare");
+        let f = dir.join("myscript.m");
+        std::fs::write(&f, "x = 41\ny = x + 1\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        // Command form; the script shares this workspace.
+        s.run("run myscript").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(41.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(42.0)));
+        // Function form too.
+        s.run("run('myscript.m')").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(41.0)));
+        // Echoed output reaches the caller.
+        let out = s.run("run myscript").unwrap();
+        assert!(out.contains("x ="), "{out}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn run_errors_report_file_and_line() {
+        let dir = m_dir("runerr");
+        let f = dir.join("boom.m");
+        std::fs::write(&f, "a = 1;\nerror('nope')\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        let e = s.run("run boom").unwrap_err();
+        assert!(e.message.contains("Error in"), "{e}");
+        assert!(e.message.contains("boom.m"), "{e}");
+        assert!(e.message.contains("line 2"), "{e}");
+        assert_eq!(e.line, 2);
+        // Missing file reports cleanly.
+        let e = s.run("run no_such_file_xyz").unwrap_err();
+        assert!(e.message.contains("no_such_file_xyz"), "{e}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn run_recursion_is_capped() {
+        let dir = m_dir("runrec");
+        std::fs::write(dir.join("selfish.m"), "run selfish\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        let e = s.run("run selfish").unwrap_err();
+        assert!(e.message.contains("recursion"), "{e}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dbstop_pauses_and_dbcont_resumes() {
+        let dir = m_dir("dbstop");
+        std::fs::write(dir.join("stepme.m"), "a = 1;\nb = 2;\nc = 3;\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("dbstop in stepme at 2").unwrap();
+        let e = s.run("run stepme").unwrap_err();
+        assert_eq!(e.id, DEBUG_PAUSE_ID);
+        assert!(s.is_paused());
+        let info = s.pause_info().unwrap();
+        assert_eq!(info.line, 2);
+        assert!(info.file.ends_with("stepme.m"), "{}", info.file);
+        // Statements before the breakpoint ran; later ones didn't.
+        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
+        assert!(s.get("b").is_none());
+        // dbcont runs the rest.
+        s.run("dbcont").unwrap();
+        assert!(!s.is_paused());
+        assert_eq!(s.get("b"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("c"), Some(&Value::Num(3.0)));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dbstop_bare_in_stops_at_first_statement() {
+        let dir = m_dir("dbfirst");
+        std::fs::write(dir.join("first.m"), "% comment\na = 1;\nb = 2;\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("dbstop in first").unwrap();
+        let e = s.run("run first").unwrap_err();
+        assert_eq!(e.id, DEBUG_PAUSE_ID);
+        // First *executable* line — the comment doesn't count.
+        assert_eq!(s.pause_info().unwrap().line, 2);
+        s.run("dbquit").unwrap();
+        assert!(s.get("a").is_none());
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dbcont_resumes_through_nested_run() {
+        let dir = m_dir("dbnest");
+        std::fs::write(dir.join("outer.m"), "x = 1;\nrun inner\nz = 9;\n").unwrap();
+        std::fs::write(dir.join("inner.m"), "p = 1;\nq = 2;\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("dbstop in inner at 2").unwrap();
+        let e = s.run("run outer").unwrap_err();
+        assert_eq!(e.id, DEBUG_PAUSE_ID);
+        assert!(s.pause_info().unwrap().file.ends_with("inner.m"));
+        s.run("dbcont").unwrap();
+        // Inner finished, then the outer file's tail ran too.
+        assert_eq!(s.get("p"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("q"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("z"), Some(&Value::Num(9.0)));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dbstatus_and_dbclear() {
+        let mut s = Session::new();
+        s.run("dbstop in foo at 3; dbstop in bar at 7; dbstop if error").unwrap();
+        assert!(s.stops_on_error());
+        let out = s.run("dbstatus").unwrap();
+        assert!(out.contains("Breakpoint for foo is on line 3."), "{out}");
+        assert!(out.contains("Breakpoint for bar is on line 7."), "{out}");
+        let out = s.run("dbstatus foo").unwrap();
+        assert!(out.contains("foo") && !out.contains("bar"), "{out}");
+        s.run("dbclear in foo at 3").unwrap();
+        assert_eq!(s.breakpoints().len(), 1);
+        s.run("dbclear all").unwrap();
+        assert!(s.breakpoints().is_empty());
+        assert!(!s.stops_on_error());
+        s.run("dbstop if error; dbclear if error").unwrap();
+        assert!(!s.stops_on_error());
+    }
+
+    #[test]
+    fn dbstop_if_error_pauses_on_error() {
+        let dir = m_dir("dberr");
+        std::fs::write(dir.join("bad.m"), "a = 1;\nerror('bang');\nb = 2;\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("dbstop if error").unwrap();
+        let e = s.run("run bad").unwrap_err();
+        assert_eq!(e.id, DEBUG_PAUSE_ID);
+        let info = s.pause_info().unwrap();
+        assert_eq!(info.line, 2);
+        assert_eq!(info.error.unwrap().message, "bang");
+        // dbcont re-raises the original error and ends the debug session.
+        let e = s.resume().unwrap_err();
+        assert_eq!(e.message, "bang");
+        assert!(!s.is_paused());
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dbstep_advances_one_statement_then_dbquit() {
+        let dir = m_dir("dbstep");
+        std::fs::write(dir.join("walk.m"), "a = 1;\nb = 2;\nc = 3;\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("dbstop in walk at 1").unwrap();
+        s.run("run walk").unwrap_err();
+        // dbstep runs the paused-at statement and stops at the next.
+        let e = s.run("dbstep").unwrap_err();
+        assert_eq!(e.id, DEBUG_PAUSE_ID);
+        assert_eq!(s.pause_info().unwrap().line, 2);
+        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
+        assert!(s.get("b").is_none());
+        // dbquit abandons the rest of the file.
+        s.run("dbquit").unwrap();
+        assert!(!s.is_paused());
+        assert!(s.get("c").is_none());
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn debugger_not_paused_errors() {
+        let mut s = Session::new();
+        assert!(s.run("dbcont").is_err());
+        assert!(s.run("dbstep").is_err());
+        // Bad dbstop usage errors too.
+        assert!(s.run("dbstop around foo").is_err());
     }
 }

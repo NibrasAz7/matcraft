@@ -13,7 +13,7 @@ pub mod lexer;
 pub mod matfile;
 pub mod parser;
 
-pub use interp::{describe, fmt_num, fmt_value, CellArray, Session, Value, BUILTIN_NAMES};
+pub use interp::{describe, fmt_num, fmt_value, Breakpoint, CellArray, PauseInfo, Session, Value, BUILTIN_NAMES, DEBUG_PAUSE_ID};
 // Re-export the numeric core types callers need to inspect `Value::Cplx`
 // without taking a direct `matcore` dependency.
 pub use matcore::{CMatrix, CNum};

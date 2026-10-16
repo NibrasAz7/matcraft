@@ -1847,12 +1847,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "matcraft-web"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "matcraft-ui-egui",
+ "matcraft_engine",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "matcraft_engine"
 version = "0.1.0"
 dependencies = [
  "matcore",
  "matlang",
  "serde_json",
+ "simcraft_engine",
 ]
 
 [[package]]
@@ -3023,6 +3038,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "simblocks"
+version = "0.1.0"
+dependencies = [
+ "matplot",
+ "simcore",
+]
+
+[[package]]
+name = "simcore"
+version = "0.1.0"
+
+[[package]]
+name = "simcraft_engine"
+version = "0.1.0"
+dependencies = [
+ "matcore",
+ "matlang",
+ "serde_json",
+ "simblocks",
+ "simcore",
+ "simmodel",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3043,6 +3082,14 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "simmodel"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "simcore",
+]
 
 [[package]]
 name = "simplecss"

@@ -11,4 +11,5 @@ workspace = true
 [dependencies]
 matlang = { path = "../matlang" }
 matcore = { path = "../matcore" }
+simcraft_engine = { path = "../../../simcraft/crates/engine" }
 serde_json = "1"

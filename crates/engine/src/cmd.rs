@@ -1,6 +1,8 @@
 //! The command registry. Each command: stable id, label, params doc, and a
 //! `run` over the session. Programmatic calls never block or prompt.
 
+use std::fmt;
+
 use serde_json::{json, Value as Json};
 
 use matcore::Matrix;
@@ -48,6 +50,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls"),
     ("solvers", "fzero fminsearch integral quad"),
     ("function handles", "feval func2str str2func functions arrayfun cellfun"),
+    ("debugging", "dbstop dbclear dbcont dbstatus dbstep dbquit run"),
     ("strings", "num2str str2double str2num strcmp strcmpi strcat upper lower strtrim strrep strfind double logical char"),
     ("workspace/env", "eval error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk disp display format fprintf sprintf who whos clear assert rng normrnd"),
     ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile csvread mkdir"),
@@ -298,6 +301,82 @@ fn figure_export(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
     Ok(json!({"ok": true, "path": path, "bytes": bytes}))
 }
 
+// ---- SimCraft interconnection ----------------------------------------------
+// The SimCraft session lives in `Session::sim` (lazy). `sim.run` loads a
+// `.simcraft` model, runs it and publishes every sink trace into this
+// session's workspace via `simcraft_engine::publish` — `out.t`, `out.y`,
+// `out.<name>`, plus a `{t, y}` struct per `to_workspace` var.
+
+/// A sim-side error (model, solver or inner command) → user-facing message.
+fn sim_e(e: impl fmt::Display) -> EngineError {
+    EngineError::Other(e.to_string())
+}
+
+/// `sim.run`'s `{solver?, dt?, tstop?}` overrides → `RunOpts`.
+fn run_opts(p: &Json, cmd: &str) -> Result<simcraft_engine::RunOpts, EngineError> {
+    let solver = match p.get("solver") {
+        None | Some(Json::Null) => None,
+        Some(v) => {
+            let name = v.as_str().ok_or_else(|| EngineError::bad_params(cmd, "`solver` must be a string"))?;
+            Some(
+                simcraft_engine::Solver::parse(name)
+                    .ok_or_else(|| EngineError::bad_params(cmd, format!("unknown solver `{name}` (have: euler, rk4)")))?,
+            )
+        }
+    };
+    let num = |key: &str| -> Result<Option<f64>, EngineError> {
+        match p.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => v.as_f64().map(Some).ok_or_else(|| EngineError::bad_params(cmd, format!("`{key}` must be a number"))),
+        }
+    };
+    Ok(simcraft_engine::RunOpts { solver, dt: num("dt")?, tstop: num("tstop")? })
+}
+
+fn sim_run(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let ov = run_opts(p, "sim.run")?;
+    // `path` may be omitted once a model is loaded (e.g. after
+    // `model.set_param` — reloading would discard the new params).
+    if let Some(path) = p.get("path").and_then(Json::as_str) {
+        s.sim().load(path).map_err(sim_e)?;
+    }
+    let run = s.sim().run(&ov).map_err(sim_e)?;
+    simcraft_engine::publish(s.lang_mut(), &run);
+    Ok(simcraft_engine::run_json(&run))
+}
+
+fn sim_check(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let path = need_str(p, "path", "sim.check")?;
+    s.sim().load(path).map_err(sim_e)?;
+    let info = s.sim().check().map_err(sim_e)?;
+    Ok(simcraft_engine::check_json(&info))
+}
+
+/// Forward a pure-sim command into the linked SimCraft session's registry.
+fn fwd(s: &mut Session, id: &str, params: Json) -> Result<Json, EngineError> {
+    s.sim().execute(id, params).map_err(sim_e)
+}
+
+fn sim_blocks(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    fwd(s, "block.list", json!({}))
+}
+
+fn model_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    fwd(s, "model.list", json!({}))
+}
+
+fn model_get_param(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let block = need_str(p, "block", "model.get_param")?;
+    fwd(s, "block.get", json!({"path": block}))
+}
+
+fn model_set_param(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let block = need_str(p, "block", "model.set_param")?;
+    let param = need_str(p, "param", "model.set_param")?;
+    let value = p.get("value").ok_or_else(|| EngineError::bad_params("model.set_param", "missing `value`"))?;
+    fwd(s, "block.set", json!({"path": block, "params": {param: value.clone()}}))
+}
+
 fn functions_list(_s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
     let groups: Vec<Json> = FUNCTION_GROUPS.iter().map(|(g, names)| json!({"group": g, "names": names})).collect();
     Ok(json!({"groups": groups}))
@@ -327,6 +406,22 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "figure.list", label: "List open figures", params: "{} → {count,current}", run: figure_list },
     CommandSpec { id: "figure.export", label: "Export a figure to SVG", params: "{path, figure?}", run: figure_export },
     CommandSpec { id: "functions.list", label: "List builtin functions", params: "{}", run: functions_list },
+    CommandSpec {
+        id: "sim.run",
+        label: "Run a .simcraft model; traces land in the workspace",
+        params: "{path?, solver?, dt?, tstop?} → {t, out:{name:{t,y}}}",
+        run: sim_run,
+    },
+    CommandSpec {
+        id: "sim.check",
+        label: "Load and compile-check a .simcraft model",
+        params: "{path} → {blocks,wires,states,steps}",
+        run: sim_check,
+    },
+    CommandSpec { id: "sim.blocks", label: "List the SimCraft block catalog", params: "{} → {blocks}", run: sim_blocks },
+    CommandSpec { id: "model.list", label: "List the loaded SimCraft model's blocks and wires", params: "{} → {blocks,wires}", run: model_list },
+    CommandSpec { id: "model.get_param", label: "Read a SimCraft block's params", params: "{block} → {path,type,params}", run: model_get_param },
+    CommandSpec { id: "model.set_param", label: "Set a SimCraft block param (loaded model)", params: "{block, param, value}", run: model_set_param },
 ];
 
 #[cfg(test)]
@@ -392,6 +487,63 @@ mod tests {
         let svg = std::fs::read_to_string(&tmp).unwrap();
         assert!(svg.contains("<svg"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // The sibling repo's example model — `<engine>/../../../simcraft`.
+    fn pendulum() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../simcraft/examples/pendulum.simcraft").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn sim_run_pendulum_publishes_workspace() {
+        let mut s = Session::new();
+        let r = s.execute("sim.run", json!({"path": pendulum()})).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["solver"], json!("rk4"));
+        assert_eq!(r["t"].as_array().unwrap().len(), 10001);
+        assert_eq!(r["out"]["theta"]["y"][0][0], json!(0.2));
+        assert_eq!(r["out"]["angle_scope"]["y"][0][0], json!(0.2));
+        // `theta` = {t, y} struct (to_workspace); `out.theta` indexes y.
+        let r = s.execute("eval.line", json!({"code": "theta.y(1)\nout.theta(1)\nnumel(out.t)"})).unwrap();
+        let out = r["output"].as_str().unwrap();
+        assert!(out.contains("0.2"), "{out}");
+        assert!(out.contains("10001"), "{out}");
+        let r = s.execute("eval.line", json!({"code": "out.theta(1:10)"})).unwrap();
+        assert!(r["output"].as_str().unwrap().contains("ans ="), "{}", r["output"]);
+    }
+
+    #[test]
+    fn sim_check_and_blocks() {
+        let mut s = Session::new();
+        let r = s.execute("sim.check", json!({"path": pendulum()})).unwrap();
+        assert_eq!(r["blocks"], json!(5));
+        assert_eq!(r["states"], json!(2));
+        let r = s.execute("sim.blocks", json!({})).unwrap();
+        assert!(r["blocks"].as_array().unwrap().iter().any(|b| b["type"] == "integrator"));
+        let r = s.execute("model.get_param", json!({"block": "gl"})).unwrap();
+        assert_eq!(r["params"]["gain"], json!(-9.81));
+    }
+
+    #[test]
+    fn model_set_param_then_run_loaded() {
+        let mut s = Session::new();
+        s.execute("sim.check", json!({"path": pendulum()})).unwrap();
+        s.execute("model.set_param", json!({"block": "gl", "param": "gain", "value": -1.0})).unwrap();
+        let r = s.execute("model.get_param", json!({"block": "gl"})).unwrap();
+        assert_eq!(r["params"]["gain"], json!(-1.0));
+        // `sim.run` without `path` runs the loaded model, keeping the param.
+        let r = s.execute("sim.run", json!({"tstop": 0.5, "solver": "euler"})).unwrap();
+        assert_eq!(r["solver"], json!("euler"));
+        assert_eq!(r["t"].as_array().unwrap().len(), 501);
+        assert_eq!(r["out"]["theta"]["y"][0][0], json!(0.2));
+    }
+
+    #[test]
+    fn sim_errors_not_panics() {
+        let mut s = Session::new();
+        assert!(s.execute("sim.run", json!({})).is_err()); // no path, no model
+        assert!(s.execute("sim.run", json!({"path": "nope.simcraft"})).is_err());
+        assert!(s.execute("model.set_param", json!({"block": "x", "param": "p", "value": 1})).is_err());
     }
 
     #[test]

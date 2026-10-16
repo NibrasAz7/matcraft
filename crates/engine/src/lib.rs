@@ -61,19 +61,23 @@ impl From<LangError> for EngineError {
 }
 
 /// A MatCraft session: the interpreter workspace plus open figures,
-/// driven through commands.
+/// driven through commands. A SimCraft session is linked lazily — the
+/// first `sim.*`/`model.*` command creates it (see [`Session::sim`]).
 pub struct Session {
     lang: matlang::Session,
+    /// Linked SimCraft session (the `sim('model.simcraft')` compute side);
+    /// `None` until a sim command runs so plain sessions pay nothing.
+    sim: Option<simcraft_engine::Session>,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Session { lang: matlang::Session::new() }
+        Session { lang: matlang::Session::new(), sim: None }
     }
 
     /// Deterministic RNG for reproducible runs and tests.
     pub fn with_seed(seed: u64) -> Self {
-        Session { lang: matlang::Session::with_seed(seed) }
+        Session { lang: matlang::Session::with_seed(seed), sim: None }
     }
 
     /// The language session (workspace, figures, search path).
@@ -83,6 +87,13 @@ impl Session {
 
     pub fn lang_mut(&mut self) -> &mut matlang::Session {
         &mut self.lang
+    }
+
+    /// The linked SimCraft session, created on first use. Its model, block
+    /// library and `sim.run` all live there; this session's matlang
+    /// workspace is the To Workspace target (via `simcraft_engine::publish`).
+    pub fn sim(&mut self) -> &mut simcraft_engine::Session {
+        self.sim.get_or_insert_with(simcraft_engine::Session::new)
     }
 
     /// Run command `id` with JSON `params`. A panic rolls the workspace
