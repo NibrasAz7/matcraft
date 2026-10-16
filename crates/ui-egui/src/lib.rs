@@ -51,6 +51,16 @@ struct XyView {
     lim: (f64, f64, f64, f64),
 }
 
+/// Where the interpreter is suspended (mirrored from
+/// `matlang::Session::pause_info` by [`MatApp::sync_debug`]). `file` is ""
+/// for interactive input; `err` is the caught error on a `dbstop if error`
+/// stop.
+struct DebugPause {
+    file: String,
+    line: usize,
+    err: Option<String>,
+}
+
 /// Construction options for [`MatApp`].
 #[derive(Default)]
 pub struct MatAppOptions {
@@ -118,6 +128,9 @@ pub struct MatApp {
     find_files: FindFiles,
     /// Figures shown as floating windows instead of document tabs.
     fig_popped: std::collections::BTreeSet<usize>,
+    /// The debugger's current stop — drives the `K>>` prompt, the debug
+    /// toolbar, the status line and the editor's paused-line highlight.
+    dbg: Option<DebugPause>,
     /// Write `layout.json` on drop (set by the eframe entry point).
     persist_layout: bool,
     /// Zoom factor restored from `layout.json`, applied on the first frame.
@@ -172,6 +185,7 @@ impl MatApp {
             prefs_open: false,
             find_files: FindFiles::default(),
             fig_popped: std::collections::BTreeSet::new(),
+            dbg: None,
             persist_layout: false,
             want_zoom: None,
             last_zoom: 1.0,
@@ -306,7 +320,14 @@ impl MatApp {
                 }
                 v
             }
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
+            Err(e) => match e {
+                // A debug pause unwinds as an error carrying DEBUG_PAUSE_ID —
+                // flag it so the UI shows the stop instead of an error line.
+                matcraft_engine::EngineError::Lang(le) if le.id == matlang::DEBUG_PAUSE_ID => {
+                    json!({"ok": false, "paused": true, "error": le.message})
+                }
+                _ => json!({"ok": false, "error": e.to_string()}),
+            },
         };
         self.figs_dirty = true;
         out
@@ -346,12 +367,84 @@ impl MatApp {
     /// Print a command reply's output (or error) into the scrollback, then
     /// refresh the file panels — commands may create/delete files.
     fn print_cmd_out(&mut self, out: &Json) {
-        if let Some(o) = out.get("output").and_then(Json::as_str).filter(|s| !s.is_empty()) {
+        if out.get("paused").and_then(Json::as_bool) == Some(true) {
+            // A debug stop, not a failure — the message names where we stopped.
+            if let Some(m) = out.get("error").and_then(Json::as_str) {
+                self.repl.push(m);
+            }
+        } else if let Some(o) = out.get("output").and_then(Json::as_str).filter(|s| !s.is_empty()) {
             self.repl.push(o);
         } else if let Some(e) = out.get("error").and_then(Json::as_str) {
             self.repl.push(&format!("Error: {e}"));
         }
         self.fcache.invalidate();
+    }
+
+    /// Mirror the interpreter's debug state into the UI — runs every frame
+    /// so pauses entered any way (gutter breakpoints, `dbstop`, `dbstep`,
+    /// control channel) surface identically: `self.dbg` drives the `K>>`
+    /// prompt, toolbar and status line, the stopped file is raised and its
+    /// line highlighted, and everything clears when the run resumes/quits.
+    fn sync_debug(&mut self) {
+        match self.session.lang().pause_info() {
+            Some(info) => {
+                let changed = self.dbg.as_ref().map(|d| (d.file.as_str(), d.line)) != Some((info.file.as_str(), info.line));
+                if changed && !info.file.is_empty() {
+                    self.open_editor_at(std::path::Path::new(&info.file), info.line);
+                }
+                self.dbg = Some(DebugPause { file: info.file.clone(), line: info.line, err: info.error.as_ref().map(|e| e.message.clone()) });
+                for e in &mut self.editors {
+                    e.pause_line = if !info.file.is_empty() && same_path(&e.path, &info.file) { Some(info.line) } else { None };
+                }
+            }
+            None => {
+                if self.dbg.is_some() {
+                    self.dbg = None;
+                    for e in &mut self.editors {
+                        e.pause_line = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A gutter toggle: mirror the mark into the interpreter with
+    /// `dbstop`/`dbclear` so the next run honours it. Call syntax (not
+    /// `dbstop in f at n`) keeps `C:\…` paths and spaces inside one string
+    /// argument.
+    fn toggle_breakpoint(&mut self, file: &str, line: usize, set: bool) {
+        if file.is_empty() || line == 0 {
+            return;
+        }
+        let esc = file.replace('\'', "''");
+        let code = if set { format!("dbstop('in','{esc}','at',{line})") } else { format!("dbclear('in','{esc}','at',{line})") };
+        let _ = self.exec_command("eval.line", json!({"code": code}));
+    }
+
+    /// `dbcont`/`dbstep` from the debug toolbar: echo the action, drive the
+    /// interpreter, surface its output. A pause-id error means still paused
+    /// — `sync_debug` picks up the new stop line.
+    fn debug_resume(&mut self, step: bool) {
+        self.repl.push(if step { ">> dbstep\n" } else { ">> dbcont\n" });
+        match if step { self.session.lang_mut().step() } else { self.session.lang_mut().resume() } {
+            Ok(out) => {
+                if !out.is_empty() {
+                    self.repl.push(&out);
+                }
+            }
+            Err(e) if e.id == matlang::DEBUG_PAUSE_ID => self.repl.push(&e.message),
+            Err(e) => self.repl.push(&format!("Error: {e}")),
+        }
+        self.figs_dirty = true;
+        self.fcache.invalidate();
+        self.sync_debug();
+    }
+
+    /// `dbquit` from the debug toolbar — abandon the suspended run.
+    fn debug_quit(&mut self) {
+        self.repl.push(">> dbquit\n");
+        self.session.lang_mut().quit_debug();
+        self.sync_debug();
     }
 
     fn drain_control(&mut self, ctx: &egui::Context) {
@@ -514,21 +607,26 @@ impl MatApp {
     /// Evaluate the editor buffer in the session (toolbar ▶ Run and the
     /// editor pane's own Run share this). `path` is echoed like `run 'path'`
     /// so error links in the Command Window point back at the file.
-    fn run_editor_buffer(&mut self, source: String, dir: Option<std::path::PathBuf>, path: Option<String>) {
+    /// `as_file` runs a clean file-backed buffer through `run 'path'` — the
+    /// interpreter then knows which file is executing and `dbstop`
+    /// breakpoints can hit (dirty and scratch buffers evaluate the text
+    /// directly; there is no file label to stop in).
+    fn run_editor_buffer(&mut self, source: String, dir: Option<std::path::PathBuf>, path: Option<String>, as_file: bool) {
         if let Some(d) = dir {
             let _ = self.exec_command("path.add", json!({"dir": d.to_string_lossy()}));
+        }
+        if as_file {
+            if let Some(p) = path.as_deref().filter(|p| std::path::Path::new(p).is_file()) {
+                self.run_line(&format!("run '{}'", p.replace('\'', "''")));
+                return;
+            }
         }
         match &path {
             Some(p) => self.repl.push(&format!(">> run '{}'\n", p.replace('\'', "''"))),
             None => self.repl.push(">> run editor buffer\n"),
         }
         let out = self.exec_command("eval.line", json!({"code": source}));
-        if let Some(o) = out.get("output").and_then(Json::as_str).filter(|s| !s.is_empty()) {
-            self.repl.push(o);
-        } else if let Some(e) = out.get("error").and_then(Json::as_str) {
-            self.repl.push(&format!("Error: {e}"));
-        }
-        self.fcache.invalidate();
+        self.print_cmd_out(&out);
     }
 
     /// The currently displayed figure. A plain 2-D axes gets MATLAB-style
@@ -905,11 +1003,18 @@ impl MatApp {
     }
 }
 
+/// Path comparison tolerant of `\` vs `/` — the debugger labels runs with
+/// `path.display()`, editors store `to_string_lossy`.
+fn same_path(a: &str, b: &str) -> bool {
+    a == b || a.replace('\\', "/") == b.replace('\\', "/")
+}
+
 impl eframe::App for MatApp {
     /// Non-painting work: control requests, screenshot replies, figure
     /// texture refresh. Runs before `ui`, also while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_control(ctx);
+        self.sync_debug();
         self.resolve_screenshots(ctx);
         if self.figs_dirty {
             self.rebuild_figures(ctx);
@@ -931,7 +1036,7 @@ impl eframe::App for MatApp {
         self.last_zoom = zoom;
         // Desktop shortcuts: Ctrl+N/O/S/W/F, Ctrl+Shift+F, F5 run — gathered
         // first so the actions can take `self` after the input borrow ends.
-        let (new_doc, open_doc, save_doc, run_doc, close_doc, find, find_files) = ctx.input_mut(|i| {
+        let (new_doc, _open_doc, save_doc, run_doc, close_doc, find, find_files) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::N),
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
@@ -946,7 +1051,7 @@ impl eframe::App for MatApp {
             self.new_editor_tab(None);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if open_doc {
+        if _open_doc {
             if let Some(p) = rfd::FileDialog::new().add_filter("M-code", &["m"]).pick_file() {
                 self.open_editor(&p);
             }
@@ -960,7 +1065,7 @@ impl eframe::App for MatApp {
             if let Some(e) = self.cur_editor() {
                 let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
                 let path = (!e.path.is_empty()).then(|| e.path.clone());
-                self.run_editor_buffer(e.text.clone(), dir, path);
+                self.run_editor_buffer(e.text.clone(), dir, path, !e.dirty);
             }
         }
         if find && matches!(self.docs.get(self.doc_sel), Some(Doc::Edit(_))) {
@@ -1007,6 +1112,8 @@ impl eframe::App for MatApp {
         let mut link_open: Option<(String, usize)> = None;
         // Figure tab asked to pop out into a floating window.
         let mut pop_fig: Option<usize> = None;
+        // Debug toolbar clicks — Continue/Step/Quit while paused.
+        let (mut dbg_cont, mut dbg_step, mut dbg_quit) = (false, false, false);
 
         // ---- toolstrip: tabbed ribbon (HOME/PLOTS/EDITOR/VIEW) -----------
         egui::Panel::top("toolstrip").show(ui, |ui| {
@@ -1042,7 +1149,7 @@ impl eframe::App for MatApp {
                         let dir = std::path::Path::new(&e.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
                         let src = e.text.clone();
                         let path = (!e.path.is_empty()).then(|| e.path.clone());
-                        self.run_editor_buffer(src, dir, path);
+                        self.run_editor_buffer(src, dir, path, !e.dirty);
                     }
                 }
                 Some(RibbonCmd::RunSelection) => {
@@ -1148,7 +1255,7 @@ impl eframe::App for MatApp {
                     Some(FileCmd::Run(p)) => {
                         if let Ok(src) = std::fs::read_to_string(&p) {
                             let path = p.to_string_lossy().to_string();
-                            self.run_editor_buffer(src, p.parent().map(|d| d.to_path_buf()), Some(path));
+                            self.run_editor_buffer(src, p.parent().map(|d| d.to_path_buf()), Some(path), true);
                         }
                     }
                     None => {}
@@ -1177,12 +1284,12 @@ impl eframe::App for MatApp {
                         self.ws_rename = Some(n.clone());
                         self.ws_rename_buf = n;
                     }
-                    Some(WsCmd::SaveAs(n)) =>
+                    Some(WsCmd::SaveAs(_n)) =>
                     {
                         #[cfg(not(target_arch = "wasm32"))]
                         if let Some(p) = rfd::FileDialog::new().add_filter("MAT v5", &["mat"]).save_file() {
                             let esc = p.display().to_string().replace('\'', "''");
-                            run_lines.push(format!("save '{esc}' {n}"));
+                            run_lines.push(format!("save '{esc}' {_n}"));
                         }
                     }
                     None => {}
@@ -1193,7 +1300,14 @@ impl eframe::App for MatApp {
         // ---- status bar ---------------------------------------------------
         egui::Panel::bottom("status").exact_size(22.0).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.weak("Ready");
+                match &self.dbg {
+                    Some(d) => ui.weak(match &d.err {
+                        Some(m) => format!("Stopped on error: {m}"),
+                        None if d.file.is_empty() => format!("Paused at line {}", d.line),
+                        None => format!("Paused at {}:{}", d.file, d.line),
+                    }),
+                    None => ui.weak("Ready"),
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(if self.control_rx.is_some() { "control: on" } else { "control: off" });
                 });
@@ -1212,12 +1326,24 @@ impl eframe::App for MatApp {
                 egui::Panel::bottom("cmdwin").resizable(true).default_size(230.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Command Window").strong());
+                        if self.dbg.is_some() {
+                            ui.separator();
+                            if ui.small_button("Continue").on_hover_text("dbcont — resume until the next breakpoint").clicked() {
+                                dbg_cont = true;
+                            }
+                            if ui.small_button("Step").on_hover_text("dbstep — run the next statement, then pause").clicked() {
+                                dbg_step = true;
+                            }
+                            if ui.small_button("Quit").on_hover_text("dbquit — abandon the paused run").clicked() {
+                                dbg_quit = true;
+                            }
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("fx").monospace().weak());
                         });
                     });
                     ui.separator();
-                    let rout = self.repl.ui(ui, &words);
+                    let rout = self.repl.ui(ui, &words, self.dbg.is_some());
                     if let Some(line) = rout.line {
                         run_lines.push(line);
                     }
@@ -1276,8 +1402,14 @@ impl eframe::App for MatApp {
                 Some(Doc::Edit(ei)) if self.show_editor => {
                     let ei = *ei;
                     if let Some(e) = self.editors.get_mut(ei) {
-                        if let Some(EditorCmd::Run { source, dir, path }) = e.ui(ui, ei) {
-                            self.run_editor_buffer(source, dir, path);
+                        let cmds = e.ui(ui, ei);
+                        let epath = e.path.clone();
+                        for c in cmds {
+                            match c {
+                                EditorCmd::Run { source, dir, path, as_file } => self.run_editor_buffer(source, dir, path, as_file),
+                                EditorCmd::BpToggle { line, set } => self.toggle_breakpoint(&epath, line, set),
+                                EditorCmd::RunSelection => {}
+                            }
                         }
                     }
                 }
@@ -1411,6 +1543,15 @@ impl eframe::App for MatApp {
         for line in run_lines {
             self.run_line(&line);
         }
+        if dbg_cont {
+            self.debug_resume(false);
+        }
+        if dbg_step {
+            self.debug_resume(true);
+        }
+        if dbg_quit {
+            self.debug_quit();
+        }
     }
 }
 
@@ -1495,12 +1636,88 @@ mod tests {
         assert!(app.fig_popped.is_empty());
     }
 
+    /// A scratch `.m` dir unique to this test (parallel tests share the pid).
+    fn dbg_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("matcraft_uidbg_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn breakpoint_toggle_registers_dbstop_and_file_run_pauses() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let dir = dbg_dir("bp");
+        let f = dir.join("brk.m");
+        std::fs::write(&f, "a = 1;\nb = 2;\nc = 3;\n").unwrap();
+        let fp = f.to_string_lossy().to_string();
+        // A gutter toggle registers `dbstop` on the session.
+        app.toggle_breakpoint(&fp, 2, true);
+        assert!(app.session.lang().breakpoints().iter().any(|b| b.line == Some(2)));
+        // Running the file pauses — the reply is flagged, not an error.
+        let out = app.exec_command("eval.line", json!({"code": format!("run '{fp}'")}));
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["paused"], json!(true));
+        assert!(app.session.lang().is_paused());
+        app.sync_debug();
+        assert_eq!(app.dbg.as_ref().map(|d| d.line), Some(2));
+        // The paused file opens with its line highlighted.
+        assert!(app.editors.iter().any(|e| e.path == fp && e.pause_line == Some(2)));
+        // dbstep advances to line 3; dbquit ends the session.
+        app.debug_resume(true);
+        assert_eq!(app.dbg.as_ref().map(|d| d.line), Some(3));
+        app.debug_quit();
+        assert!(app.dbg.is_none());
+        assert!(!app.session.lang().is_paused());
+        assert!(app.editors.iter().all(|e| e.pause_line.is_none()));
+        // dbclear removes the registration.
+        app.toggle_breakpoint(&fp, 2, false);
+        assert!(app.session.lang().breakpoints().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_via_run_line_shows_message_not_error() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let dir = dbg_dir("stoperr");
+        let f = dir.join("bad.m");
+        std::fs::write(&f, "a = 1;\nerror('boom');\nb = 2;\n").unwrap();
+        let fp = f.to_string_lossy().to_string();
+        app.run_line("dbstop if error");
+        app.run_line(&format!("run '{fp}'"));
+        assert!(app.repl.scrollback.contains("Paused on error at"), "{}", app.repl.scrollback);
+        assert!(!app.repl.scrollback.contains("Error: Paused"));
+        app.sync_debug();
+        assert_eq!(app.dbg.as_ref().and_then(|d| d.err.as_deref()), Some("boom"));
+        // dbcont re-raises the caught error and ends the pause.
+        app.debug_resume(false);
+        assert!(app.dbg.is_none());
+        assert!(app.repl.scrollback.contains("Error:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_file_run_enters_pause_mode() {
+        let mut app = MatApp::with_options(MatAppOptions::default());
+        let dir = dbg_dir("filerun");
+        let f = dir.join("step.m");
+        std::fs::write(&f, "a = 1;\nb = 2;\n").unwrap();
+        let fp = f.to_string_lossy().to_string();
+        app.toggle_breakpoint(&fp, 1, true);
+        app.run_editor_buffer(String::new(), None, Some(fp), true);
+        // Echoed like `run 'path'` and paused at line 1.
+        assert!(app.repl.scrollback.contains(">> run '"));
+        assert!(app.session.lang().is_paused());
+        app.sync_debug();
+        assert_eq!(app.dbg.as_ref().map(|d| d.line), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn editor_run_echo_leaves_a_file_link() {
         let mut app = MatApp::with_options(MatAppOptions::default());
         let tmp = std::env::temp_dir().join("matcraft_echo_link_test.m");
         std::fs::write(&tmp, "x = 1;\n").unwrap();
-        app.run_editor_buffer("no_such_fn(1);".to_string(), None, Some(tmp.to_string_lossy().to_string()));
+        app.run_editor_buffer("no_such_fn(1);".to_string(), None, Some(tmp.to_string_lossy().to_string()), false);
         assert!(app.repl.scrollback.contains(">> run '"));
         // The error's bare `line 1` links back to the echoed file.
         let links = repl::find_links(&app.repl.scrollback);

@@ -8,10 +8,15 @@ pub enum EditorCmd {
     /// Evaluate the buffer in the session; `dir` joins the function search
     /// path first when the buffer came from a file. `path` is echoed like
     /// `run 'path'` so error links in the Command Window resolve to it.
-    Run { source: String, dir: Option<std::path::PathBuf>, path: Option<String> },
+    /// `as_file` runs a clean file-backed buffer through `run 'path'` so
+    /// `dbstop` breakpoints can hit.
+    Run { source: String, dir: Option<std::path::PathBuf>, path: Option<String>, as_file: bool },
     /// Internal marker: the Run Selection button was clicked (resolved to a
     /// `Run` with the selected text once the editor's cursor range is known).
     RunSelection,
+    /// A gutter click toggled the breakpoint on `line`; `set` = added —
+    /// the app mirrors it into the session with `dbstop`/`dbclear`.
+    BpToggle { line: usize, set: bool },
 }
 
 /// The Ctrl+F find/replace bar over the buffer.
@@ -43,9 +48,11 @@ pub struct Editor {
     pub want_run_selection: bool,
     /// The find/replace bar (Ctrl+F).
     pub find: FindBar,
-    /// 1-based lines with a breakpoint mark in the gutter. UI-only markers —
-    /// `dbstop`/`dbclear` need interpreter support that doesn't exist yet.
+    /// 1-based lines with a breakpoint mark in the gutter; toggles are
+    /// mirrored into the session as `dbstop`/`dbclear` ([`EditorCmd::BpToggle`]).
     pub breakpoints: BTreeSet<usize>,
+    /// The debugger's paused line — painted amber with a `▶` in the gutter.
+    pub pause_line: Option<usize>,
     /// Scroll to this 1-based line next `ui` pass (error links, find hits).
     pub want_line: Option<usize>,
     /// Scroll to this char index next `ui` pass (find next/prev, replace).
@@ -110,6 +117,7 @@ impl Editor {
             want_run_selection: false,
             find: FindBar::default(),
             breakpoints: BTreeSet::new(),
+            pause_line: None,
             want_line: None,
             want_char: None,
             want_text_focus: false,
@@ -235,9 +243,9 @@ impl Editor {
     }
 
     /// Draw the pane. `salt` keeps widget ids unique across editor tabs.
-    /// Returns the command for the app to run.
-    pub fn ui(&mut self, ui: &mut egui::Ui, salt: usize) -> Option<EditorCmd> {
-        let mut cmd = None;
+    /// Returns the commands for the app to run (usually empty or one).
+    pub fn ui(&mut self, ui: &mut egui::Ui, salt: usize) -> Vec<EditorCmd> {
+        let mut cmds = Vec::new();
         ui.heading("Editor");
         ui.horizontal(|ui| {
             ui.label("file:");
@@ -260,10 +268,15 @@ impl Editor {
             }
             if ui.button("Run").clicked() {
                 let dir = std::path::Path::new(&self.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
-                cmd = Some(EditorCmd::Run { source: self.text.clone(), dir, path: (!self.path.is_empty()).then(|| self.path.clone()) });
+                cmds.push(EditorCmd::Run {
+                    source: self.text.clone(),
+                    dir,
+                    path: (!self.path.is_empty()).then(|| self.path.clone()),
+                    as_file: !self.dirty && !self.path.is_empty(),
+                });
             }
             if ui.button("Run Selection").on_hover_text("run the highlighted code — F9").clicked() {
-                cmd = Some(EditorCmd::RunSelection);
+                cmds.push(EditorCmd::RunSelection);
             }
         });
         if !self.status.is_empty() {
@@ -277,6 +290,7 @@ impl Editor {
             self.find_bar(ui, salt, &matches);
         }
         let cur_match = matches.get(self.find.cur).copied();
+        let pause_ln = self.pause_line;
 
         // ---- buffer with gutter ------------------------------------------
         let edit_id = egui::Id::new(("editor-text", salt));
@@ -298,7 +312,7 @@ impl Editor {
                             .min_size(egui::vec2(ui.available_width(), avail_h))
                             .lock_focus(true)
                             .layouter(&mut |ui, s, wrap| {
-                                let mut job = highlight_matches(s.as_str(), ui.visuals().text_color(), &matches, cur_match);
+                                let mut job = highlight_matches(s.as_str(), ui.visuals().text_color(), &matches, cur_match, pause_ln);
                                 job.wrap.max_width = wrap;
                                 ui.fonts_mut(|f| f.layout_job(job))
                             })
@@ -334,20 +348,36 @@ impl Editor {
                     if self.breakpoints.contains(&(li + 1)) {
                         painter.circle_filled(egui::pos2(grect.left() + 9.0, y + row.size.y / 2.0), 4.0, bp_col);
                     }
+                    if self.pause_line == Some(li + 1) {
+                        // The debugger's execution pointer (MATLAB's green arrow).
+                        painter.text(
+                            egui::pos2(grect.left() + 12.0, y + row.size.y / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            "▶",
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_rgb(0xB8, 0x86, 0x0B),
+                        );
+                    }
                     li += 1;
                 }
                 cum += row.char_count_including_newline().0;
             }
         }
-        let gresp = gresp.on_hover_text("click to set/clear a breakpoint\n(markers only — interpreter support pending)");
+        let gresp = gresp.on_hover_text("click to set/clear a breakpoint");
         if gresp.clicked() {
             if let Some(p) = gresp.interact_pointer_pos() {
                 let ci = output.galley.cursor_from_pos(p - output.galley_pos).index.0;
                 let line = line_starts.partition_point(|s| *s <= ci).max(1);
-                if !self.breakpoints.remove(&line) {
+                let set = !self.breakpoints.remove(&line);
+                if set {
                     self.breakpoints.insert(line);
                 }
-                self.status = format!("breakpoint at line {line} — markers only (interpreter support pending)");
+                cmds.push(EditorCmd::BpToggle { line, set });
+                self.status = if self.path.is_empty() {
+                    format!("breakpoint at line {line} — save the file for it to take effect")
+                } else {
+                    format!("breakpoint {} at line {line}", if set { "set" } else { "cleared" })
+                };
             }
         }
 
@@ -381,7 +411,10 @@ impl Editor {
 
         // F9 (or the button above) evaluates the highlighted selection.
         let want_sel = std::mem::take(&mut self.want_run_selection);
-        if (ui.input(|i| i.key_pressed(egui::Key::F9)) && output.response.has_focus()) || matches!(cmd, Some(EditorCmd::RunSelection)) || want_sel {
+        if (ui.input(|i| i.key_pressed(egui::Key::F9)) && output.response.has_focus())
+            || cmds.iter().any(|c| matches!(c, EditorCmd::RunSelection))
+            || want_sel
+        {
             if let Some(sel) = output.cursor_range.and_then(|cr| {
                 let n = self.text.chars().count();
                 let (a, b) = if cr.primary.index <= cr.secondary.index {
@@ -393,10 +426,10 @@ impl Editor {
                 (b > a).then(|| self.text.chars().skip(a).take(b - a).collect::<String>())
             }) {
                 let dir = std::path::Path::new(&self.path).parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
-                cmd = Some(EditorCmd::Run { source: sel, dir, path: (!self.path.is_empty()).then(|| self.path.clone()) });
+                cmds.push(EditorCmd::Run { source: sel, dir, path: (!self.path.is_empty()).then(|| self.path.clone()), as_file: false });
             }
         }
-        cmd
+        cmds
     }
 }
 
@@ -430,10 +463,18 @@ const KEYWORDS: &[&str] = &[
 
 /// `highlight` plus find-bar marks: every match gets a light-yellow
 /// background, the current one a stronger amber — like the Editor's find
-/// highlighting.
-fn highlight_matches(text: &str, default_color: egui::Color32, matches: &[(usize, usize)], cur: Option<(usize, usize)>) -> egui::text::LayoutJob {
+/// highlighting. `pause_line` (1-based) paints the debugger's stopped line
+/// a distinct amber.
+fn highlight_matches(
+    text: &str,
+    default_color: egui::Color32,
+    matches: &[(usize, usize)],
+    cur: Option<(usize, usize)>,
+    pause_line: Option<usize>,
+) -> egui::text::LayoutJob {
     let mut job = highlight(text, default_color);
     if matches.is_empty() {
+        paint_debug_line(&mut job.sections, text, pause_line);
         return job;
     }
     // Split sections at every match boundary, keeping each piece's format.
@@ -469,7 +510,21 @@ fn highlight_matches(text: &str, default_color: egui::Color32, matches: &[(usize
         }
     }
     job.sections = secs;
+    paint_debug_line(&mut job.sections, text, pause_line);
     job
+}
+
+/// Amber background on the debugger's stopped line (1-based; `None` = not
+/// paused) — distinct from the red breakpoint dots and paler find marks.
+fn paint_debug_line(secs: &mut [egui::text::LayoutSection], text: &str, pause_line: Option<usize>) {
+    let Some(ln) = pause_line else { return };
+    let starts = line_start_offsets(text);
+    let Some(&a) = starts.get(ln.saturating_sub(1)) else { return };
+    let b = starts.get(ln).copied().unwrap_or(text.len());
+    let bg = egui::Color32::from_rgb(0xF7, 0xD7, 0x6B);
+    for sec in secs.iter_mut().filter(|s| s.byte_range.start.0 >= a && s.byte_range.end.0 <= b) {
+        sec.format.background = bg;
+    }
 }
 
 /// Colour M-code into a `LayoutJob`: keywords blue, `%`/`...` comments

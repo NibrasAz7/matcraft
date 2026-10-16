@@ -14,9 +14,15 @@ pub struct Rasterizer {
 
 impl Rasterizer {
     pub fn new() -> Self {
-        let mut db = usvg::fontdb::Database::new();
+        // System fonts load natively; the wasm build ships without them.
         #[cfg(not(target_arch = "wasm32"))]
-        db.load_system_fonts();
+        let db = {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            db
+        };
+        #[cfg(target_arch = "wasm32")]
+        let db = usvg::fontdb::Database::new();
         Rasterizer { fontdb: std::sync::Arc::new(db) }
     }
 

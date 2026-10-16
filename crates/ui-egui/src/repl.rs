@@ -256,7 +256,9 @@ impl Repl {
 
     /// Draw the command window. Reports a line to evaluate on Enter and a
     /// `(file, line)` target when a scrollback file link was clicked.
-    pub fn ui(&mut self, ui: &mut egui::Ui, words: &[String]) -> ReplOut {
+    /// `paused` switches the prompt to MATLAB's debug prompt `K>>` — the
+    /// input line stays live while the debugger holds a suspended run.
+    pub fn ui(&mut self, ui: &mut egui::Ui, words: &[String], paused: bool) -> ReplOut {
         // Bound the scroll area: inside a content-sized panel an expanding
         // MATLAB puts the `>>` prompt right after the last output line: the
         // prompt lives inside the scroll area and scrolls up with the text
@@ -309,7 +311,7 @@ impl Repl {
             }
 
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(">>").monospace().strong());
+                ui.label(egui::RichText::new(if paused { "K>>" } else { ">>" }).monospace().strong());
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.input)
                         .font(egui::TextStyle::Monospace)
