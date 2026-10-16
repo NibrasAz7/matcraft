@@ -114,7 +114,7 @@ fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
     match val {
         Value::Num(x) => Ok(matrix_element(name, MX_DOUBLE, 0, &[1, 1], MI_DOUBLE, &x.to_le_bytes())),
         Value::Mat(m) => {
-            let dims = [m.rows() as u32, m.cols() as u32];
+            let dims: Vec<u32> = m.dims().iter().map(|&d| d as u32).collect();
             let mut data = Vec::with_capacity(m.numel() * 8);
             // `Matrix::data` is already column-major — direct dump.
             for x in m.data() {
@@ -291,11 +291,16 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
     for i in 0..nd {
         dims.push(u32::from_le_bytes([p[i * 4], p[i * 4 + 1], p[i * 4 + 2], p[i * 4 + 3]]) as usize);
     }
-    if dims.len() > 2 {
-        return Err("N-D arrays not supported yet".into());
-    }
     let rows = dims.first().copied().unwrap_or(1);
     let cols = dims.get(1).copied().unwrap_or(1);
+    let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    // N-D storage exists only for dense doubles; other classes stay 2-D.
+    if dims.len() > 2 && !matches!(class, MX_DOUBLE | MX_UINT8) {
+        return Err("N-D arrays are only supported for double data".into());
+    }
+    if numel > MAX_NESTED {
+        return Err("array too large".into());
+    }
     // Name
     let (t, p) = r.element().ok_or("truncated name")?;
     if t != MI_INT8 {
@@ -318,17 +323,20 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
     let (t, p) = r.element().ok_or("truncated data")?;
     match class {
         MX_DOUBLE => {
-            if t != MI_DOUBLE || p.len() < rows * cols * 8 {
+            if t != MI_DOUBLE || p.len() < numel * 8 {
                 return Err("double payload mismatch".into());
             }
-            let mut data = Vec::with_capacity(rows * cols);
-            for i in 0..rows * cols {
+            let mut data = Vec::with_capacity(numel);
+            for i in 0..numel {
                 let b = p.get(i * 8..i * 8 + 8).ok_or("double payload short")?;
                 data.push(f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]));
             }
             if is_complex {
+                if dims.len() > 2 {
+                    return Err("N-D complex arrays are not supported".into());
+                }
                 // Imaginary part follows as a second miDOUBLE element.
-                let (_t2, im) = read_doubles(&mut r, rows * cols)?;
+                let (_t2, im) = read_doubles(&mut r, numel)?;
                 if im.len() != data.len() {
                     return Err("complex imag payload mismatch".into());
                 }
@@ -336,7 +344,7 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
                 let m = CMatrix::from_col_major(rows, cols, cd).map_err(|e| format!("bad dims: {e}"))?;
                 return Ok((name, Value::Cplx(m)));
             }
-            let m = Matrix::from_col_major(rows, cols, data).map_err(|e| format!("bad dims: {e}"))?;
+            let m = Matrix::from_col_major_nd(&dims, data).map_err(|e| format!("bad dims: {e}"))?;
             Ok((name, if m.is_scalar() { Value::Num(m.as_scalar().unwrap_or(0.0)) } else { Value::Mat(m) }))
         }
         MX_CHAR => {
@@ -352,8 +360,8 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
         }
         MX_UINT8 => {
             // e.g. logical arrays stored as uint8 with the logical flag.
-            let data: Vec<f64> = p.iter().take(rows * cols).map(|&b| f64::from(b)).collect();
-            let m = Matrix::from_col_major(rows, cols, data).map_err(|e| format!("bad dims: {e}"))?;
+            let data: Vec<f64> = p.iter().take(numel).map(|&b| f64::from(b)).collect();
+            let m = Matrix::from_col_major_nd(&dims, data).map_err(|e| format!("bad dims: {e}"))?;
             Ok((name, Value::Mat(m)))
         }
         MX_SPARSE => {
@@ -556,6 +564,24 @@ mod tests {
                 assert_eq!(m.get(1, 1).unwrap_or(CNum::real(0.0)), CNum::new(0.0, -2.0));
             }
             v => panic!("expected Cplx, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_nd_double() {
+        let mut data = vec![0.0; 24];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = (i + 1) as f64;
+        }
+        let m = Matrix::from_col_major_nd(&[2, 3, 4], data).unwrap();
+        let got = roundtrip(vec![("x".to_string(), Value::Mat(m))]);
+        assert_eq!(got.len(), 1);
+        match &got[0].1 {
+            Value::Mat(m) => {
+                assert_eq!(m.dims(), &[2, 3, 4]);
+                assert_eq!(m.get_nd(&[1, 2, 3]), Some(24.0));
+            }
+            v => panic!("expected Mat, got {v:?}"),
         }
     }
 

@@ -6,7 +6,9 @@ by observing MathWorks software.
 
 ## Values
 
-- `double` matrix — everything is a column-major `f64` matrix; scalars are 1x1.
+- `double` matrix — everything is a column-major `f64` array of `N` dims
+  (`N ≥ 2`); scalars are 1×1. Linear indexing runs column-major through
+  every dim: `x(i,j,k)` on a 2×3×4 array is the same element as `x(24)`.
 - `char` string — `'like this'` (`''` escapes a quote). `''` is a `0×0`
   empty char; nonempty chars are `1×n`. In numeric contexts a char promotes
   to its code-point doubles: `'a'+1`, `'a'=='a'`, `x'` on a char (a numeric
@@ -43,8 +45,18 @@ by observing MathWorks software.
 
 - Matrix literal `[a b; c d]`, empty `[]`.
 - Ranges `a:b`, `a:step:b` (row vectors).
-- Indexing `A(i)`, `A(i,j)`, `A(:)`, `A(end)`, `A(i:j)`, and mixing:
-  `A(2:end, :)` works.
+- Indexing `A(i)`, `A(i,j)`, `A(i,j,k,…)`, `A(:)`, `A(end)`, `A(i:j)`, and
+  mixing: `A(2:end, :)` works. Subscripts beyond the second dim index an
+  N-D array's trailing dims; fewer subscripts than `ndims` fold the
+  remaining dims into the last one (`x(:,5)` on a 2×3×4 array reads the
+  5th element of the merged 3×4 tail). A subscripted read keeps one dim
+  per subscript, so `x(:,:,2)` reports `[2 3 1]` and `x(:,2,:)` reports
+  `[2 1 4]` — `size` returns the stored dims.
+- N-D writes work the same way: `x(i,j,k) = v` broadcasts a scalar RHS,
+  matches element counts otherwise, grows any dim past its end with
+  zeros, and extends the dims vector — `x(1,1,1) = 5` on a 2-D matrix
+  makes it 2×2×1. `x(i) = v` writes flat column-major; a linear index
+  past `numel` still only grows vectors.
 - Cell literal `{a b; c d}` mirrors matrix literals; braces index **content**
   (`x = c{i}`, `c{i} = v`) while parens index **cells** (`c(i)` is a sub-cell,
   `c(i) = v` writes a cell, `c(i) = []`/`c(:,j)=[]`/`c(i,:)=[]` delete).
@@ -111,11 +123,11 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 
 | Group | Functions |
 | --- | --- |
-| Construction | `zeros ones eye magic rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists) |
-| Shape | `size numel length ndims` (multi-output `[r,c] = size(A)`) |
+| Construction | `zeros ones eye magic rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists). `zeros`/`ones`/`rand`/`randn`/`Inf`/`NaN` take extra dims (`zeros(2,3,4)` or `zeros([2 3 4])`), `reshape` takes an N-D dims vector or extra args, `squeeze` drops singleton dims, and `cat(d,a,b)` concatenates along any dim (`cat(3,…)` stacks pages; `horzcat`/`vertcat` work on N-D operands too) |
+| Shape | `size numel length ndims` — `size(x)` returns the whole dims vector as a row, `size(x,d)` one dim, multi-output `[r,c,…] = size(A)` folds trailing dims into the last output; `ndims` counts stored dims (≥2) |
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
-| Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
-| Running | `cumsum cumprod diff sort unique find` (`find` multi-output) |
+| Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); N-D arrays reduce along `dim` over the whole array (`sum(ones(2,3,4),3)` → 2×3×1) and default to the first non-singleton dim; two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
+| Running | `cumsum cumprod diff sort unique find` (`find` multi-output; `cumsum`/`cumprod`/`diff` are 2-D-only) |
 | Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` |
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
 | DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`) |
@@ -153,7 +165,12 @@ Notes:
   uniform approximation (not yet Box–Muller).
 - `disp`/`who`/`whos`/`clear`/`format`/`fprintf` print and produce no `ans`.
 - `format long` prints ~14 digits, `format short` (default) ~4.
-- `f(n)` dims constructors make `n×n`; `f(r,c)` makes `r×c`; `f()` makes `1×1`.
+- `f(n)` dims constructors make `n×n`; `f(r,c)` makes `r×c`; `f()` makes `1×1`;
+  `f(d1,d2,d3,…)` or `f([d1 d2 d3])` makes an N-D array.
+- N-D arrays display page by page — `x(:,:,1) =` / `x(:,:,2) =` blocks —
+  and inherently 2-D operations (`*` `\` `'` `^`, `det`/`inv`/`eig`/…,
+  `cumsum`/`diff`, `[v,i] = max`) reject N-D operands with a 2-D-operand
+  error rather than reading the first page.
 - Matrix literals follow the M-code whitespace rule: `[0 -2 5]` is three
   elements (space before `-`, none after), `[0 - 2]` is one.
 - Logical masks index and assign: `v = A(A > 0)`, `A(A < 0) = 0`.
@@ -161,6 +178,11 @@ Notes:
 
 ## Known gaps (by design, for now)
 
+- N-D applies to dense real `double` only: cells, structs, complex and
+  sparse arrays stay 2-D, and a `()`-subscripted `= []` delete on an N-D
+  double is rejected (linear `x(i) = []` still works). Subscripted reads
+  return one dim per subscript (`x(:,:,1)` is 2×3×1, not squeezed 2×3 —
+  use `squeeze`). `.mat` files round-trip N-D dims for doubles.
 - No nested/local-scoped subfunctions. `.mat` v5 binary `save`/`load`
   covers double, complex (FLAG_COMPLEX pr/pi), char and sparse (mxSPARSE
   `ir`/`jc`/`pr`) arrays — saving a cell or struct errors

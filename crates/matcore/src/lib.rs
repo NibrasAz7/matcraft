@@ -24,6 +24,8 @@ pub use sparse::SparseMat;
 pub enum MatError {
     /// Dimensions don't match for the requested operation.
     DimensionMismatch { a: (usize, usize), b: (usize, usize) },
+    /// N-D shapes don't match for the requested operation.
+    DimsMismatch { a: Vec<usize>, b: Vec<usize> },
     /// A solve/decomposition needs a square or nonsingular matrix.
     Singular,
     /// Index out of bounds.
@@ -40,6 +42,10 @@ impl fmt::Display for MatError {
             MatError::DimensionMismatch { a, b } => {
                 write!(f, "dimension mismatch: {}x{} vs {}x{}", a.0, a.1, b.0, b.1)
             }
+            MatError::DimsMismatch { a, b } => {
+                let dims = |d: &[usize]| d.iter().map(usize::to_string).collect::<Vec<_>>().join("x");
+                write!(f, "dimension mismatch: {} vs {}", dims(a), dims(b))
+            }
             MatError::Singular => write!(f, "matrix is singular or not square"),
             MatError::OutOfBounds { index, shape } => write!(f, "index ({},{}) out of bounds for {}x{} matrix", index.0, index.1, shape.0, shape.1),
             MatError::BadData { len, expected } => {
@@ -52,24 +58,45 @@ impl fmt::Display for MatError {
 
 impl std::error::Error for MatError {}
 
-/// Dense column-major matrix of f64.
+/// Dense column-major array of f64 with two or more dims — a plain matrix
+/// when `dims.len() == 2`, an N-D array otherwise. `data` is column-major,
+/// so element `(i, j, k, …)` (0-based) sits at `i + j*d0 + k*d0*d1 + …`
+/// and a single linear index always walks the whole array.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
-    rows: usize,
-    cols: usize,
-    /// `data[col * rows + row]`
+    /// Extent of each dimension; `dims.len() >= 2` always — `[r, c]` is the
+    /// classic matrix case. Trailing dims of extent 1 are kept: `size`
+    /// reports exactly this vector.
+    dims: Vec<usize>,
+    /// `data.len() == product(dims)`; layout described above.
     data: Vec<f64>,
+}
+
+fn dim_product(dims: &[usize]) -> usize {
+    dims.iter().fold(1usize, |acc, &d| acc.saturating_mul(d))
 }
 
 impl Matrix {
     /// Zero matrix.
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Matrix { rows, cols, data: vec![0.0; rows.saturating_mul(cols)] }
+        Matrix { dims: vec![rows, cols], data: vec![0.0; rows.saturating_mul(cols)] }
+    }
+
+    /// Zero N-D array (`dims` must have at least two entries).
+    pub fn zeros_nd(dims: &[usize]) -> Self {
+        let dims = if dims.len() >= 2 { dims.to_vec() } else { vec![0, 0] };
+        Matrix { data: vec![0.0; dim_product(&dims)], dims }
     }
 
     /// Matrix of ones.
     pub fn ones(rows: usize, cols: usize) -> Self {
-        Matrix { rows, cols, data: vec![1.0; rows.saturating_mul(cols)] }
+        Matrix { dims: vec![rows, cols], data: vec![1.0; rows.saturating_mul(cols)] }
+    }
+
+    /// N-D array of ones (`dims` must have at least two entries).
+    pub fn ones_nd(dims: &[usize]) -> Self {
+        let dims = if dims.len() >= 2 { dims.to_vec() } else { vec![0, 0] };
+        Matrix { data: vec![1.0; dim_product(&dims)], dims }
     }
 
     /// Identity matrix (max(rows, cols) diagonal of ones).
@@ -88,7 +115,18 @@ impl Matrix {
         if data.len() != rows.saturating_mul(cols) {
             return Err(MatError::BadData { len: data.len(), expected: rows.saturating_mul(cols) });
         }
-        Ok(Matrix { rows, cols, data })
+        Ok(Matrix { dims: vec![rows, cols], data })
+    }
+
+    /// Build an N-D array from column-major storage (`dims.len() >= 2`).
+    pub fn from_col_major_nd(dims: &[usize], data: Vec<f64>) -> Result<Self, MatError> {
+        if dims.len() < 2 {
+            return Err(MatError::BadData { len: data.len(), expected: 0 });
+        }
+        if data.len() != dim_product(dims) {
+            return Err(MatError::BadData { len: data.len(), expected: dim_product(dims) });
+        }
+        Ok(Matrix { dims: dims.to_vec(), data })
     }
 
     /// Build from row-major storage (the natural way to write literals).
@@ -110,29 +148,47 @@ impl Matrix {
 
     /// 1x1 scalar matrix.
     pub fn scalar(v: f64) -> Self {
-        Matrix { rows: 1, cols: 1, data: vec![v] }
+        Matrix { dims: vec![1, 1], data: vec![v] }
     }
 
     /// Row vector `1 x values.len()`.
     pub fn row_vector(values: Vec<f64>) -> Self {
-        Matrix { rows: 1, cols: values.len(), data: values }
+        Matrix { dims: vec![1, values.len()], data: values }
     }
 
     /// Column vector `values.len() x 1`.
     pub fn col_vector(values: Vec<f64>) -> Self {
-        Matrix { rows: values.len(), cols: 1, data: values }
+        Matrix { dims: vec![values.len(), 1], data: values }
     }
 
     pub fn rows(&self) -> usize {
-        self.rows
+        self.dims.first().copied().unwrap_or(0)
     }
 
     pub fn cols(&self) -> usize {
-        self.cols
+        self.dims.get(1).copied().unwrap_or(0)
     }
 
+    /// First two dims as a `(rows, cols)` pair — the classic matrix view.
     pub fn shape(&self) -> (usize, usize) {
-        (self.rows, self.cols)
+        (self.rows(), self.cols())
+    }
+
+    /// Extent of every stored dimension (`len() >= 2`).
+    pub fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
+    /// Number of stored dimensions (`size` reports this many).
+    pub fn ndims(&self) -> usize {
+        self.dims.len()
+    }
+
+    /// Whether the array is effectively a 2-D matrix: every dim past the
+    /// second has extent 1. Matrix-only ops (`*`, `\`, `det`, …) use this
+    /// so `x(:,:,1)` results still work.
+    pub fn is_matrix(&self) -> bool {
+        self.dims.iter().skip(2).all(|&d| d <= 1)
     }
 
     pub fn numel(&self) -> usize {
@@ -144,30 +200,78 @@ impl Matrix {
         &self.data
     }
 
-    /// Element at (row, col), 0-based.
+    /// Element at (row, col), 0-based — the (row, col, 0, …) element of an
+    /// N-D array.
     pub fn get(&self, row: usize, col: usize) -> Option<f64> {
-        if row < self.rows && col < self.cols {
-            self.data.get(col * self.rows + row).copied()
+        if row < self.rows() && col < self.cols() {
+            self.data.get(col * self.rows() + row).copied()
         } else {
             None
         }
     }
 
+    /// Element at 0-based subscripts `subs` (one per dim). Missing trailing
+    /// subscripts read as 0.
+    pub fn get_nd(&self, subs: &[usize]) -> Option<f64> {
+        self.offset(subs).and_then(|i| self.data.get(i).copied())
+    }
+
+    /// Column-major offset of 0-based subscripts, or `None` when any
+    /// subscript is out of bounds or `subs` has too many entries.
+    pub fn offset(&self, subs: &[usize]) -> Option<usize> {
+        if subs.len() > self.dims.len() {
+            return None;
+        }
+        let mut off = 0usize;
+        let mut stride = 1usize;
+        for (i, &d) in self.dims.iter().enumerate() {
+            let s = subs.get(i).copied().unwrap_or(0);
+            if s >= d {
+                return None;
+            }
+            off = off.saturating_add(s.saturating_mul(stride));
+            stride = stride.saturating_mul(d);
+        }
+        Some(off)
+    }
+
     /// Set element at (row, col), 0-based.
     pub fn set(&mut self, row: usize, col: usize, v: f64) -> Result<(), MatError> {
-        if row < self.rows && col < self.cols {
-            if let Some(slot) = self.data.get_mut(col * self.rows + row) {
+        let (rows, cols) = self.shape();
+        if row < rows && col < cols {
+            if let Some(slot) = self.data.get_mut(col * rows + row) {
                 *slot = v;
             }
             Ok(())
         } else {
-            Err(MatError::OutOfBounds { index: (row, col), shape: self.shape() })
+            Err(MatError::OutOfBounds { index: (row, col), shape: (rows, cols) })
+        }
+    }
+
+    /// Set element at 0-based subscripts `subs`.
+    pub fn set_nd(&mut self, subs: &[usize], v: f64) -> Result<(), MatError> {
+        match self.offset(subs) {
+            Some(i) => {
+                if let Some(slot) = self.data.get_mut(i) {
+                    *slot = v;
+                }
+                Ok(())
+            }
+            None => Err(MatError::Other(format!("subscript index out of bounds for dims {:?}", self.dims))),
         }
     }
 
     /// Linear index (0-based, column-major order).
     pub fn get_linear(&self, i: usize) -> Option<f64> {
         self.data.get(i).copied()
+    }
+
+    /// Write by linear index (0-based, column-major order); out-of-range
+    /// writes are ignored.
+    pub fn set_linear(&mut self, i: usize, v: f64) {
+        if let Some(slot) = self.data.get_mut(i) {
+            *slot = v;
+        }
     }
 
     pub fn is_scalar(&self) -> bool {
@@ -185,16 +289,25 @@ impl Matrix {
 
     /// Elementwise map.
     pub fn map(&self, f: impl Fn(f64) -> f64) -> Self {
-        Matrix { rows: self.rows, cols: self.cols, data: self.data.iter().map(|&v| f(v)).collect() }
+        Matrix { dims: self.dims.clone(), data: self.data.iter().map(|&v| f(v)).collect() }
     }
 
-    /// Elementwise binary op; shapes must match exactly.
+    /// Do two dims vectors describe the same shape, counting implicit
+    /// trailing singleton dims as equal? `[2 3]` ≡ `[2 3 1]`.
+    pub fn same_shape(a: &[usize], b: &[usize]) -> bool {
+        let n = a.len().max(b.len());
+        (0..n).all(|i| a.get(i).copied().unwrap_or(1) == b.get(i).copied().unwrap_or(1))
+    }
+
+    /// Elementwise binary op; shapes must match exactly (implicit trailing
+    /// singleton dims aside). The result keeps the longer dims vector.
     pub fn elemwise(&self, other: &Matrix, f: impl Fn(f64, f64) -> f64) -> Result<Self, MatError> {
-        if self.shape() != other.shape() {
-            return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
+        if self.numel() != other.numel() || !Self::same_shape(&self.dims, &other.dims) {
+            return Err(MatError::DimsMismatch { a: self.dims.clone(), b: other.dims.clone() });
         }
+        let dims = if other.dims.len() > self.dims.len() { other.dims.clone() } else { self.dims.clone() };
         let data = self.data.iter().zip(other.data.iter()).map(|(&a, &b)| f(a, b)).collect();
-        Ok(Matrix { rows: self.rows, cols: self.cols, data })
+        Ok(Matrix { dims, data })
     }
 
     /// Broadcast `other` if it is a scalar, else require equal shapes.
@@ -218,10 +331,13 @@ impl Matrix {
         if let Some(s) = other.as_scalar() {
             return Ok(self.map(|a| a * s));
         }
-        if self.cols != other.rows {
+        if !self.is_matrix() || !other.is_matrix() {
+            return Err(MatError::Other("matrix multiply requires 2-D operands".into()));
+        }
+        if self.cols() != other.rows() {
             return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
         }
-        let (m, k, n) = (self.rows, self.cols, other.cols);
+        let (m, k, n) = (self.rows(), self.cols(), other.cols());
         let mut out = Matrix::zeros(m, n);
         for c in 0..n {
             for i in 0..k {
@@ -240,12 +356,13 @@ impl Matrix {
         Ok(out)
     }
 
-    /// Transpose.
+    /// Transpose — defined on the 2-D view; callers must check
+    /// [`Matrix::is_matrix`] first (an N-D transpose is not defined).
     pub fn transpose(&self) -> Self {
-        let mut out = Matrix::zeros(self.cols, self.rows);
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                if let (Some(v), Some(slot)) = (self.get(r, c), out.data.get_mut(r * self.cols + c)) {
+        let mut out = Matrix::zeros(self.cols(), self.rows());
+        for r in 0..self.rows() {
+            for c in 0..self.cols() {
+                if let (Some(v), Some(slot)) = (self.get(r, c), out.data.get_mut(r * self.cols() + c)) {
                     *slot = v;
                 }
             }
@@ -255,20 +372,23 @@ impl Matrix {
 
     /// LU solve `self * x = b` with partial pivoting.
     pub fn solve(&self, b: &Matrix) -> Result<Matrix, MatError> {
-        if self.rows != self.cols || b.rows != self.rows {
+        if !self.is_matrix() || !b.is_matrix() {
+            return Err(MatError::Other("solve requires 2-D operands".into()));
+        }
+        if self.rows() != self.cols() || b.rows() != self.rows() {
             return Err(MatError::DimensionMismatch { a: self.shape(), b: b.shape() });
         }
-        let n = self.rows;
+        let n = self.rows();
         // Augmented copy, row-major for cache-friendly elimination.
-        let mut a = vec![0.0; n.saturating_mul(n + b.cols)];
-        let width = n + b.cols;
+        let mut a = vec![0.0; n.saturating_mul(n + b.cols())];
+        let width = n + b.cols();
         for r in 0..n {
             for c in 0..n {
                 if let Some(dst) = a.get_mut(r * width + c) {
                     *dst = self.get(r, c).unwrap_or(0.0);
                 }
             }
-            for c in 0..b.cols {
+            for c in 0..b.cols() {
                 if let Some(dst) = a.get_mut(r * width + n + c) {
                     *dst = b.get(r, c).unwrap_or(0.0);
                 }
@@ -308,8 +428,8 @@ impl Matrix {
             }
         }
         // Back substitution.
-        let mut x = Matrix::zeros(n, b.cols);
-        for col in 0..b.cols {
+        let mut x = Matrix::zeros(n, b.cols());
+        for col in 0..b.cols() {
             for r in (0..n).rev() {
                 let mut acc = a.get(r * width + n + col).copied().unwrap_or(0.0);
                 for c in (r + 1)..n {
@@ -326,18 +446,24 @@ impl Matrix {
 
     /// Inverse via repeated solves (columns of the identity).
     pub fn inverse(&self) -> Result<Matrix, MatError> {
-        if self.rows != self.cols {
+        if !self.is_matrix() {
+            return Err(MatError::Other("inverse requires a 2-D operand".into()));
+        }
+        if self.rows() != self.cols() {
             return Err(MatError::Singular);
         }
-        self.solve(&Matrix::eye(self.rows, self.cols))
+        self.solve(&Matrix::eye(self.rows(), self.cols()))
     }
 
     /// Determinant via LU elimination (sign tracked on pivot swaps).
     pub fn det(&self) -> Result<f64, MatError> {
-        if self.rows != self.cols {
+        if !self.is_matrix() {
+            return Err(MatError::Other("det requires a 2-D operand".into()));
+        }
+        if self.rows() != self.cols() {
             return Err(MatError::Singular);
         }
-        let n = self.rows;
+        let n = self.rows();
         let mut a = self.data.clone(); // column-major
         let mut sign = 1.0;
         let mut det = 1.0;
@@ -387,62 +513,121 @@ impl Matrix {
 
     /// Reshape preserving column-major element order.
     pub fn reshape(&self, rows: usize, cols: usize) -> Result<Matrix, MatError> {
-        if rows.saturating_mul(cols) != self.data.len() {
-            return Err(MatError::BadData { len: self.data.len(), expected: rows.saturating_mul(cols) });
+        self.reshape_nd(&[rows, cols])
+    }
+
+    /// Reshape to any dims (`len >= 2`) preserving column-major order.
+    pub fn reshape_nd(&self, dims: &[usize]) -> Result<Matrix, MatError> {
+        if dims.len() < 2 {
+            return Err(MatError::BadData { len: self.data.len(), expected: 0 });
         }
-        Ok(Matrix { rows, cols, data: self.data.clone() })
+        if dim_product(dims) != self.data.len() {
+            return Err(MatError::BadData { len: self.data.len(), expected: dim_product(dims) });
+        }
+        Ok(Matrix { dims: dims.to_vec(), data: self.data.clone() })
+    }
+
+    /// Drop every extent-1 dim, keeping at least two — `squeeze`.
+    /// (`squeeze` of a row vector gives a column, like M-code.)
+    pub fn squeezed(&self) -> Matrix {
+        let mut dims: Vec<usize> = self.dims.iter().copied().filter(|&d| d != 1).collect();
+        while dims.len() < 2 {
+            dims.push(1);
+        }
+        Matrix { dims, data: self.data.clone() }
     }
 
     /// Grow to at least (rows, cols), padding with zeros.
     pub fn grow(&mut self, rows: usize, cols: usize) {
-        if rows <= self.rows && cols <= self.cols {
+        self.grow_nd(&[rows, cols]);
+    }
+
+    /// Grow to at least `want` dims (element-wise max per dim), padding
+    /// with zeros. `want` may have more entries than `self.dims` — the
+    /// dims vector extends (new dims start at extent 1), which is how
+    /// `x(1,1,1) = v` on a 2-D array makes it 3-D.
+    pub fn grow_nd(&mut self, want: &[usize]) {
+        let nd = self.dims.len().max(want.len()).max(2);
+        let mut new_dims = vec![1usize; nd];
+        for (i, d) in new_dims.iter_mut().enumerate() {
+            *d = self.dims.get(i).copied().unwrap_or(1).max(want.get(i).copied().unwrap_or(1));
+        }
+        if new_dims == self.dims {
             return;
         }
-        let (nr, nc) = (rows.max(self.rows), cols.max(self.cols));
-        let mut out = Matrix::zeros(nr, nc);
-        for c in 0..self.cols {
-            for r in 0..self.rows {
-                if let (Some(v), Some(slot)) = (self.get(r, c), out.data.get_mut(c * nr + r)) {
+        if dim_product(&new_dims) == self.data.len() {
+            // Only trailing dims of extent 1 were appended — same storage.
+            self.dims = new_dims;
+            return;
+        }
+        let mut out = vec![0.0; dim_product(&new_dims)];
+        let old_dims = std::mem::replace(&mut self.dims, new_dims);
+        for (i, &v) in self.data.iter().enumerate() {
+            // Decompose the old linear index into old subscripts…
+            let mut rem = i;
+            let mut off = 0usize;
+            let mut stride = 1usize;
+            for (d, &od) in old_dims.iter().enumerate() {
+                let s = rem % od.max(1);
+                rem /= od.max(1);
+                // …and re-accumulate under the new strides.
+                off = off.saturating_add(s.saturating_mul(stride));
+                stride = stride.saturating_mul(self.dims.get(d).copied().unwrap_or(1));
+            }
+            if let Some(slot) = out.get_mut(off) {
+                *slot = v;
+            }
+        }
+        self.data = out;
+    }
+
+    /// Concatenate along 0-based dimension `dim` (`cat(dim+1, a, b)`).
+    /// Every other dim must match after padding missing dims with 1s.
+    pub fn cat(dim: usize, a: &Matrix, b: &Matrix) -> Result<Matrix, MatError> {
+        let nd = a.dims.len().max(b.dims.len()).max(dim + 1).max(2);
+        let mut rd = vec![1usize; nd];
+        for (i, d) in rd.iter_mut().enumerate() {
+            let (da, db) = (a.dims.get(i).copied().unwrap_or(1), b.dims.get(i).copied().unwrap_or(1));
+            if i == dim {
+                *d = da.saturating_add(db);
+            } else if da != db {
+                return Err(MatError::DimsMismatch { a: a.dims.clone(), b: b.dims.clone() });
+            } else {
+                *d = da;
+            }
+        }
+        let mut out = vec![0.0; dim_product(&rd)];
+        // Copy `src` into `out` with its cat-dim subscript offset by `shift`.
+        let copy = |src: &Matrix, shift: usize, out: &mut [f64]| {
+            for (i, &v) in src.data().iter().enumerate() {
+                let mut rem = i;
+                let mut off = 0usize;
+                let mut stride = 1usize;
+                for (d, &od) in rd.iter().enumerate() {
+                    let sd = src.dims.get(d).copied().unwrap_or(1).max(1);
+                    let s = rem % sd;
+                    rem /= sd;
+                    off = off.saturating_add((s + if d == dim { shift } else { 0 }).saturating_mul(stride));
+                    stride = stride.saturating_mul(od);
+                }
+                if let Some(slot) = out.get_mut(off) {
                     *slot = v;
                 }
             }
-        }
-        *self = out;
+        };
+        copy(a, 0, &mut out);
+        copy(b, a.dims.get(dim).copied().unwrap_or(1), &mut out);
+        Ok(Matrix { dims: rd, data: out })
     }
 
-    /// Horizontal concatenation `[a b]`.
+    /// Horizontal concatenation `[a b]` — `cat` along dim 2.
     pub fn hcat(a: &Matrix, b: &Matrix) -> Result<Matrix, MatError> {
-        if a.rows != b.rows {
-            return Err(MatError::DimensionMismatch { a: a.shape(), b: b.shape() });
-        }
-        let mut out = Matrix::zeros(a.rows, a.cols + b.cols);
-        for c in 0..a.cols + b.cols {
-            let src = if c < a.cols { a } else { b };
-            let sc = if c < a.cols { c } else { c - a.cols };
-            for r in 0..a.rows {
-                if let (Some(v), Some(slot)) = (src.get(r, sc), out.data.get_mut(c * a.rows + r)) {
-                    *slot = v;
-                }
-            }
-        }
-        Ok(out)
+        Matrix::cat(1, a, b)
     }
 
-    /// Vertical concatenation `[a; b]`.
+    /// Vertical concatenation `[a; b]` — `cat` along dim 1.
     pub fn vcat(a: &Matrix, b: &Matrix) -> Result<Matrix, MatError> {
-        if a.cols != b.cols {
-            return Err(MatError::DimensionMismatch { a: a.shape(), b: b.shape() });
-        }
-        let mut data = Vec::with_capacity(a.data.len() + b.data.len());
-        for c in 0..a.cols {
-            for r in 0..a.rows {
-                data.push(a.get(r, c).unwrap_or(0.0));
-            }
-            for r in 0..b.rows {
-                data.push(b.get(r, c).unwrap_or(0.0));
-            }
-        }
-        Ok(Matrix { rows: a.rows + b.rows, cols: a.cols, data })
+        Matrix::cat(0, a, b)
     }
 }
 
@@ -500,5 +685,97 @@ mod tests {
         let a = m(2, 2, &[1.0, 2.0, 2.0, 4.0]);
         let b = Matrix::col_vector(vec![1.0, 2.0]);
         assert_eq!(a.solve(&b), Err(MatError::Singular));
+    }
+
+    #[test]
+    fn nd_basics() {
+        let mut m = Matrix::zeros_nd(&[2, 3, 4]);
+        assert_eq!(m.dims(), &[2, 3, 4]);
+        assert_eq!(m.ndims(), 3);
+        assert_eq!(m.numel(), 24);
+        assert!(!m.is_matrix());
+        // (1,2,3) 0-based → linear 1 + 2*2 + 3*6 = 23.
+        assert_eq!(m.offset(&[1, 2, 3]), Some(23));
+        m.set_nd(&[1, 2, 3], 9.0).unwrap();
+        assert_eq!(m.get_nd(&[1, 2, 3]), Some(9.0));
+        assert_eq!(m.get_linear(23), Some(9.0));
+        assert!(m.get_nd(&[2, 0, 0]).is_none());
+        assert!(m.set_nd(&[0, 0, 4], 1.0).is_err());
+        // `get`/`set` see the first-page (row, col) view.
+        assert_eq!(m.get(1, 2), Some(0.0));
+        let _ = m.set(1, 2, 7.0);
+        assert_eq!(m.get_nd(&[1, 2, 0]), Some(7.0));
+    }
+
+    #[test]
+    fn nd_grow_extends_dims() {
+        // x(1,1,1) = 5 growth: appending an extent-1 dim keeps storage.
+        let mut m = Matrix::scalar(5.0);
+        m.grow_nd(&[1, 1, 1]);
+        assert_eq!(m.dims(), &[1, 1, 1]);
+        assert_eq!(m.get_nd(&[0, 0, 0]), Some(5.0));
+        // Growing a real dim pads zeros and preserves old elements.
+        let mut m = Matrix::zeros(2, 2);
+        m.set(0, 0, 1.0).unwrap();
+        m.set(1, 1, 2.0).unwrap();
+        m.grow_nd(&[2, 2, 3]);
+        assert_eq!(m.dims(), &[2, 2, 3]);
+        assert_eq!(m.numel(), 12);
+        assert_eq!(m.get_nd(&[0, 0, 0]), Some(1.0));
+        assert_eq!(m.get_nd(&[1, 1, 0]), Some(2.0));
+        assert_eq!(m.get_nd(&[1, 1, 2]), Some(0.0));
+    }
+
+    #[test]
+    fn nd_cat_pages() {
+        let a = Matrix::ones(2, 2);
+        let b = Matrix::zeros(2, 2);
+        let c = Matrix::cat(2, &a, &b).unwrap();
+        assert_eq!(c.dims(), &[2, 2, 2]);
+        assert_eq!(c.get_nd(&[0, 0, 0]), Some(1.0));
+        assert_eq!(c.get_nd(&[1, 1, 1]), Some(0.0));
+        // Non-cat dims must match.
+        assert!(Matrix::cat(2, &a, &Matrix::ones(2, 3)).is_err());
+        // cat along dim 1/2 still concatenates N-D operands.
+        let h = Matrix::cat(1, &c, &c).unwrap();
+        assert_eq!(h.dims(), &[2, 4, 2]);
+        let v = Matrix::cat(0, &c, &c).unwrap();
+        assert_eq!(v.dims(), &[4, 2, 2]);
+    }
+
+    #[test]
+    fn nd_elemwise_and_2d_guards() {
+        let a = Matrix::ones_nd(&[2, 2, 2]);
+        let b = Matrix::ones_nd(&[2, 2, 2]);
+        assert_eq!(a.broadcast(&b, |x, y| x + y).unwrap().dims(), &[2, 2, 2]);
+        // Implicit trailing singleton dims are shape-compatible:
+        // [2 2] ≡ [2 2 1], but not [2 2 2].
+        let page = Matrix::ones_nd(&[2, 2, 1]);
+        assert_eq!(page.elemwise(&Matrix::ones(2, 2), |x, y| x * y).unwrap().dims(), &[2, 2, 1]);
+        // Mismatched N-D shapes error.
+        assert!(a.elemwise(&Matrix::ones_nd(&[2, 2, 3]), |x, y| x + y).is_err());
+        assert!(a.elemwise(&Matrix::ones(2, 2), |x, y| x + y).is_err());
+        // Matrix ops refuse N-D operands.
+        assert!(a.matmul(&b).is_err());
+        assert!(a.det().is_err());
+        assert!(a.solve(&b).is_err());
+        assert!(a.inverse().is_err());
+        // …but a trailing-singleton 3-D view still counts as a matrix.
+        assert!(page.is_matrix());
+        assert!(page.det().is_ok());
+    }
+
+    #[test]
+    fn nd_reshape_and_squeeze() {
+        let m = Matrix::ones_nd(&[1, 4, 1, 3]);
+        let s = m.squeezed();
+        assert_eq!(s.dims(), &[4, 3]);
+        // squeeze of a row vector is a column.
+        assert_eq!(Matrix::row_vector(vec![1.0; 4]).squeezed().dims(), &[4, 1]);
+        let r = s.reshape_nd(&[2, 3, 2]).unwrap();
+        assert_eq!(r.dims(), &[2, 3, 2]);
+        assert_eq!(r.numel(), 12);
+        assert!(r.reshape_nd(&[2, 2]).is_err());
+        assert!(r.reshape_nd(&[5]).is_err());
     }
 }

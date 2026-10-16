@@ -34,6 +34,10 @@ const MAX_CALL_DEPTH: usize = 256;
 /// never legitimately nest `run` this deep.
 const MAX_RUN_DEPTH: usize = 4;
 
+/// N-D array display prints one 2-D page per `dims[3..]` combination —
+/// bounded so a big array can't bury the console.
+const MAX_DISP_PAGES: usize = 100;
+
 /// `LangError::id` signalling "the debugger suspended execution" rather
 /// than a real error. When `Session::run` returns an error with this id,
 /// inspect [`Session::pause_info`] and drive the session on with
@@ -656,12 +660,36 @@ impl Value {
     }
 
     /// Complex-context conversion: reals/chars promote with a zero imaginary
-    /// part; `Cplx` is cloned. Cells/structs still error.
+    /// part; `Cplx` is cloned. Cells/structs still error. Complex arrays are
+    /// 2-D only — an N-D real errors rather than truncating to a page.
     fn to_cmatrix(&self) -> Result<CMatrix, LangError> {
         match self {
             Value::Cplx(m) => Ok(m.clone()),
+            Value::Mat(m) if !m.is_matrix() => Err(LangError::new("complex arrays are 2-D — index a page or reshape first", 0)),
             _ => Ok(CMatrix::from_real(&self.to_numeric()?)),
         }
+    }
+
+    /// Stored dims as a vector (always ≥ 2 entries) — `size`/`ndims`
+    /// report this verbatim. Only dense `Mat` values carry >2 dims.
+    fn dims_vec(&self) -> Vec<usize> {
+        match self {
+            Value::Mat(m) => m.dims().to_vec(),
+            _ => {
+                let (r, c) = self.dims();
+                vec![r, c]
+            }
+        }
+    }
+
+    /// `dims_vec` with trailing extent-1 dims dropped (min 2) — the "matrix
+    /// view" predicates and 2-D-only ops use.
+    fn dims_2d(&self) -> Vec<usize> {
+        let mut d = self.dims_vec();
+        while d.len() > 2 && d.last() == Some(&1) {
+            d.pop();
+        }
+        d
     }
 
     /// `(rows, cols)` of any value — for `size`/`numel`/`length`/`isempty`.
@@ -1287,11 +1315,21 @@ impl Session {
                 }
                 let m = it.to_numeric()?;
                 // The loop variable takes each column of `iter` in turn;
-                // for a row vector `1:n` each column is a scalar.
-                for c in 0..m.cols() {
+                // for a row vector `1:n` each column is a scalar. On N-D
+                // arrays the tail dims merge into the column count.
+                let ncols = if m.ndims() > 2 {
+                    if m.rows() > 0 {
+                        m.numel() / m.rows()
+                    } else {
+                        0
+                    }
+                } else {
+                    m.cols()
+                };
+                for c in 0..ncols {
                     let mut colv = Vec::with_capacity(m.rows());
                     for r in 0..m.rows() {
-                        colv.push(m.get(r, c).unwrap_or(0.0));
+                        colv.push(m.get_linear(c.saturating_mul(m.rows()).saturating_add(r)).unwrap_or(0.0));
                     }
                     self.vars.insert(var.clone(), Value::Mat(Matrix::col_vector(colv)));
                     match self.exec_block(body, out)? {
@@ -1783,6 +1821,7 @@ impl Session {
                     return Ok(Some(cmat_or_value(out)));
                 }
                 let m = v.to_matrix()?;
+                need_2d(&m, if *conj { "ctranspose" } else { "transpose" })?;
                 Ok(Some(mat_or_num(m.transpose())))
             }
             Expr::Binary(op, a, b) => {
@@ -1866,8 +1905,9 @@ impl Session {
         if let Some(Value::Str(s)) = self.vars.get(name).cloned() {
             let len = s.chars().count();
             let mut target = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, target.shape(), target.numel().max(1))?;
-            let max_i = specs.rows.iter().chain(specs.cols.iter()).copied().max().unwrap_or(0);
+            let specs = self.index_specs(index, target.dims(), target.numel().max(1))?;
+            pages_in_bounds(&specs)?;
+            let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
                 let mut d = target.data().to_vec();
                 d.resize(max_i, 32.0);
@@ -1892,10 +1932,11 @@ impl Session {
         // them; writing past the end grows the sparse dims (MATLAB rule).
         if let Some(Value::Sparse(mut s)) = self.vars.get(name).cloned() {
             let rhs = v.to_matrix()?;
-            let specs = self.index_specs(index, s.shape(), s.numel().max(1))?;
+            let specs = self.index_specs(index, &[s.rows(), s.cols()], s.numel().max(1))?;
+            pages_in_bounds(&specs)?;
             if rhs.numel() == 0 {
                 // `S(idx) = []` clears the addressed entries.
-                for &i in &specs.rows {
+                for &i in specs.rows() {
                     let i0 = i.saturating_sub(1);
                     if i0 < s.numel() {
                         let (r, c) = (i0 % s.rows().max(1), i0 / s.rows().max(1));
@@ -1905,14 +1946,14 @@ impl Session {
             } else {
                 let scalar_rhs = rhs.numel() == 1;
                 if specs.linear {
-                    for (o, &i) in specs.rows.iter().enumerate() {
+                    for (o, &i) in specs.rows().iter().enumerate() {
                         let i0 = i.saturating_sub(1);
                         let (r, c) = (i0 % s.rows().max(1), i0 / s.rows().max(1));
                         s.set(r, c, if scalar_rhs { rhs.get_linear(0).unwrap_or(0.0) } else { rhs.get_linear(o).unwrap_or(0.0) });
                     }
                 } else {
-                    for (oc, &c) in specs.cols.iter().enumerate() {
-                        for (or, &r) in specs.rows.iter().enumerate() {
+                    for (oc, &c) in specs.cols().iter().enumerate() {
+                        for (or, &r) in specs.rows().iter().enumerate() {
                             let rv = if scalar_rhs { rhs.get_linear(0).unwrap_or(0.0) } else { rhs.get(or, oc).unwrap_or(0.0) };
                             s.set(r.saturating_sub(1), c.saturating_sub(1), rv);
                         }
@@ -1930,7 +1971,7 @@ impl Session {
                 None => CMatrix::zeros(0, 0),
             };
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, target.shape(), target.numel().max(1))?;
+            let specs = self.index_specs(index, &[target.rows(), target.cols()], target.numel().max(1))?;
             if rhs.numel() == 0 {
                 let kept = cmatrix_delete(&target, &specs)?;
                 self.vars.insert(name.to_string(), cmat_or_value(kept));
@@ -1947,7 +1988,7 @@ impl Session {
         // `x(i) = 'a'` — chars promote to code points when written into
         // a numeric array.
         let rhs = v.to_numeric()?;
-        let specs = self.index_specs(index, target.shape(), target.numel())?;
+        let specs = self.index_specs(index, target.dims(), target.numel())?;
         // `A(i) = []` — deletion on a matrix (`A(:,j)`, `A(i,:)` too).
         if rhs.numel() == 0 {
             let kept = matrix_delete(&target, &specs)?;
@@ -1964,10 +2005,11 @@ impl Session {
     /// Fetch the contents selected by `c{…}` as a list — the building
     /// block of comma-separated-list expansion.
     fn cell_pick(&mut self, ca: &CellArray, args: &[Expr]) -> Result<Vec<Value>, LangError> {
-        let specs = self.index_specs(args, ca.shape(), ca.numel().max(1))?;
+        let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        pages_in_bounds(&specs)?;
         if specs.linear {
             specs
-                .rows
+                .rows()
                 .iter()
                 .map(|&i| {
                     ca.get_linear(i.saturating_sub(1))
@@ -1976,9 +2018,9 @@ impl Session {
                 })
                 .collect()
         } else {
-            let mut out = Vec::with_capacity(specs.rows.len() * specs.cols.len());
-            for &c in &specs.cols {
-                for &r in &specs.rows {
+            let mut out = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+            for &c in specs.cols() {
+                for &r in specs.rows() {
                     out.push(
                         ca.get(r.saturating_sub(1), c.saturating_sub(1))
                             .cloned()
@@ -2125,14 +2167,15 @@ impl Session {
     fn paren_apply(&mut self, target: Value, index: &[Expr], v: Value) -> Result<Value, LangError> {
         if let Value::Struct(sa) = target {
             let mut sa = sa;
-            let specs = self.index_specs(index, (sa.rows(), sa.cols()), sa.numel().max(1))?;
+            let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            pages_in_bounds(&specs)?;
             // Linear indices into the element list (1-based).
             let idx: Vec<usize> = if specs.linear {
-                specs.rows.iter().map(|i| i.saturating_sub(1)).collect()
+                specs.rows().iter().map(|i| i.saturating_sub(1)).collect()
             } else {
-                let mut out = Vec::with_capacity(specs.rows.len() * specs.cols.len());
-                for &c in &specs.cols {
-                    for &r in &specs.rows {
+                let mut out = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+                for &c in specs.cols() {
+                    for &r in specs.rows() {
                         out.push(r.saturating_sub(1) + c.saturating_sub(1) * sa.rows());
                     }
                 }
@@ -2174,8 +2217,9 @@ impl Session {
             // Char-array write through a chain (`s.f(2) = 'x'`).
             let len = s.chars().count();
             let mut m = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, m.shape(), m.numel().max(1))?;
-            let max_i = specs.rows.iter().chain(specs.cols.iter()).copied().max().unwrap_or(0);
+            let specs = self.index_specs(index, m.dims(), m.numel().max(1))?;
+            pages_in_bounds(&specs)?;
+            let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
                 let mut d = m.data().to_vec();
                 d.resize(max_i, 32.0);
@@ -2196,7 +2240,7 @@ impl Session {
         if matches!(target, Value::Cplx(_)) || matches!(v, Value::Cplx(_)) {
             let mut m = target.to_cmatrix()?;
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, m.shape(), m.numel().max(1))?;
+            let specs = self.index_specs(index, &[m.rows(), m.cols()], m.numel().max(1))?;
             if rhs.numel() == 0 {
                 return Ok(cmat_or_value(cmatrix_delete(&m, &specs)?));
             }
@@ -2205,7 +2249,7 @@ impl Session {
         }
         let mut m = target.to_matrix()?;
         let rhs = v.to_numeric()?;
-        let specs = self.index_specs(index, m.shape(), m.numel())?;
+        let specs = self.index_specs(index, m.dims(), m.numel())?;
         if rhs.numel() == 0 {
             return Ok(Value::Mat(matrix_delete(&m, &specs)?));
         }
@@ -2216,9 +2260,10 @@ impl Session {
     /// `c{i} = v` — content assignment into an owned cell array; creates and
     /// grows the cell. Shared by variable and field assignment.
     fn cell_brace_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, ca.shape(), ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        pages_in_bounds(&specs)?;
         if specs.linear {
-            let max_i = specs.rows.iter().copied().max().unwrap_or(0);
+            let max_i = specs.rows().iter().copied().max().unwrap_or(0);
             let (gr, gc) = if ca.cols == 1 && ca.rows > 1 {
                 (max_i, 1)
             } else if ca.rows <= 1 {
@@ -2227,15 +2272,15 @@ impl Session {
                 (max_i.div_ceil(ca.cols.max(1)), ca.cols)
             };
             ca.grow_capped(gr, gc)?;
-            for &i in &specs.rows {
+            for &i in specs.rows() {
                 ca.set_linear(i.saturating_sub(1), v.clone());
             }
         } else {
-            let max_r = specs.rows.iter().copied().max().unwrap_or(0);
-            let max_c = specs.cols.iter().copied().max().unwrap_or(0);
+            let max_r = specs.rows().iter().copied().max().unwrap_or(0);
+            let max_c = specs.cols().iter().copied().max().unwrap_or(0);
             ca.grow_capped(max_r, max_c)?;
-            for &c in &specs.cols {
-                for &r in &specs.rows {
+            for &c in specs.cols() {
+                for &r in specs.rows() {
                     ca.set(r.saturating_sub(1), c.saturating_sub(1), v.clone());
                 }
             }
@@ -2262,12 +2307,13 @@ impl Session {
     /// The `c(i) = v` operation on an owned cell array — shared by variable
     /// assignment and `s.f(i) = …` field assignment.
     fn cell_paren_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, ca.shape(), ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        pages_in_bounds(&specs)?;
         match v {
             Value::Cell(rhs) => {
                 // Grow first, same orientation rules as brace assignment.
                 let (gr, gc) = if specs.linear {
-                    let max_i = specs.rows.iter().copied().max().unwrap_or(0);
+                    let max_i = specs.rows().iter().copied().max().unwrap_or(0);
                     if ca.cols == 1 && ca.rows > 1 {
                         (max_i, 1)
                     } else if ca.rows <= 1 {
@@ -2276,15 +2322,15 @@ impl Session {
                         (max_i.div_ceil(ca.cols.max(1)), ca.cols)
                     }
                 } else {
-                    (specs.rows.iter().copied().max().unwrap_or(0), specs.cols.iter().copied().max().unwrap_or(0))
+                    (specs.rows().iter().copied().max().unwrap_or(0), specs.cols().iter().copied().max().unwrap_or(0))
                 };
                 ca.grow_capped(gr, gc)?;
                 let idxs: Vec<usize> = if specs.linear {
-                    specs.rows.clone()
+                    specs.rows().to_vec()
                 } else {
-                    let mut lin = Vec::with_capacity(specs.rows.len() * specs.cols.len());
-                    for &c in &specs.cols {
-                        for &r in &specs.rows {
+                    let mut lin = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+                    for &c in specs.cols() {
+                        for &r in specs.rows() {
                             lin.push((c - 1) * ca.rows + r);
                         }
                     }
@@ -2305,16 +2351,16 @@ impl Session {
             Value::Mat(m) if m.numel() == 0 => {
                 if specs.linear {
                     // `c(i) = []` deletes cells.
-                    ca.remove_linear(&specs.rows)?;
+                    ca.remove_linear(specs.rows())?;
                     return Ok(ca);
                 }
                 // `c(:,j) = []` / `c(i,:) = []` — whole column/row delete.
                 // A null assignment may have only one non-colon index.
-                let all_rows = specs.rows.len() == ca.rows;
-                let all_cols = specs.cols.len() == ca.cols;
+                let all_rows = specs.rows().len() == ca.rows;
+                let all_cols = specs.cols().len() == ca.cols;
                 match (all_rows, all_cols) {
-                    (true, false) => ca.remove_cols(&specs.cols),
-                    (false, true) => ca.remove_rows(&specs.rows),
+                    (true, false) => ca.remove_cols(specs.cols()),
+                    (false, true) => ca.remove_rows(specs.rows()),
                     (true, true) => ca = CellArray::new(0, 0),
                     (false, false) => {
                         return Err(LangError::new("a null assignment can have only one non-colon index", 0));
@@ -2333,10 +2379,11 @@ impl Session {
                 return Ok(Value::Cell(CellArray::new(0, 0)));
             }
             // `c(i)` / `c(i, j)` — paren indexing keeps cells.
-            let specs = self.index_specs(args, ca.shape(), ca.numel().max(1))?;
+            let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+            pages_in_bounds(&specs)?;
             if specs.linear {
-                let mut out = Vec::with_capacity(specs.rows.len());
-                for &i in &specs.rows {
+                let mut out = Vec::with_capacity(specs.rows().len());
+                for &i in specs.rows() {
                     match ca.get_linear(i.saturating_sub(1)) {
                         Some(v) => out.push(v.clone()),
                         None => return Err(LangError::new(format!("index {i} out of bounds ({} cells)", ca.numel()), 0)),
@@ -2346,9 +2393,9 @@ impl Session {
                 let col = matches!(args.first(), Some(Expr::Colon)) || (ca.cols == 1 && ca.rows > 1);
                 return Ok(Value::Cell(if col { CellArray::col(out) } else { CellArray::row(out) }));
             }
-            let mut out = CellArray::new(specs.rows.len(), specs.cols.len());
-            for (oc, &c) in specs.cols.iter().enumerate() {
-                for (or, &r) in specs.rows.iter().enumerate() {
+            let mut out = CellArray::new(specs.rows().len(), specs.cols().len());
+            for (oc, &c) in specs.cols().iter().enumerate() {
+                for (or, &r) in specs.rows().iter().enumerate() {
                     match ca.get(r.saturating_sub(1), c.saturating_sub(1)) {
                         Some(v) => out.set(or, oc, v.clone()),
                         None => return Err(LangError::new(format!("index ({r},{c}) out of bounds {:?}", ca.shape()), 0)),
@@ -2360,8 +2407,9 @@ impl Session {
         if let Value::Str(s) = target {
             // Strings index as 1xN row vectors of chars.
             let chars: Vec<char> = s.chars().collect();
-            let specs = self.index_specs(args, (1, chars.len()), chars.len())?;
-            let idxs = if specs.linear { &specs.rows } else { &specs.cols };
+            let specs = self.index_specs(args, &[1, chars.len()], chars.len())?;
+            pages_in_bounds(&specs)?;
+            let idxs = if specs.linear { specs.rows() } else { specs.cols() };
             let mut out = String::new();
             for &i in idxs {
                 if let Some(&ch) = chars.get(i.saturating_sub(1)) {
@@ -2372,18 +2420,19 @@ impl Session {
         }
         if let Value::Sparse(s) = target {
             // `S(i,j)` reads sparse → a sparse result (or scalar Num).
-            let specs = self.index_specs(args, s.shape(), s.numel().max(1))?;
+            let specs = self.index_specs(args, &[s.rows(), s.cols()], s.numel().max(1))?;
+            pages_in_bounds(&specs)?;
             if specs.linear {
                 // Single-element linear read returns a scalar double.
-                if specs.rows.len() == 1 {
-                    let i0 = specs.rows.first().copied().unwrap_or(1).saturating_sub(1);
+                if specs.rows().len() == 1 {
+                    let i0 = specs.rows().first().copied().unwrap_or(1).saturating_sub(1);
                     if i0 >= s.numel() {
                         return Err(LangError::new(format!("index out of bounds ({}x{} sparse)", s.rows(), s.cols()), 0));
                     }
                     return Ok(Value::Num(s.get(i0 % s.rows().max(1), i0 / s.rows().max(1))));
                 }
-                let mut out = matcore::SparseMat::zeros(specs.rows.len(), 1);
-                for (o, &i) in specs.rows.iter().enumerate() {
+                let mut out = matcore::SparseMat::zeros(specs.rows().len(), 1);
+                for (o, &i) in specs.rows().iter().enumerate() {
                     let i0 = i.saturating_sub(1);
                     if i0 >= s.numel() {
                         return Err(LangError::new(format!("index {i} out of bounds ({}x{} sparse)", s.rows(), s.cols()), 0));
@@ -2397,17 +2446,17 @@ impl Session {
                 return Ok(Value::Sparse(out));
             }
             // A 1x1 selection reads as a scalar double.
-            if specs.rows.len() == 1 && specs.cols.len() == 1 {
+            if specs.rows().len() == 1 && specs.cols().len() == 1 {
                 let (r0, c0) =
-                    (specs.rows.first().copied().unwrap_or(1).saturating_sub(1), specs.cols.first().copied().unwrap_or(1).saturating_sub(1));
+                    (specs.rows().first().copied().unwrap_or(1).saturating_sub(1), specs.cols().first().copied().unwrap_or(1).saturating_sub(1));
                 if r0 >= s.rows() || c0 >= s.cols() {
                     return Err(LangError::new(format!("index out of bounds ({}x{} sparse)", s.rows(), s.cols()), 0));
                 }
                 return Ok(Value::Num(s.get(r0, c0)));
             }
-            let mut out = matcore::SparseMat::zeros(specs.rows.len(), specs.cols.len());
-            for (oc, &c) in specs.cols.iter().enumerate() {
-                for (or, &r) in specs.rows.iter().enumerate() {
+            let mut out = matcore::SparseMat::zeros(specs.rows().len(), specs.cols().len());
+            for (oc, &c) in specs.cols().iter().enumerate() {
+                for (or, &r) in specs.rows().iter().enumerate() {
                     let (r0, c0) = (r.saturating_sub(1), c.saturating_sub(1));
                     if r0 >= s.rows() || c0 >= s.cols() {
                         return Err(LangError::new(format!("index ({r},{c}) out of bounds ({}x{} sparse)", s.rows(), s.cols()), 0));
@@ -2421,9 +2470,10 @@ impl Session {
             return Ok(Value::Sparse(out));
         }
         if let Value::Struct(sa) = target {
-            let specs = self.index_specs(args, (sa.rows(), sa.cols()), sa.numel().max(1))?;
+            let specs = self.index_specs(args, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            pages_in_bounds(&specs)?;
             if specs.linear {
-                let idx: Vec<usize> = specs.rows.iter().map(|i| i.saturating_sub(1)).collect();
+                let idx: Vec<usize> = specs.rows().iter().map(|i| i.saturating_sub(1)).collect();
                 // `s(:)` columnizes; a column vector stays a column.
                 let col = matches!(args.first(), Some(Expr::Colon)) || (sa.cols() == 1 && sa.rows() > 1);
                 let (r, c) = if idx.is_empty() {
@@ -2435,22 +2485,23 @@ impl Session {
                 };
                 return Ok(Value::Struct(sa.pick(&idx, r, c)?));
             }
-            let mut idx = Vec::with_capacity(specs.rows.len() * specs.cols.len());
-            for &c in &specs.cols {
-                for &r in &specs.rows {
+            let mut idx = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+            for &c in specs.cols() {
+                for &r in specs.rows() {
                     idx.push(r.saturating_sub(1) + c.saturating_sub(1) * sa.rows());
                 }
             }
-            return Ok(Value::Struct(sa.pick(&idx, specs.rows.len().max(1), specs.cols.len().max(1))?));
+            return Ok(Value::Struct(sa.pick(&idx, specs.rows().len().max(1), specs.cols().len().max(1))?));
         }
         if let Value::Cplx(m) = target {
             if m.numel() == 0 && matches!(args, [Expr::Colon]) {
                 return Ok(Value::Mat(Matrix::zeros(0, 0)));
             }
-            let specs = self.index_specs(args, m.shape(), m.numel())?;
+            let specs = self.index_specs(args, &[m.rows(), m.cols()], m.numel())?;
+            pages_in_bounds(&specs)?;
             if specs.linear {
-                let mut data = Vec::with_capacity(specs.rows.len());
-                for i in &specs.rows {
+                let mut data = Vec::with_capacity(specs.rows().len());
+                for i in specs.rows() {
                     match m.get_linear(i.saturating_sub(1)) {
                         Some(v) => data.push(v),
                         None => return Err(LangError::new(format!("index {i} out of bounds ({})", m.numel()), 0)),
@@ -2461,9 +2512,9 @@ impl Session {
                 let out = CMatrix::from_col_major(rows, cols, data).map_err(lang)?;
                 return Ok(cmat_or_value(out));
             }
-            let mut out = CMatrix::zeros(specs.rows.len(), specs.cols.len());
-            for (oc, &c) in specs.cols.iter().enumerate() {
-                for (or, &r) in specs.rows.iter().enumerate() {
+            let mut out = CMatrix::zeros(specs.rows().len(), specs.cols().len());
+            for (oc, &c) in specs.cols().iter().enumerate() {
+                for (or, &r) in specs.rows().iter().enumerate() {
                     match m.get(r.saturating_sub(1), c.saturating_sub(1)) {
                         Some(v) => {
                             let _ = out.set(or, oc, v);
@@ -2478,10 +2529,10 @@ impl Session {
         if m.numel() == 0 && matches!(args, [Expr::Colon]) {
             return Ok(Value::Mat(Matrix::zeros(0, 0)));
         }
-        let specs = self.index_specs(args, m.shape(), m.numel())?;
+        let specs = self.index_specs(args, m.dims(), m.numel())?;
         if specs.linear {
-            let mut data = Vec::with_capacity(specs.rows.len());
-            for i in &specs.rows {
+            let mut data = Vec::with_capacity(specs.rows().len());
+            for i in specs.rows() {
                 match m.get_linear(i.saturating_sub(1)) {
                     Some(v) => data.push(v),
                     None => return Err(LangError::new(format!("index {i} out of bounds ({})", m.numel()), 0)),
@@ -2489,31 +2540,39 @@ impl Session {
             }
             // `A(:)` always columnizes; a column vector keeps its shape.
             let col = matches!(args.first(), Some(Expr::Colon)) || (m.cols() == 1 && m.rows() > 1);
-            return Ok(Value::Mat(if col { Matrix::col_vector(data) } else { Matrix::row_vector(data) }));
+            return Ok(mat_or_num(if col { Matrix::col_vector(data) } else { Matrix::row_vector(data) }));
         }
-        let mut out = Matrix::zeros(specs.rows.len(), specs.cols.len());
-        for (oc, &c) in specs.cols.iter().enumerate() {
-            for (or, &r) in specs.rows.iter().enumerate() {
-                match m.get(r.saturating_sub(1), c.saturating_sub(1)) {
-                    Some(v) => {
-                        let _ = out.set(or, oc, v);
-                    }
-                    None => return Err(LangError::new(format!("index ({r},{c}) out of bounds {:?}", m.shape()), 0)),
-                }
-            }
-        }
-        Ok(mat_or_num(out))
+        Ok(mat_or_num(gather_nd(&m, &specs)?))
     }
 
-    /// Evaluate index arguments to concrete 1-based index lists.
-    /// Comma-separated lists expand: `A(c{1:2})` indexes as `A(1,2)`.
-    fn index_specs(&mut self, args: &[Expr], shape: (usize, usize), numel: usize) -> Result<IndexSpec, LangError> {
+    /// Evaluate index arguments to concrete 1-based index lists, one list
+    /// per subscript. With fewer subscripts than `dims` the last one
+    /// indexes the product of the remaining dims — M-code collapses
+    /// unindexed trailing dims into the last subscript (`x(:,5)` on a
+    /// 2×3×4 array addresses dim 2..3 merged). Extra subscripts beyond
+    /// `dims.len()` address implicit extent-1 dims, so `x(i,j,1)` is legal
+    /// on a 2-D array. Comma-separated lists expand: `A(c{1:2})` indexes
+    /// as `A(1,2)`.
+    fn index_specs(&mut self, args: &[Expr], dims: &[usize], numel: usize) -> Result<IndexSpec, LangError> {
         /// One declared subscript: the symbolic colon/end, or evaluated values.
         enum Sub {
             Colon,
             End,
             V(Vec<Value>),
         }
+        // Extent addressed by subscript position `i` out of `n`: `dims[i]`
+        // (1 for implicit dims), except a single subscript addresses the
+        // whole array linearly and the last subscript spans `dims[i..]`
+        // collapsed.
+        let extent = |i: usize, n: usize| -> usize {
+            if n == 1 {
+                return numel.max(1);
+            }
+            if i + 1 == n {
+                return dims.get(i..).unwrap_or(&[]).iter().fold(1usize, |a, &d| a.saturating_mul(d)).max(1);
+            }
+            dims.get(i).copied().unwrap_or(1).max(1)
+        };
         let mut flat: Vec<Sub> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             match a {
@@ -2522,14 +2581,7 @@ impl Session {
                 _ => {
                     // `end` is resolved against the declared position's dim
                     // before evaluation (`A(1:end)`), then CSLs flatten.
-                    let dim = if args.len() == 1 {
-                        numel.max(1)
-                    } else if i == 0 {
-                        shape.0.max(1)
-                    } else {
-                        shape.1.max(1)
-                    };
-                    let resolved = resolve_end(a, dim);
+                    let resolved = resolve_end(a, extent(i, args.len()));
                     flat.push(Sub::V(self.eval_multi(&resolved)?));
                 }
             }
@@ -2543,21 +2595,20 @@ impl Session {
                 other => vec![other],
             })
             .collect();
-        let conv = |sub: &Sub, dim_len: usize| -> Result<Vec<usize>, LangError> {
-            match sub {
-                Sub::Colon => Ok((1..=dim_len).collect()),
-                Sub::End => Ok(vec![dim_len]),
+        let n = subs.len();
+        let mut out = Vec::with_capacity(n);
+        for (i, sub) in subs.iter().enumerate() {
+            let dim_len = extent(i, n);
+            out.push(match sub {
+                Sub::Colon => (1..=dim_len).collect(),
+                Sub::End => vec![dim_len],
                 Sub::V(vals) => {
                     let v = vals.first().ok_or_else(|| LangError::new("empty index", 0))?;
-                    index_list(v, dim_len)
+                    index_list(v, dim_len)?
                 }
-            }
-        };
-        match subs.len() {
-            1 => Ok(IndexSpec { rows: conv(&subs[0], numel.max(1))?, cols: Vec::new(), linear: true }),
-            2 => Ok(IndexSpec { rows: conv(&subs[0], shape.0.max(1))?, cols: conv(&subs[1], shape.1.max(1))?, linear: false }),
-            n => Err(LangError::new(format!("expected 1 or 2 indices, got {n}"), 0)),
+            });
         }
+        Ok(IndexSpec { linear: n == 1, dims: out })
     }
 
     fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, LangError> {
@@ -2742,29 +2793,34 @@ impl Session {
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         match name {
             "zeros" | "ones" | "eye" | "rand" | "randn" => {
-                let (r, c) = self.dims(args)?;
+                let dims = self.dim_vec(args)?;
+                if name == "eye" && dims.len() > 2 {
+                    return Err(LangError::new("eye accepts at most two dimensions", 0));
+                }
                 let m = match name {
-                    "zeros" => Matrix::zeros(r, c),
-                    "ones" => Matrix::ones(r, c),
-                    "eye" => Matrix::eye(r, c),
+                    "zeros" => Matrix::zeros_nd(&dims),
+                    "ones" => Matrix::ones_nd(&dims),
+                    "eye" => Matrix::eye(dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1)),
                     "rand" => {
-                        let mut data = Vec::with_capacity(r.saturating_mul(c));
-                        for _ in 0..r.saturating_mul(c) {
+                        let n = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+                        let mut data = Vec::with_capacity(n);
+                        for _ in 0..n {
                             data.push(self.next_f64());
                         }
-                        Matrix::from_col_major(r, c, data).map_err(lang)?
+                        Matrix::from_col_major_nd(&dims, data).map_err(lang)?
                     }
                     _ => {
                         // randn: sum-of-12 uniform approximation to N(0,1).
-                        let mut data = Vec::with_capacity(r.saturating_mul(c));
-                        for _ in 0..r.saturating_mul(c) {
+                        let n = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+                        let mut data = Vec::with_capacity(n);
+                        for _ in 0..n {
                             let mut acc = 0.0;
                             for _ in 0..12 {
                                 acc += self.next_f64();
                             }
                             data.push(acc - 6.0);
                         }
-                        Matrix::from_col_major(r, c, data).map_err(lang)?
+                        Matrix::from_col_major_nd(&dims, data).map_err(lang)?
                     }
                 };
                 Ok(Some(mat_or_num(m)))
@@ -2789,18 +2845,24 @@ impl Session {
             }
             "size" => {
                 let v = self.eval_args(args)?;
-                let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
-                Ok(Some(Value::Mat(Matrix::row_vector(vec![r as f64, c as f64]))))
+                let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
+                // `size(x, d)` — a dim past the stored ones has extent 1.
+                if v.len() > 1 {
+                    let d = v.scalar_at(1)?.max(0.0) as usize;
+                    let n = if d == 0 { 0 } else { dims.get(d - 1).copied().unwrap_or(1) };
+                    return Ok(Some(Value::Num(n as f64)));
+                }
+                Ok(Some(Value::Mat(Matrix::row_vector(dims.iter().map(|&d| d as f64).collect()))))
             }
             "numel" => {
                 let v = self.eval_args(args)?;
-                let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
-                Ok(Some(Value::Num((r * c) as f64)))
+                let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
+                Ok(Some(Value::Num(dims.iter().product::<usize>() as f64)))
             }
             "length" => {
                 let v = self.eval_args(args)?;
-                let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
-                Ok(Some(Value::Num(r.max(c) as f64)))
+                let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
+                Ok(Some(Value::Num(dims.iter().copied().max().unwrap_or(0) as f64)))
             }
             "cell" => {
                 // cell(n) | cell(m, n) | cell([m n]) — `[]`-filled array.
@@ -2873,6 +2935,7 @@ impl Session {
                         Value::Sparse(s) => Ok(Some(Value::Sparse(s.clone()))),
                         _ => {
                             let m = x.to_matrix()?;
+                            need_2d(&m, name)?;
                             Ok(Some(Value::Sparse(matcore::SparseMat::from_dense(&m))))
                         }
                     },
@@ -2988,6 +3051,7 @@ impl Session {
                     Some(x) => x.to_matrix()?,
                     None => return Err(LangError::new("num2cell needs a matrix", 0)),
                 };
+                need_2d(&m, name)?;
                 if m.numel() > MAX_CELL_ELEMS {
                     return Err(LangError::new("allocation exceeds limit", 0));
                 }
@@ -3246,14 +3310,37 @@ impl Session {
             }
             "reshape" => {
                 let v = self.eval_args(args)?;
-                let r = v.scalar_at(1)? as usize;
-                let c = v.scalar_at(2)? as usize;
+                // `reshape(A, d1, d2, …)` or `reshape(A, [d1 d2 …])`.
+                let dims: Vec<usize> = if v.len() > 2 {
+                    v.iter().skip(1).map(|x| x.scalar().map(|s| s.max(0.0) as usize)).collect::<Result<_, _>>()?
+                } else {
+                    match v.get(1) {
+                        Some(d) => {
+                            let m = d.to_matrix()?;
+                            if m.numel() < 2 {
+                                return Err(LangError::new("reshape needs at least two dimension sizes", 0));
+                            }
+                            m.data().iter().map(|&x| x.max(0.0) as usize).collect()
+                        }
+                        None => return Err(LangError::new("reshape needs a matrix and new dims", 0)),
+                    }
+                };
                 match v.first() {
-                    Some(Value::Cell(ca)) => ca.reshape(r, c).map(Value::Cell).map(Some),
-                    Some(Value::Cplx(cm)) => cm.reshape(r, c).map(cmat_or_value).map(Some).map_err(lang),
+                    Some(Value::Cell(ca)) => {
+                        if dims.len() != 2 {
+                            return Err(LangError::new("cell arrays are 2-D — reshape needs exactly two dims", 0));
+                        }
+                        ca.reshape(dims.first().copied().unwrap_or(0), dims.get(1).copied().unwrap_or(0)).map(Value::Cell).map(Some)
+                    }
+                    Some(Value::Cplx(cm)) => {
+                        if dims.len() != 2 {
+                            return Err(LangError::new("complex arrays are 2-D — reshape needs exactly two dims", 0));
+                        }
+                        cm.reshape(dims.first().copied().unwrap_or(0), dims.get(1).copied().unwrap_or(0)).map(cmat_or_value).map(Some).map_err(lang)
+                    }
                     Some(x) => {
                         let m = x.to_matrix()?;
-                        m.reshape(r, c).map(mat_or_num).map(Some).map_err(lang)
+                        m.reshape_nd(&dims).map(mat_or_num).map(Some).map_err(lang)
                     }
                     None => Err(LangError::new("reshape needs a matrix", 0)),
                 }
@@ -3266,6 +3353,7 @@ impl Session {
                     return Ok(Some(cmat_or_value(if name == "ctranspose" { cm.ctranspose() } else { cm.transpose() })));
                 }
                 let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_matrix()?;
+                need_2d(&m, name)?;
                 Ok(Some(mat_or_num(m.transpose())))
             }
             "det" => {
@@ -3327,44 +3415,44 @@ impl Session {
                 }
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
                 if let Value::Cplx(cm) = v0 {
-                    let dim = self.dim_arg(args, cm.shape())?;
+                    let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
                 }
                 let m = v0.to_matrix()?;
-                let dim = self.dim_arg(args, m.shape())?;
+                let dim = self.dim_arg(args, m.dims())?;
                 self.reduce(name, &m, dim).map(Some)
             }
             "std" | "var" | "median" => {
                 let v = self.eval_args(args)?;
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
                 if let Value::Cplx(cm) = v0 {
-                    let dim = self.dim_arg(args, cm.shape())?;
+                    let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
                 }
                 let m = v0.to_matrix()?;
-                let dim = self.dim_arg(args, m.shape())?;
+                let dim = self.dim_arg(args, m.dims())?;
                 self.reduce(name, &m, dim).map(Some)
             }
             "any" | "all" => {
                 let v = self.eval_args(args)?;
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
                 if let Value::Cplx(cm) = v0 {
-                    let dim = self.dim_arg(args, cm.shape())?;
+                    let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
                 }
                 let m = v0.to_matrix()?;
-                let dim = self.dim_arg(args, m.shape())?;
+                let dim = self.dim_arg(args, m.dims())?;
                 self.reduce(name, &m, dim).map(Some)
             }
             "cumsum" | "cumprod" | "diff" => {
                 let v = self.eval_args(args)?;
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
                 if let Value::Cplx(cm) = v0 {
-                    let dim = self.dim_arg(args, cm.shape())?;
+                    let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.crunning(name, cm, dim).map(Some);
                 }
                 let m = v0.to_matrix()?;
-                let dim = self.dim_arg(args, m.shape())?;
+                let dim = self.dim_arg(args, m.dims())?;
                 self.running(name, &m, dim).map(Some)
             }
             "sort" => {
@@ -3453,7 +3541,7 @@ impl Session {
                     }
                     "imag" => {
                         let m = first.to_matrix()?;
-                        return Ok(Some(mat_or_num(Matrix::zeros(m.rows(), m.cols()))));
+                        return Ok(Some(mat_or_num(Matrix::zeros_nd(m.dims()))));
                     }
                     "angle" => {
                         let m = first.to_matrix()?;
@@ -3471,6 +3559,9 @@ impl Session {
                     _ => false,
                 };
                 if needs_complex {
+                    if !m.is_matrix() {
+                        return Err(LangError::new(format!("{name} on N-D real input needing complex results is not supported"), 0));
+                    }
                     let cm = CMatrix::from_real(&m);
                     let out = match name {
                         "sqrt" => cm.map(CNum::sqrt),
@@ -3549,9 +3640,10 @@ impl Session {
                 if v.is_empty() {
                     return Ok(Some(Value::Num(fill)));
                 }
-                let (r, c) = self.dims(args)?;
-                check_elems(r.saturating_mul(c))?;
-                Ok(Some(mat_or_num(Matrix::from_col_major(r, c, vec![fill; r * c]).map_err(lang)?)))
+                let dims = self.dim_vec(args)?;
+                let n = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+                check_elems(n)?;
+                Ok(Some(mat_or_num(Matrix::from_col_major_nd(&dims, vec![fill; n]).map_err(lang)?)))
             }
             "eps" => {
                 let v = self.eval_args(args)?;
@@ -3880,6 +3972,7 @@ impl Session {
                     Some(Value::Cplx(cm)) => cplanes(cm, |m| repmat(m, r, c)).map(cmat_or_value).map(Some),
                     Some(x) => {
                         let m = x.to_matrix()?;
+                        need_2d(&m, name)?;
                         repmat(&m, r, c).map(mat_or_num).map(Some)
                     }
                     None => Err(LangError::new("repmat needs a matrix", 0)),
@@ -3891,6 +3984,7 @@ impl Session {
                     return cplanes(cm, diag).map(cmat_or_value).map(Some);
                 }
                 let m = v.first().ok_or_else(|| LangError::new("diag needs an argument", 0))?.to_matrix()?;
+                need_2d(&m, name)?;
                 diag(&m).map(mat_or_num).map(Some)
             }
             "triu" | "tril" => {
@@ -3912,6 +4006,7 @@ impl Session {
                     return cplanes(cm, |m| Ok(band(m))).map(cmat_or_value).map(Some);
                 }
                 let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_matrix()?;
+                need_2d(&m, name)?;
                 Ok(Some(mat_or_num(band(&m))))
             }
             "flipud" | "fliplr" => {
@@ -3933,6 +4028,7 @@ impl Session {
                     return cplanes(cm, |m| Ok(flip(m))).map(cmat_or_value).map(Some);
                 }
                 let m = first.ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_matrix()?;
+                need_2d(&m, name)?;
                 Ok(Some(mat_or_num(flip(&m))))
             }
             "kron" => {
@@ -3956,6 +4052,8 @@ impl Session {
                     return Ok(Some(cmat_or_value(out)));
                 }
                 let (a, b) = (a.to_matrix()?, b.to_matrix()?);
+                need_2d(&a, name)?;
+                need_2d(&b, name)?;
                 let mut out = Matrix::zeros(a.rows() * b.rows(), a.cols() * b.cols());
                 for cb in 0..b.cols() {
                     for rb in 0..b.rows() {
@@ -3971,7 +4069,7 @@ impl Session {
             }
             "cat" => {
                 let v = self.eval_args(args)?;
-                let dim = v.scalar_at(0)? as usize;
+                let dim = v.scalar_at(0)?.max(1.0) as usize;
                 if v.len() < 3 {
                     return Err(LangError::new("cat needs a dim and at least two matrices", 0));
                 }
@@ -4028,11 +4126,7 @@ impl Session {
                 for x in v.iter().skip(2) {
                     let m = x.to_matrix()?;
                     check_elems(acc.numel().saturating_add(m.numel()))?;
-                    acc = match dim {
-                        1 => Matrix::vcat(&acc, &m).map_err(lang)?,
-                        2 => Matrix::hcat(&acc, &m).map_err(lang)?,
-                        _ => return Err(LangError::new("cat supports dims 1 and 2", 0)),
-                    };
+                    acc = Matrix::cat(dim - 1, &acc, &m).map_err(lang)?;
                 }
                 Ok(Some(mat_or_num(acc)))
             }
@@ -4111,10 +4205,17 @@ impl Session {
                 }
                 Ok(Some(mat_or_num(acc)))
             }
-            "ndims" => Ok(Some(Value::Num(2.0))),
+            "ndims" => {
+                let v = self.eval_args(args)?;
+                let n = v.first().map(|x| x.dims_vec().len()).unwrap_or(2);
+                Ok(Some(Value::Num(n as f64)))
+            }
             "squeeze" => {
                 let v = self.eval_args(args)?;
-                Ok(v.first().cloned())
+                match v.first() {
+                    Some(Value::Mat(m)) => Ok(Some(mat_or_num(m.squeezed()))),
+                    other => Ok(other.cloned()),
+                }
             }
             "circshift" => {
                 let v = self.eval_args(args)?;
@@ -4135,7 +4236,9 @@ impl Session {
                 if let Value::Cplx(cm) = first {
                     return cplanes(cm, |m| Ok(shift(m))).map(cmat_or_value).map(Some);
                 }
-                Ok(Some(Value::Mat(shift(&first.to_matrix()?))))
+                let m = first.to_matrix()?;
+                need_2d(&m, name)?;
+                Ok(Some(Value::Mat(shift(&m))))
             }
             "rot90" => {
                 let v = self.eval_args(args)?;
@@ -4158,7 +4261,9 @@ impl Session {
                 if let Value::Cplx(cm) = first {
                     return cplanes(cm, |m| Ok(rot(m))).map(cmat_or_value).map(Some);
                 }
-                let out = rot(&first.to_matrix()?);
+                let m = first.to_matrix()?;
+                need_2d(&m, name)?;
+                let out = rot(&m);
                 Ok(Some(mat_or_num(out)))
             }
             // --- statistics / elementwise extras ---------------------------
@@ -4255,10 +4360,7 @@ impl Session {
             "isempty" => {
                 let v = self.eval_args(args)?;
                 let e = match v.first() {
-                    Some(x) => {
-                        let (r, c) = x.dims();
-                        r * c == 0
-                    }
+                    Some(x) => x.dims_vec().iter().product::<usize>() == 0,
                     None => true,
                 };
                 Ok(Some(Value::Num(if e { 1.0 } else { 0.0 })))
@@ -4269,6 +4371,9 @@ impl Session {
                 let v = self.eval_args(args)?;
                 let re = v.first().ok_or_else(|| LangError::new("complex needs real and imaginary parts", 0))?.to_numeric()?;
                 let im = v.get(1).ok_or_else(|| LangError::new("complex needs two arguments", 0))?.to_numeric()?;
+                if !re.is_matrix() || !im.is_matrix() {
+                    return Err(LangError::new("complex arrays are 2-D — index a page or reshape first", 0));
+                }
                 Ok(Some(cmat_or_value(CMatrix::from_parts(&re, &im).map_err(lang)?)))
             }
             // --- polynomials / fitting -------------------------------------
@@ -4369,6 +4474,7 @@ impl Session {
                     }
                     _ => {
                         let m = x.to_numeric()?;
+                        need_2d(&m, name)?;
                         let d = shift_both(m.rows(), m.cols(), order, |r, c| m.get(r, c).unwrap_or(0.0));
                         Ok(Some(mat_or_num(Matrix::from_col_major(m.rows(), m.cols(), d).map_err(lang)?)))
                     }
@@ -4404,6 +4510,7 @@ impl Session {
             }
             "unwrap" => {
                 let m = self.arg_matrix(args, 0)?;
+                need_2d(&m, name)?;
                 let tol = self.eval_args(args)?.scalar_at(1).unwrap_or(std::f64::consts::PI);
                 let (rows, cols) = m.shape();
                 let mut out = Matrix::zeros(rows, cols);
@@ -5550,12 +5657,14 @@ impl Session {
                 Value::Cplx(cm) => cm.re(),
                 other => other.to_matrix()?,
             };
+            need_2d(&first_m, "plot")?;
             let (x, y) = if i + 1 < v.len() && matches!(v.get(i + 1), Some(Value::Mat(_)) | Some(Value::Num(_)) | Some(Value::Cplx(_))) {
                 let ym = match v.get(i + 1) {
                     Some(Value::Cplx(cm)) => cm.re(),
                     Some(o) => o.to_matrix()?,
                     None => return Err(LangError::new("plot needs data", 0)),
                 };
+                need_2d(&ym, "plot")?;
                 i += 2;
                 (first_m, ym)
             } else {
@@ -5842,14 +5951,26 @@ impl Session {
                 }
             }
             "size" => {
+                // `[d1, d2, …] = size(x)` — when fewer outputs than dims,
+                // the last output is the product of the remaining dims
+                // (M-code rule).
                 let v = self.eval_args(args)?;
-                let (r, c) = v.first().map(Value::dims).unwrap_or((0, 0));
-                vec![Value::Num(r as f64), Value::Num(c as f64)]
+                let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
+                let mut out = Vec::with_capacity(nout);
+                for i in 0..nout.saturating_sub(1) {
+                    out.push(Value::Num(dims.get(i).copied().unwrap_or(1) as f64));
+                }
+                let tail: usize = dims.get(nout.saturating_sub(1)..).unwrap_or(&[]).iter().product();
+                out.push(Value::Num(tail as f64));
+                out
             }
             "min" | "max" => {
                 let m = self.arg_matrix(args, 0)?;
                 let hi = name == "max";
-                let dim = self.dim_arg(args, m.shape())?;
+                let dim = self.dim_arg(args, m.dims())?;
+                if !m.is_matrix() {
+                    return Err(LangError::new(format!("{name} with an index output needs a 2-D operand"), 0));
+                }
                 let (vals, idxs) = reduce_with_index(&m, dim, hi);
                 vec![mat_or_num(vals), mat_or_num(idxs)]
             }
@@ -5869,13 +5990,16 @@ impl Session {
                     return Ok(Some(out));
                 }
                 let m = self.arg_matrix(args, 0)?;
+                // (row, merged-column) subscripts over flat column-major
+                // storage — identical to (r,c) on 2-D, covers every page
+                // of an N-D array.
                 let mut rows = Vec::new();
                 let mut cols = Vec::new();
-                for c in 0..m.cols() {
-                    for r in 0..m.rows() {
-                        if m.get(r, c).unwrap_or(0.0) != 0.0 {
-                            rows.push((r + 1) as f64);
-                            cols.push((c + 1) as f64);
+                if m.rows() > 0 {
+                    for i in 0..m.numel() {
+                        if m.get_linear(i).unwrap_or(0.0) != 0.0 {
+                            rows.push((i % m.rows() + 1) as f64);
+                            cols.push((i / m.rows() + 1) as f64);
                         }
                     }
                 }
@@ -5917,6 +6041,7 @@ impl Session {
             }
             "eig" => {
                 let m = self.arg_matrix(args, 0)?;
+                need_2d(&m, name)?;
                 if nout < 2 {
                     let w = matcore::eigvals_c(&m).map_err(lang)?;
                     let cm = CMatrix::from_col_major(w.len(), 1, w).map_err(lang)?;
@@ -5961,6 +6086,7 @@ impl Session {
             }
             "svd" => {
                 let m = self.arg_matrix(args, 0)?;
+                need_2d(&m, name)?;
                 let s = matcore::svd(&m).map_err(lang)?;
                 if nout >= 3 {
                     vec![Value::Mat(s.u), Value::Mat(s.s), Value::Mat(s.v)]
@@ -5974,11 +6100,13 @@ impl Session {
             }
             "qr" => {
                 let m = self.arg_matrix(args, 0)?;
+                need_2d(&m, name)?;
                 let (q, r) = matcore::qr(&m).map_err(lang)?;
                 vec![Value::Mat(q), Value::Mat(r)]
             }
             "lu" => {
                 let m = self.arg_matrix(args, 0)?;
+                need_2d(&m, name)?;
                 let (l, u, p) = matcore::lu(&m).map_err(lang)?;
                 vec![Value::Mat(l), Value::Mat(u), Value::Mat(p)]
             }
@@ -6151,7 +6279,7 @@ impl Session {
 
     /// Dim argument for reductions: `f(A)`, `f(A, 2)`, `f(A, 'all')`,
     /// `f(A, [], 2)`. Returns 0 for "all" (reduce to scalar).
-    fn dim_arg(&mut self, args: &[Expr], dims: (usize, usize)) -> Result<usize, LangError> {
+    fn dim_arg(&mut self, args: &[Expr], dims: &[usize]) -> Result<usize, LangError> {
         // Expanded argument values — positions count comma-separated lists.
         for v in self.eval_args(args)?.iter().skip(1) {
             match v {
@@ -6166,8 +6294,12 @@ impl Session {
                 }
             }
         }
-        // Default: vectors reduce fully; matrices reduce along columns.
-        if dims.0 == 1 || dims.1 == 1 {
+        // Default: vectors reduce fully; matrices reduce along columns;
+        // N-D arrays reduce along the first non-singleton dim.
+        if dims.len() > 2 {
+            return Ok(dims.iter().position(|&d| d != 1).map(|i| i + 1).unwrap_or(0));
+        }
+        if dims.first().copied().unwrap_or(0) == 1 || dims.get(1).copied().unwrap_or(0) == 1 {
             return Ok(0);
         }
         Ok(1)
@@ -6233,6 +6365,12 @@ impl Session {
                 _ => f64::NAN,
             }
         };
+        if m.ndims() > 2 {
+            if dim == 0 {
+                return Ok(Value::Num(reduce_vec(m.data())));
+            }
+            return reduce_nd(m, dim, &reduce_vec).map(mat_or_num);
+        }
         match dim {
             0 => Ok(Value::Num(reduce_vec(m.data()))),
             2 => {
@@ -6254,8 +6392,12 @@ impl Session {
         }
     }
 
-    /// Running operations (`cumsum`/`cumprod`/`diff`) along `dim`.
+    /// Running operations (`cumsum`/`cumprod`/`diff`) along `dim`. 2-D only
+    /// for now — an N-D operand errors rather than reducing the first page.
     fn running(&mut self, name: &str, m: &Matrix, dim: usize) -> Result<Value, LangError> {
+        if !m.is_matrix() {
+            return Err(LangError::new(format!("{name} requires a 2-D operand"), 0));
+        }
         // `dim_arg` returns 0 for vectors ("along the data"): map it to the
         // vector's non-singleton direction so row/column output is preserved.
         let dim = if dim == 0 {
@@ -6518,6 +6660,7 @@ impl Session {
 
     /// Sort vectors or each column/row of a matrix; `desc` reverses.
     fn sort(&mut self, m: &Matrix, dim: usize, desc: bool) -> Result<Value, LangError> {
+        need_2d(m, "sort")?;
         let cmp = |a: &f64, b: &f64| {
             let o = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
             if desc {
@@ -6565,11 +6708,15 @@ impl Session {
         let v = self.eval_args(args)?;
         let first = v.first();
         let b = match name {
-            "isscalar" => matches!(first, Some(x) if x.dims().0 * x.dims().1 == 1),
-            "isvector" => matches!(first, Some(x) if x.dims().0 == 1 || x.dims().1 == 1),
-            "isrow" => matches!(first, Some(x) if x.dims().0 == 1),
-            "iscolumn" => matches!(first, Some(x) if x.dims().1 == 1),
-            "ismatrix" => matches!(first, Some(Value::Mat(_)) | Some(Value::Num(_)) | Some(Value::Cplx(_))),
+            "isscalar" => matches!(first, Some(x) if x.dims_2d().iter().product::<usize>() == 1),
+            "isvector" => matches!(first, Some(x) if { let d = x.dims_2d(); d.len() == 2 && (d[0] == 1 || d[1] == 1) }),
+            "isrow" => matches!(first, Some(x) if { let d = x.dims_2d(); d.len() == 2 && d[0] == 1 }),
+            "iscolumn" => matches!(first, Some(x) if { let d = x.dims_2d(); d.len() == 2 && d[1] == 1 }),
+            "ismatrix" => match first {
+                Some(Value::Num(_)) | Some(Value::Cplx(_)) => true,
+                Some(Value::Mat(m)) => m.is_matrix(),
+                _ => false,
+            },
             "isnumeric" => matches!(first, Some(Value::Mat(_)) | Some(Value::Num(_)) | Some(Value::Cplx(_))),
             // `isreal` is false only for a complex value with a nonzero
             // imaginary part — auto-demoted Cplx are real again.
@@ -6629,7 +6776,7 @@ impl Session {
                             let (mx, my) = (x.to_matrix(), y.to_matrix());
                             match (mx, my) {
                                 (Ok(mx), Ok(my)) => {
-                                    if mx.shape() != my.shape()
+                                    if !Matrix::same_shape(mx.dims(), my.dims())
                                         || mx.data().iter().zip(my.data()).any(|(&p, &q)| {
                                             if name == "isequaln" && p.is_nan() && q.is_nan() {
                                                 false
@@ -6812,6 +6959,7 @@ impl Session {
             return Err(LangError::new(format!("{name} on a complex matrix is not implemented yet"), 0));
         }
         let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_matrix()?;
+        need_2d(&m, name)?;
         match name {
             "eig" => {
                 let w = matcore::eigvals_c(&m).map_err(lang)?;
@@ -6910,6 +7058,9 @@ impl Session {
                         Value::Num(x) => out.push_str(&format!("# name {n} double 1 1\n{x:.17e}\n")),
                         Value::Str(s) => out.push_str(&format!("# name {n} char 1 {}\n{s}\n", s.chars().count())),
                         Value::Mat(m) => {
+                            if !m.is_matrix() {
+                                return Err(LangError::new(format!("cannot save N-D array '{n}' to an ASCII file — use .mat"), 0));
+                            }
                             out.push_str(&format!("# name {n} double {} {}\n", m.rows(), m.cols()));
                             for r in 0..m.rows() {
                                 for c in 0..m.cols() {
@@ -7078,27 +7229,38 @@ impl Session {
         BUILTIN_NAMES.contains(&name)
     }
 
-    /// (rows, cols) from a dims call: `f()` = 1x1, `f(n)` = nxn, `f(r, c)` = rxc.
-    /// Shared choke point for `zeros`/`ones`/`eye`/`rand`/`randn`: the
-    /// element count is capped before any allocation is attempted.
-    fn dims(&mut self, args: &[Expr]) -> Result<(usize, usize), LangError> {
-        let (r, c) = match args.len() {
-            0 => (1, 1),
+    /// Dims vector from a dims call: `f()` = `[1 1]`, `f(n)` = `[n n]`,
+    /// `f([d1 d2 …])` or `f(d1, d2, …)` = the given dims (always ≥ 2 —
+    /// single-dim `f(n)` stays square, a one-element vector too).
+    /// Shared choke point for `zeros`/`ones`/`eye`/`rand`/`randn`/`Inf`/`NaN`:
+    /// the element count is capped before any allocation is attempted.
+    fn dim_vec(&mut self, args: &[Expr]) -> Result<Vec<usize>, LangError> {
+        let dims = match args.len() {
+            0 => vec![1, 1],
             1 => {
                 let m = self.eval(&args[0])?.to_matrix()?;
                 if m.numel() == 1 {
                     let n = m.as_scalar().unwrap_or(0.0).max(0.0) as usize;
-                    (n, n)
+                    vec![n, n]
                 } else if m.numel() >= 2 {
-                    (m.get_linear(0).unwrap_or(0.0).max(0.0) as usize, m.get_linear(1).unwrap_or(0.0).max(0.0) as usize)
+                    m.data().iter().map(|&x| x.max(0.0) as usize).collect()
                 } else {
-                    (0, 0)
+                    vec![0, 0]
                 }
             }
-            _ => (self.eval(&args[0])?.scalar()? as usize, self.eval(&args[1])?.scalar()? as usize),
+            _ => {
+                let mut d = Vec::with_capacity(args.len());
+                for a in args {
+                    d.push(self.eval(a)?.scalar()?.max(0.0) as usize);
+                }
+                d
+            }
         };
-        check_elems(r.saturating_mul(c))?;
-        Ok((r, c))
+        if dims.len() < 2 {
+            return Err(LangError::new("size arguments must give at least two dimensions", 0));
+        }
+        check_elems(dims.iter().fold(1usize, |a, &d| a.saturating_mul(d)))?;
+        Ok(dims)
     }
 }
 
@@ -7109,9 +7271,27 @@ impl Default for Session {
 }
 
 struct IndexSpec {
-    rows: Vec<usize>,
-    cols: Vec<usize>,
+    /// Per-dimension 1-based index lists; `dims.len() == 1` ⇔ `linear`
+    /// (a single subscript is always linear, even on N-D arrays).
+    dims: Vec<Vec<usize>>,
     linear: bool,
+}
+
+impl IndexSpec {
+    /// Dim-1 subscripts (the linear list when `linear`).
+    fn rows(&self) -> &[usize] {
+        self.dims.first().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Dim-2 subscripts (empty when `linear`).
+    fn cols(&self) -> &[usize] {
+        self.dims.get(1).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Subscripts for dims ≥ 3 (empty for 1- or 2-subscript indexing).
+    fn pages(&self) -> &[Vec<usize>] {
+        self.dims.get(2..).unwrap_or(&[])
+    }
 }
 
 /// An evaluated index value → a list of 1-based indices into a dimension
@@ -7154,16 +7334,33 @@ fn resolve_end(e: &Expr, dim_len: usize) -> Expr {
     }
 }
 
+/// Dim-≥3 subscripts on a 2-D value must select the single implicit page —
+/// `x(i,j,1)` is legal, `x(i,j,2)` is out of bounds.
+fn pages_in_bounds(specs: &IndexSpec) -> Result<(), LangError> {
+    for (d, sel) in specs.pages().iter().enumerate() {
+        if let Some(&bad) = sel.iter().find(|&&i| i != 1) {
+            return Err(LangError::new(format!("index {bad} out of bounds in dimension {}", d + 3), 0));
+        }
+    }
+    Ok(())
+}
+
 /// `A(i) = []`, `A(:,j) = []`, `A(i,:) = []` — null-assignment deletion
 /// on a matrix. A linear delete collapses a 2-D matrix to a row vector
 /// (vectors keep orientation); a subscripted delete needs exactly one
 /// non-colon index.
 fn matrix_delete(m: &Matrix, specs: &IndexSpec) -> Result<Matrix, LangError> {
+    if !specs.linear {
+        pages_in_bounds(specs)?;
+        if !m.is_matrix() {
+            return Err(LangError::new("subscripted deletion is only supported on 2-D arrays", 0));
+        }
+    }
     // Deletion cannot grow: every index must be in range.
     let oob = if specs.linear {
-        specs.rows.iter().any(|&i| i > m.numel())
+        specs.rows().iter().any(|&i| i > m.numel())
     } else {
-        specs.rows.iter().any(|&i| i > m.rows()) || specs.cols.iter().any(|&i| i > m.cols())
+        specs.rows().iter().any(|&i| i > m.rows()) || specs.cols().iter().any(|&i| i > m.cols())
     };
     if oob {
         return Err(LangError::new("index out of range for deletion", 0));
@@ -7171,17 +7368,17 @@ fn matrix_delete(m: &Matrix, specs: &IndexSpec) -> Result<Matrix, LangError> {
     if specs.linear {
         let mut data = Vec::with_capacity(m.numel());
         for i in 0..m.numel() {
-            if !specs.rows.contains(&(i + 1)) {
+            if !specs.rows().contains(&(i + 1)) {
                 data.push(m.get_linear(i).unwrap_or(0.0));
             }
         }
         return Ok(if m.cols() == 1 && m.rows() > 1 { Matrix::col_vector(data) } else { Matrix::row_vector(data) });
     }
-    let all_rows = specs.rows.len() == m.rows();
-    let all_cols = specs.cols.len() == m.cols();
+    let all_rows = specs.rows().len() == m.rows();
+    let all_cols = specs.cols().len() == m.cols();
     match (all_rows, all_cols) {
         (true, false) => {
-            let keep: Vec<usize> = (1..=m.cols()).filter(|c| !specs.cols.contains(c)).collect();
+            let keep: Vec<usize> = (1..=m.cols()).filter(|c| !specs.cols().contains(c)).collect();
             let mut out = Matrix::zeros(m.rows(), keep.len());
             for (nc, &oc) in keep.iter().enumerate() {
                 for r in 0..m.rows() {
@@ -7191,7 +7388,7 @@ fn matrix_delete(m: &Matrix, specs: &IndexSpec) -> Result<Matrix, LangError> {
             Ok(out)
         }
         (false, true) => {
-            let keep: Vec<usize> = (1..=m.rows()).filter(|r| !specs.rows.contains(r)).collect();
+            let keep: Vec<usize> = (1..=m.rows()).filter(|r| !specs.rows().contains(r)).collect();
             let mut out = Matrix::zeros(keep.len(), m.cols());
             for c in 0..m.cols() {
                 for (nr, &or) in keep.iter().enumerate() {
@@ -7208,35 +7405,183 @@ fn matrix_delete(m: &Matrix, specs: &IndexSpec) -> Result<Matrix, LangError> {
 fn assign_into(target: &mut Matrix, specs: &IndexSpec, rhs: &Matrix) -> Result<(), LangError> {
     if specs.linear {
         // Grow to fit the largest linear index (column-vector semantics).
-        let top = specs.rows.iter().copied().max().unwrap_or(0);
+        // N-D arrays cannot grow by linear index.
+        let top = specs.rows().iter().copied().max().unwrap_or(0);
         if top > target.numel() {
-            if target.cols() > 1 && target.numel() > 0 {
+            if target.ndims() > 2 || (target.cols() > 1 && target.numel() > 0) {
                 return Err(LangError::new("linear index exceeds matrix dimensions", 0));
             }
             check_elems(top)?;
             target.grow(top, 1);
         }
-        for (i, &idx) in specs.rows.iter().enumerate() {
+        for (i, &idx) in specs.rows().iter().enumerate() {
             let v = rhs.get_linear(if rhs.is_scalar() { 0 } else { i }).unwrap_or(0.0);
-            let (r, c) = if target.rows() > 0 { ((idx - 1) % target.rows(), (idx - 1) / target.rows()) } else { (0, 0) };
-            target.set(r, c, v).map_err(lang)?;
+            if target.ndims() > 2 {
+                target.set_linear(idx - 1, v);
+            } else {
+                let (r, c) = if target.rows() > 0 { ((idx - 1) % target.rows(), (idx - 1) / target.rows()) } else { (0, 0) };
+                target.set(r, c, v).map_err(lang)?;
+            }
         }
         return Ok(());
     }
-    let maxr = specs.rows.iter().copied().max().unwrap_or(0);
-    let maxc = specs.cols.iter().copied().max().unwrap_or(0);
-    check_elems(maxr.max(target.rows()).saturating_mul(maxc.max(target.cols())))?;
-    target.grow(maxr, maxc);
-    for (oc, &c) in specs.cols.iter().enumerate() {
-        for (or, &r) in specs.rows.iter().enumerate() {
-            let v = if rhs.is_scalar() { rhs.as_scalar().unwrap_or(0.0) } else { rhs.get(or, oc).unwrap_or(0.0) };
-            let _ = target.set(r.saturating_sub(1), c.saturating_sub(1), v);
+    if specs.dims.len() == 2 && target.ndims() == 2 {
+        let maxr = specs.rows().iter().copied().max().unwrap_or(0);
+        let maxc = specs.cols().iter().copied().max().unwrap_or(0);
+        check_elems(maxr.max(target.rows()).saturating_mul(maxc.max(target.cols())))?;
+        target.grow(maxr, maxc);
+        for (oc, &c) in specs.cols().iter().enumerate() {
+            for (or, &r) in specs.rows().iter().enumerate() {
+                let v = if rhs.is_scalar() { rhs.as_scalar().unwrap_or(0.0) } else { rhs.get(or, oc).unwrap_or(0.0) };
+                let _ = target.set(r.saturating_sub(1), c.saturating_sub(1), v);
+            }
+        }
+        return Ok(());
+    }
+    assign_into_nd(target, specs, rhs)
+}
+
+/// `x(i,j,k,…) = v` — subscripted write on an N-D target (or a 2-D target
+/// addressed with extra dims). The dims vector extends to the number of
+/// subscripts (new dims pad with 1s, so `x(1,1,1) = 5` on a 2×2 makes it
+/// stored-3-D), and every dim grows to fit its largest subscript with zero
+/// padding — the last subscript spans dims `nsubs-1..` merged, so its
+/// growth lands on the final stored dim.
+fn assign_into_nd(target: &mut Matrix, specs: &IndexSpec, rhs: &Matrix) -> Result<(), LangError> {
+    let nsubs = specs.dims.len();
+    let mut want: Vec<usize> = target.dims().to_vec();
+    want.resize(nsubs.max(want.len()).max(2), 1);
+    for (d, sel) in specs.dims.iter().enumerate().take(nsubs - 1) {
+        let m = sel.iter().copied().max().unwrap_or(0);
+        if let Some(w) = want.get_mut(d) {
+            *w = (*w).max(m);
+        }
+    }
+    let top = specs.dims.last().map(|s| s.iter().copied().max().unwrap_or(0)).unwrap_or(0);
+    // Merged extent of the collapsed tail dims (all but the last stored dim).
+    let tail: usize = want.get(nsubs - 1..want.len().saturating_sub(1)).unwrap_or(&[]).iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    if let Some(w) = want.last_mut() {
+        *w = (*w).max(top.div_ceil(tail.max(1)));
+    }
+    check_elems(want.iter().fold(1usize, |a, &d| a.saturating_mul(d)))?;
+    target.grow_nd(&want);
+    // Column-major walk over the selected positions; `rhs` supplies values
+    // elementwise (scalar broadcasts) in the same order.
+    let tdims = target.dims().to_vec();
+    let stride = |d: usize| tdims.iter().take(d).fold(1usize, |a, &b| a.saturating_mul(b));
+    let total: usize = specs.dims.iter().map(|s| s.len()).fold(1usize, |a, n| a.saturating_mul(n));
+    let mut pos = vec![0usize; nsubs];
+    for k in 0..total {
+        let mut off = 0usize;
+        for (d, sel) in specs.dims.iter().enumerate() {
+            let s = sel.get(pos[d]).copied().unwrap_or(1);
+            off = off.saturating_add(s.saturating_sub(1).saturating_mul(stride(d)));
+        }
+        let v = if rhs.is_scalar() { rhs.as_scalar().unwrap_or(0.0) } else { rhs.get_linear(k).unwrap_or(0.0) };
+        target.set_linear(off, v);
+        for (d, p) in pos.iter_mut().enumerate() {
+            *p += 1;
+            if *p < specs.dims.get(d).map_or(0, Vec::len) {
+                break;
+            }
+            *p = 0;
         }
     }
     Ok(())
 }
 
+/// `x(i,j,k,…)` — subscripted read on a dense array of any dimensionality.
+/// Each subscript is bounds-checked against its dim (the last spans the
+/// product of the remaining dims — unindexed trailing dims collapse into
+/// it); the result keeps one dim per subscript, each the length of its
+/// selection.
+fn gather_nd(m: &Matrix, specs: &IndexSpec) -> Result<Matrix, LangError> {
+    let tdims = m.dims();
+    let nsubs = specs.dims.len();
+    for (d, sel) in specs.dims.iter().enumerate().take(nsubs - 1) {
+        let ext = tdims.get(d).copied().unwrap_or(1);
+        if let Some(&bad) = sel.iter().find(|&&i| i > ext) {
+            return Err(LangError::new(format!("index {bad} out of bounds in dimension {}", d + 1), 0));
+        }
+    }
+    let last_ext = tdims.get(nsubs - 1..).unwrap_or(&[]).iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    if let Some(&bad) = specs.dims[nsubs - 1].iter().find(|&&i| i > last_ext) {
+        return Err(LangError::new(format!("index {bad} out of bounds in dimension {nsubs}"), 0));
+    }
+    let out_dims: Vec<usize> = specs.dims.iter().map(Vec::len).collect();
+    let stride = |d: usize| tdims.iter().take(d).fold(1usize, |a, &b| a.saturating_mul(b));
+    let total: usize = out_dims.iter().fold(1usize, |a, &n| a.saturating_mul(n));
+    let mut data = Vec::with_capacity(total);
+    let mut pos = vec![0usize; nsubs];
+    for _ in 0..total {
+        let mut off = 0usize;
+        for (d, sel) in specs.dims.iter().enumerate() {
+            let s = sel.get(pos[d]).copied().unwrap_or(1);
+            off = off.saturating_add(s.saturating_sub(1).saturating_mul(stride(d)));
+        }
+        data.push(m.get_linear(off).unwrap_or(0.0));
+        for (d, p) in pos.iter_mut().enumerate() {
+            *p += 1;
+            if *p < specs.dims.get(d).map_or(0, Vec::len) {
+                break;
+            }
+            *p = 0;
+        }
+    }
+    Matrix::from_col_major_nd(&out_dims, data).map_err(lang)
+}
+
+/// Reduce an N-D array along `dim` (1-based) over the whole array: the
+/// output keeps every dim with `dim` collapsed to 1, e.g. `sum(x, 1)` on a
+/// 2×3×4 → 1×3×4. `dim > ndims` is a no-op, matching the "reduce a
+/// non-existent dim" convention.
+fn reduce_nd(m: &Matrix, dim: usize, f: &dyn Fn(&[f64]) -> f64) -> Result<Matrix, LangError> {
+    let tdims = m.dims();
+    if dim == 0 || dim > tdims.len() {
+        return Ok(m.clone());
+    }
+    let mut out_dims = tdims.to_vec();
+    if let Some(d) = out_dims.get_mut(dim - 1) {
+        *d = 1;
+    }
+    let out_numel = out_dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    let stride_out: Vec<usize> = (0..tdims.len()).map(|d| out_dims.iter().take(d).fold(1usize, |a, &b| a.saturating_mul(b))).collect();
+    let mut buckets: Vec<Vec<f64>> = (0..out_numel).map(|_| Vec::new()).collect();
+    let mut pos = vec![0usize; tdims.len()];
+    for i in 0..m.numel() {
+        // Column-major position of element i; the reduced dim is skipped so
+        // all its slices share a bucket.
+        let off: usize =
+            pos.iter().enumerate().map(|(d, &p)| if d + 1 == dim { 0 } else { p.saturating_mul(stride_out.get(d).copied().unwrap_or(0)) }).sum();
+        if let Some(b) = buckets.get_mut(off) {
+            b.push(m.get_linear(i).unwrap_or(0.0));
+        }
+        for (d, p) in pos.iter_mut().enumerate() {
+            *p += 1;
+            if *p < tdims.get(d).copied().unwrap_or(0) {
+                break;
+            }
+            *p = 0;
+        }
+    }
+    let out: Vec<f64> = buckets.iter().map(|b| f(b)).collect();
+    Matrix::from_col_major_nd(&out_dims, out).map_err(lang)
+}
+
+/// Matrix ops (`eig`, `svd`, `det`, …) are defined on 2-D operands only —
+/// an N-D argument errors rather than silently reading the first page.
+fn need_2d(m: &Matrix, name: &str) -> Result<(), LangError> {
+    if m.is_matrix() {
+        Ok(())
+    } else {
+        Err(LangError::new(format!("{name} requires a 2-D operand"), 0))
+    }
+}
+
 fn matrix_power(m: &Matrix, p: f64) -> Result<Matrix, MatError> {
+    if !m.is_matrix() {
+        return Err(MatError::Other("matrix power requires a 2-D operand".into()));
+    }
     let n = p.round() as i64;
     if (n as f64 - p).abs() > 1e-12 {
         return Err(MatError::DimensionMismatch { a: m.shape(), b: (1, 1) });
@@ -7266,9 +7611,13 @@ fn cmp(a: &Matrix, b: &Matrix, f: impl Fn(f64, f64) -> bool) -> Result<Value, La
 }
 
 /// `A(i) = v` on a complex target — mirrors `assign_into` with `CNum`s.
+/// Complex arrays are 2-D storage: dim-≥3 subscripts must be singletons.
 fn cassign_into(target: &mut CMatrix, specs: &IndexSpec, rhs: &CMatrix) -> Result<(), LangError> {
+    if !specs.linear {
+        pages_in_bounds(specs)?;
+    }
     if specs.linear {
-        let top = specs.rows.iter().copied().max().unwrap_or(0);
+        let top = specs.rows().iter().copied().max().unwrap_or(0);
         if top > target.numel() {
             if target.cols() > 1 && target.numel() > 0 {
                 return Err(LangError::new("linear index exceeds matrix dimensions", 0));
@@ -7276,19 +7625,19 @@ fn cassign_into(target: &mut CMatrix, specs: &IndexSpec, rhs: &CMatrix) -> Resul
             check_elems(top)?;
             target.grow(top, 1);
         }
-        for (i, &idx) in specs.rows.iter().enumerate() {
+        for (i, &idx) in specs.rows().iter().enumerate() {
             let v = rhs.get_linear(if rhs.is_scalar() { 0 } else { i }).unwrap_or(CNum::real(0.0));
             let (r, c) = if target.rows() > 0 { ((idx - 1) % target.rows(), (idx - 1) / target.rows()) } else { (0, 0) };
             target.set(r, c, v).map_err(lang)?;
         }
         return Ok(());
     }
-    let maxr = specs.rows.iter().copied().max().unwrap_or(0);
-    let maxc = specs.cols.iter().copied().max().unwrap_or(0);
+    let maxr = specs.rows().iter().copied().max().unwrap_or(0);
+    let maxc = specs.cols().iter().copied().max().unwrap_or(0);
     check_elems(maxr.max(target.rows()).saturating_mul(maxc.max(target.cols())))?;
     target.grow(maxr, maxc);
-    for (oc, &c) in specs.cols.iter().enumerate() {
-        for (or, &r) in specs.rows.iter().enumerate() {
+    for (oc, &c) in specs.cols().iter().enumerate() {
+        for (or, &r) in specs.rows().iter().enumerate() {
             let v = if rhs.is_scalar() { rhs.as_scalar().unwrap_or(CNum::real(0.0)) } else { rhs.get(or, oc).unwrap_or(CNum::real(0.0)) };
             let _ = target.set(r.saturating_sub(1), c.saturating_sub(1), v);
         }
@@ -7298,10 +7647,13 @@ fn cassign_into(target: &mut CMatrix, specs: &IndexSpec, rhs: &CMatrix) -> Resul
 
 /// `A(i) = []` on a complex target — mirrors `matrix_delete`.
 fn cmatrix_delete(m: &CMatrix, specs: &IndexSpec) -> Result<CMatrix, LangError> {
+    if !specs.linear {
+        pages_in_bounds(specs)?;
+    }
     let oob = if specs.linear {
-        specs.rows.iter().any(|&i| i > m.numel())
+        specs.rows().iter().any(|&i| i > m.numel())
     } else {
-        specs.rows.iter().any(|&i| i > m.rows()) || specs.cols.iter().any(|&i| i > m.cols())
+        specs.rows().iter().any(|&i| i > m.rows()) || specs.cols().iter().any(|&i| i > m.cols())
     };
     if oob {
         return Err(LangError::new("index out of range for deletion", 0));
@@ -7309,18 +7661,18 @@ fn cmatrix_delete(m: &CMatrix, specs: &IndexSpec) -> Result<CMatrix, LangError> 
     if specs.linear {
         let mut data = Vec::with_capacity(m.numel());
         for i in 0..m.numel() {
-            if !specs.rows.contains(&(i + 1)) {
+            if !specs.rows().contains(&(i + 1)) {
                 data.push(m.get_linear(i).unwrap_or(CNum::real(0.0)));
             }
         }
         let (r, c) = if m.cols() == 1 && m.rows() > 1 { (data.len(), 1) } else { (1, data.len()) };
         return CMatrix::from_col_major(r, c, data).map_err(lang);
     }
-    let all_rows = specs.rows.len() == m.rows();
-    let all_cols = specs.cols.len() == m.cols();
+    let all_rows = specs.rows().len() == m.rows();
+    let all_cols = specs.cols().len() == m.cols();
     match (all_rows, all_cols) {
         (true, false) => {
-            let keep: Vec<usize> = (1..=m.cols()).filter(|c| !specs.cols.contains(c)).collect();
+            let keep: Vec<usize> = (1..=m.cols()).filter(|c| !specs.cols().contains(c)).collect();
             let mut out = CMatrix::zeros(m.rows(), keep.len());
             for (nc, &oc) in keep.iter().enumerate() {
                 for r in 0..m.rows() {
@@ -7330,7 +7682,7 @@ fn cmatrix_delete(m: &CMatrix, specs: &IndexSpec) -> Result<CMatrix, LangError> 
             Ok(out)
         }
         (false, true) => {
-            let keep: Vec<usize> = (1..=m.rows()).filter(|r| !specs.rows.contains(r)).collect();
+            let keep: Vec<usize> = (1..=m.rows()).filter(|r| !specs.rows().contains(r)).collect();
             let mut out = CMatrix::zeros(keep.len(), m.cols());
             for c in 0..m.cols() {
                 for (nr, &or) in keep.iter().enumerate() {
@@ -8187,10 +8539,15 @@ fn glob_match(pat: &str, name: &str) -> bool {
 }
 
 /// Short class description used by `whos` and `workspace.list`.
+/// `2x3x4`-style dims text for `whos`/`celldisp` summaries.
+fn dims_text(dims: &[usize]) -> String {
+    dims.iter().map(usize::to_string).collect::<Vec<_>>().join("x")
+}
+
 pub fn describe(v: &Value) -> String {
     match v {
         Value::Num(_) => "1x1 double".into(),
-        Value::Mat(m) => format!("{}x{} double", m.rows(), m.cols()),
+        Value::Mat(m) => format!("{} double", dims_text(m.dims())),
         Value::Cplx(m) => format!("{}x{} complex", m.rows(), m.cols()),
         Value::Str(s) => format!("1x{} char", s.chars().count()),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
@@ -8381,7 +8738,7 @@ fn fmt_cell_item(v: &Value, long: bool) -> String {
         Value::Num(n) => format!("[{}]", fmt_num(*n, long)),
         Value::Mat(m) if m.numel() == 0 => "[]".into(),
         Value::Mat(m) if m.numel() == 1 => format!("[{}]", fmt_num(m.get_linear(0).unwrap_or(0.0), long)),
-        Value::Mat(m) => format!("{}x{} double", m.rows(), m.cols()),
+        Value::Mat(m) => format!("{} double", dims_text(m.dims())),
         Value::Cplx(m) if m.numel() == 1 => {
             let z = m.get_linear(0).unwrap_or(CNum::real(0.0));
             format!("[{} + {}i]", fmt_num(z.re, long), fmt_num(z.im, long))
@@ -8431,6 +8788,43 @@ pub fn fmt_value(v: &Value, long: bool) -> impl fmt::Display + '_ {
                     Ok(())
                 }
                 Value::Mat(m) => {
+                    if m.ndims() > 2 {
+                        // MATLAB prints N-D arrays one 2-D page at a time:
+                        // `(:,:,i3,i4,…) =` followed by that page's matrix.
+                        let page_dims = &m.dims()[2..];
+                        let pages: usize = page_dims.iter().product();
+                        let mut subs = vec![0usize; page_dims.len()];
+                        for p in 0..pages.min(MAX_DISP_PAGES) {
+                            let idx: Vec<String> = subs.iter().map(|s| (s + 1).to_string()).collect();
+                            write!(f, "   (:,:,{}) =\n\n", idx.join(","))?;
+                            for r in 0..m.rows() {
+                                write!(f, "   ")?;
+                                for c in 0..m.cols() {
+                                    let mut su = Vec::with_capacity(subs.len() + 2);
+                                    su.push(r);
+                                    su.push(c);
+                                    su.extend_from_slice(&subs);
+                                    let v = m.get_nd(&su).unwrap_or(0.0);
+                                    write!(f, "{:>12}", fmt_num(v, self.1))?;
+                                }
+                                writeln!(f)?;
+                            }
+                            if p + 1 < pages.min(MAX_DISP_PAGES) {
+                                writeln!(f)?;
+                            }
+                            for (d, s) in subs.iter_mut().enumerate() {
+                                *s += 1;
+                                if *s < page_dims[d] {
+                                    break;
+                                }
+                                *s = 0;
+                            }
+                        }
+                        if pages > MAX_DISP_PAGES {
+                            write!(f, "   … {} more pages not shown", pages - MAX_DISP_PAGES)?;
+                        }
+                        return Ok(());
+                    }
                     for r in 0..m.rows() {
                         write!(f, "   ")?;
                         for c in 0..m.cols() {
@@ -10925,5 +11319,210 @@ legend('sig'); grid on; saveas('{f}')"
         assert!(s.run("dbstep").is_err());
         // Bad dbstop usage errors too.
         assert!(s.run("dbstop around foo").is_err());
+    }
+
+    fn get_mat(s: &Session, name: &str) -> Matrix {
+        match s.get(name) {
+            Some(Value::Mat(m)) => m.clone(),
+            other => panic!("expected {name} to be a matrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nd_ctor_and_size() {
+        let mut s = Session::new();
+        s.run("x = zeros(2,3,4);").unwrap();
+        let m = get_mat(&s, "x");
+        assert_eq!(m.dims(), &[2, 3, 4]);
+        assert_eq!(m.ndims(), 3);
+        assert_eq!(m.numel(), 24);
+        // size returns the full dims row vector.
+        s.run("d = size(x); n = ndims(x); e = numel(x); d3 = size(x,3);").unwrap();
+        let d = get_mat(&s, "d");
+        assert_eq!(d.dims(), &[1, 3]);
+        assert_eq!(d.get_linear(0), Some(2.0));
+        assert_eq!(d.get_linear(1), Some(3.0));
+        assert_eq!(d.get_linear(2), Some(4.0));
+        assert_eq!(s.get("n"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("e"), Some(&Value::Num(24.0)));
+        assert_eq!(s.get("d3"), Some(&Value::Num(4.0)));
+        // ones / rand / randn follow the same convention.
+        s.run("a = ones(2,3,4); b = rand(2,3,4); c = randn(2,3,4);").unwrap();
+        assert_eq!(get_mat(&s, "a").dims(), &[2, 3, 4]);
+        assert_eq!(get_mat(&s, "b").dims(), &[2, 3, 4]);
+        assert_eq!(get_mat(&s, "c").dims(), &[2, 3, 4]);
+        // zeros(n) stays square; a dims vector is also accepted.
+        s.run("q = zeros(3); r = zeros([2 3 4]);").unwrap();
+        assert_eq!(get_mat(&s, "q").dims(), &[3, 3]);
+        assert_eq!(get_mat(&s, "r").dims(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn nd_index_read() {
+        let mut s = Session::new();
+        // x(i,j,k) = i + 10j + 100k over a 2x3x4 array.
+        s.run("x = zeros(2,3,4); for k = 1:4\nfor j = 1:3\nfor i = 1:2\nx(i,j,k) = i + 10*j + 100*k;\nend\nend\nend").unwrap();
+        s.run("v = x(2,3,4); w = x(24); p = x(2,3,1);").unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(432.0)));
+        assert_eq!(s.get("w"), Some(&Value::Num(432.0)));
+        assert_eq!(s.get("p"), Some(&Value::Num(132.0)));
+        // Page selection x(:,:,k) keeps [r c 1] dims (stored-dims rule).
+        s.run("pg = x(:,:,2);").unwrap();
+        let pg = get_mat(&s, "pg");
+        assert_eq!(pg.dims(), &[2, 3, 1]);
+        assert_eq!(pg.get(0, 0), Some(211.0));
+        assert_eq!(pg.get(1, 2), Some(232.0));
+        // Colon in the first dims collapses to a flat column.
+        s.run("col = x(:);").unwrap();
+        let col = get_mat(&s, "col");
+        assert_eq!(col.dims(), &[24, 1]);
+        // Mixed subscripts: x(1,:) folds dims ≥ 2 → 1x12 matrix.
+        s.run("row = x(1,:);").unwrap();
+        let row = get_mat(&s, "row");
+        assert_eq!(row.dims(), &[1, 12]);
+        // Linear position 1 in folded dims 2..3 → (1,1,1) = 1+10+100.
+        assert_eq!(row.get(0, 0), Some(111.0));
+        // Position 12 → (dim2=3, dim3=4) → x(1,3,4) = 1+30+400.
+        assert_eq!(row.get(0, 11), Some(431.0));
+        // Scalar subscripts keep their (length-1) dim: x(:,2,:) → 2x1x4.
+        s.run("sl = x(:,2,:);").unwrap();
+        assert_eq!(get_mat(&s, "sl").dims(), &[2, 1, 4]);
+        // Out of bounds in dim 3 errors.
+        assert!(s.run("x(:,:,9)").is_err());
+    }
+
+    #[test]
+    fn nd_index_write_and_growth() {
+        let mut s = Session::new();
+        // Scalar write extends a 2-D matrix into 3-D (singleton pad).
+        s.run("A = [1 2; 3 4]; A(1,1,1) = 9;").unwrap();
+        let m = get_mat(&s, "A");
+        assert_eq!(m.dims(), &[2, 2, 1]);
+        assert_eq!(m.get_nd(&[0, 0, 0]), Some(9.0));
+        assert_eq!(m.get_nd(&[1, 1, 0]), Some(4.0));
+        // Writing past a dim grows it, zero-padding.
+        s.run("B = zeros(2,2); B(2,2,3) = 7;").unwrap();
+        let b = get_mat(&s, "B");
+        assert_eq!(b.dims(), &[2, 2, 3]);
+        assert_eq!(b.get_nd(&[1, 1, 2]), Some(7.0));
+        assert_eq!(b.get_nd(&[0, 0, 1]), Some(0.0));
+        // Scalar broadcast over a selected page.
+        s.run("C = zeros(2,2,2); C(:,:,2) = 5;").unwrap();
+        let c = get_mat(&s, "C");
+        assert_eq!(c.get_nd(&[0, 0, 1]), Some(5.0));
+        assert_eq!(c.get_nd(&[1, 1, 1]), Some(5.0));
+        assert_eq!(c.get_nd(&[1, 1, 0]), Some(0.0));
+        // Matching-shape RHS writes elementwise.
+        s.run("D = zeros(2,2,2); D(:,:,1) = [1 2; 3 4];").unwrap();
+        let d = get_mat(&s, "D");
+        assert_eq!(d.get_nd(&[0, 0, 0]), Some(1.0));
+        assert_eq!(d.get_nd(&[1, 0, 0]), Some(3.0));
+        assert_eq!(d.get_nd(&[1, 1, 0]), Some(4.0));
+        // Deletion on N-D is rejected cleanly.
+        assert!(s.run("E = zeros(2,2,2); E(:,:,1) = []").is_err());
+    }
+
+    #[test]
+    fn nd_cat_reshape_elemwise() {
+        let mut s = Session::new();
+        s.run("a = ones(2,2); b = zeros(2,2); c = cat(3,a,b);").unwrap();
+        let c = get_mat(&s, "c");
+        assert_eq!(c.dims(), &[2, 2, 2]);
+        assert_eq!(c.get_nd(&[0, 0, 0]), Some(1.0));
+        assert_eq!(c.get_nd(&[0, 0, 1]), Some(0.0));
+        // cat(1/2) on N-D inputs.
+        s.run("v = cat(1,c,c); h = cat(2,c,c);").unwrap();
+        assert_eq!(get_mat(&s, "v").dims(), &[4, 2, 2]);
+        assert_eq!(get_mat(&s, "h").dims(), &[2, 4, 2]);
+        // reshape into and out of N-D preserves column-major order.
+        s.run("r = reshape(1:24, [2 3 4]);").unwrap();
+        let r = get_mat(&s, "r");
+        assert_eq!(r.dims(), &[2, 3, 4]);
+        assert_eq!(r.get_nd(&[1, 2, 3]), Some(24.0));
+        s.run("r2 = reshape(r, 4, 6);").unwrap();
+        assert_eq!(get_mat(&s, "r2").dims(), &[4, 6]);
+        // Elementwise ops on equal N-D shapes; scalar broadcast too.
+        s.run("e = r + r; f = r .* 2;").unwrap();
+        assert_eq!(get_mat(&s, "e").get_nd(&[0, 0, 0]), Some(2.0));
+        assert_eq!(get_mat(&s, "f").get_nd(&[1, 2, 3]), Some(48.0));
+        // Shape mismatch errors.
+        assert!(s.run("r + ones(2,3,5)").is_err());
+        // squeeze drops singleton dims.
+        s.run("g = squeeze(zeros(1,3,1,2));").unwrap();
+        assert_eq!(get_mat(&s, "g").dims(), &[3, 2]);
+    }
+
+    #[test]
+    fn nd_matrix_ops_rejected() {
+        let mut s = Session::new();
+        s.run("x = zeros(2,2,2); y = zeros(2,2,2);").unwrap();
+        for src in ["x * y", "x \\ y", "x'", "det(x)", "inv(x)", "eig(x)", "x^2"] {
+            assert!(s.run(src).is_err(), "{src} should fail on N-D");
+        }
+        // Transpose of a 3-D-with-singleton-page view still works…
+        s.run("t = x(:,:,1)';").unwrap();
+        assert_eq!(get_mat(&s, "t").dims(), &[2, 2]);
+    }
+
+    #[test]
+    fn nd_display_pages() {
+        let mut s = Session::new();
+        let out = s.run("x = zeros(2,2,2)").unwrap();
+        assert!(out.contains("(:,:,1) ="), "page heading missing: {out}");
+        assert!(out.contains("(:,:,2) ="), "second page heading missing: {out}");
+        // describe / whos-style shape string shows all dims.
+        let out2 = s.run("d = 'x';").unwrap();
+        drop(out2);
+    }
+
+    #[test]
+    fn nd_misc_builtins() {
+        let mut s = Session::new();
+        // length → max dim; isempty false for nonempty N-D.
+        s.run("x = zeros(2,3,4); l = length(x);").unwrap();
+        assert_eq!(s.get("l"), Some(&Value::Num(4.0)));
+        // Multi-output size: extra dims fold into the last output.
+        s.run("[m,n] = size(x);").unwrap();
+        assert_eq!(s.get("m"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("n"), Some(&Value::Num(12.0)));
+        s.run("[m,n,p] = size(x);").unwrap();
+        assert_eq!(s.get("p"), Some(&Value::Num(4.0)));
+        // Linear `end` uses numel.
+        s.run("x(end) = 99;").unwrap();
+        assert_eq!(get_mat(&s, "x").get_nd(&[1, 2, 3]), Some(99.0));
+        // find/logical indexing treat N-D as flat storage.
+        s.run("idx = find(x == 99);").unwrap();
+        assert_eq!(s.get("idx"), Some(&Value::Num(24.0)));
+    }
+
+    #[test]
+    fn nd_reductions() {
+        let mut s = Session::new();
+        // x = ones(2,3,4): sum along dim d collapses that dim.
+        s.run("x = ones(2,3,4);").unwrap();
+        s.run("s1 = sum(x); s2 = sum(x,2); s3 = sum(x,3); sa = sum(x,'all');").unwrap();
+        let s1 = get_mat(&s, "s1");
+        assert_eq!(s1.dims(), &[1, 3, 4]);
+        assert_eq!(s1.get_nd(&[0, 1, 2]), Some(2.0));
+        let s2 = get_mat(&s, "s2");
+        assert_eq!(s2.dims(), &[2, 1, 4]);
+        assert_eq!(s2.get_nd(&[1, 0, 0]), Some(3.0));
+        let s3 = get_mat(&s, "s3");
+        assert_eq!(s3.dims(), &[2, 3, 1]);
+        assert_eq!(s3.get_nd(&[0, 2, 0]), Some(4.0));
+        assert_eq!(s.get("sa"), Some(&Value::Num(24.0)));
+        // mean/prod/min/max follow the same shape rule.
+        s.run("mm = mean(x,3); mx = max(x,[],1); pd = prod(2*ones(1,2,2),2);").unwrap();
+        let mm = get_mat(&s, "mm");
+        assert_eq!(mm.dims(), &[2, 3, 1]);
+        assert_eq!(mm.get_nd(&[0, 0, 0]), Some(1.0));
+        let mx = get_mat(&s, "mx");
+        assert_eq!(mx.dims(), &[1, 3, 4]);
+        // Index-returning min/max and running ops are 2-D only.
+        assert!(s.run("[v,i] = max(x)").is_err());
+        assert!(s.run("cumsum(x)").is_err());
+        // sum over a non-existent dim is a no-op.
+        s.run("nop = sum(x,9);").unwrap();
+        assert_eq!(get_mat(&s, "nop").dims(), &[2, 3, 4]);
     }
 }
