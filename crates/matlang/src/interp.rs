@@ -5604,7 +5604,7 @@ impl Session {
                 };
                 let fig = self.figure_mut();
                 let bytes = export_figure(fig, &file, None)?;
-                std::fs::write(&file, &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
+                crate::write_file(std::path::Path::new(&file), &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
                 self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
                 Ok(None)
             }
@@ -5625,7 +5625,7 @@ impl Session {
                 }
                 let file = file.ok_or_else(|| LangError::new("print needs a filename", 0))?;
                 let bytes = export_figure(self.figure_mut(), &file, fmt.as_deref())?;
-                std::fs::write(&file, &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
+                crate::write_file(std::path::Path::new(&file), &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
                 self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
                 Ok(None)
             }
@@ -7107,7 +7107,7 @@ impl Session {
                     }
                 }
             }
-            std::fs::write(&path, &out).map_err(|e| LangError::new(format!("cannot write {path}: {e}"), 0))?;
+            crate::write_file(std::path::Path::new(&path), out.as_bytes()).map_err(|e| LangError::new(format!("cannot write {path}: {e}"), 0))?;
             self.print_buf.push_str(&format!("saved {} variable(s) to {path}\n", names.len()));
             return Ok(None);
         }

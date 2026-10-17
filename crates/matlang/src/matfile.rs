@@ -230,7 +230,7 @@ pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
         }
         push_tag(&mut out, MI_COMPRESSED, &comp);
     }
-    std::fs::write(path, &out).map_err(|e| format!("cannot write {path}: {e}"))?;
+    crate::write_file(std::path::Path::new(path), &out).map_err(|e| format!("cannot write {path}: {e}"))?;
     Ok(vars.len())
 }
 

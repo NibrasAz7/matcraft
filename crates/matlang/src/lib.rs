@@ -51,6 +51,21 @@ impl std::fmt::Display for LangError {
 
 impl std::error::Error for LangError {}
 
+/// Crash-safe file write shared by `save`, `saveas`/`print` and the .mat
+/// writer: an atomic replace via `craft-atomic` on native targets. On
+/// wasm32 there is no filesystem — `std::fs::write` errors cleanly, while
+/// `craft-atomic`'s temp-name (`std::process::id`) would panic.
+pub(crate) fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        craft_atomic::atomic_write(path, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 /// Parse and execute `source` in a fresh session; returns echoed output.
 pub fn eval(source: &str) -> Result<String, LangError> {
     let mut session = Session::new();

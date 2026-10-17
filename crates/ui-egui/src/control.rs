@@ -136,7 +136,7 @@ pub fn handle(app: &mut MatApp, ctx: &egui::Context, req: ControlRequest) {
                             "pngBase64": base64::engine::general_purpose::STANDARD.encode(&png),
                         });
                         if let Some(p) = &path {
-                            match std::fs::write(p, &png) {
+                            match crate::write_file(std::path::Path::new(p), &png) {
                                 Ok(()) => out["path"] = json!(p),
                                 Err(e) => out = json!({"ok": false, "error": format!("cannot write {p}: {e}")}),
                             }

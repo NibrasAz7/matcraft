@@ -148,7 +148,7 @@ impl Editor {
                 return;
             }
         }
-        match std::fs::write(&self.path, &self.text) {
+        match crate::write_file(std::path::Path::new(&self.path), self.text.as_bytes()) {
             Ok(()) => {
                 self.status = format!("saved {}", self.path);
                 self.dirty = false;

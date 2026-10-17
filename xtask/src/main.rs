@@ -100,7 +100,7 @@ fn layers() -> ExitCode {
             _ => return None,
         })
     };
-    const UI_DEPS: &[&str] = &["egui", "eframe", "winit", "wgpu", "rfd"];
+    const UI_DEPS: &[&str] = &["egui", "eframe", "winit", "wgpu", "rfd", "craft-quit", "craft-ui"];
 
     let roots = ["crates", "apps"];
     let mut ok = true;

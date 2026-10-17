@@ -33,6 +33,48 @@ use repl::Repl;
 use ribbon::{RibbonCmd, Tab as RibbonTab};
 use workspace::WsCmd;
 
+/// Persisted desktop state — panel toggles, zoom, working directory — held
+/// in `config.toml` via `craft-settings` (atomic writes, a backup of the
+/// previous file, damaged-file recovery and portable mode). The field names
+/// match the legacy `layout.json` keys and a [`craft_settings::LegacyFile`]
+/// imports that JSON file on first run, so existing installs keep their
+/// layout.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MatLayout {
+    pub show_left: bool,
+    pub show_right: bool,
+    pub show_cmdwin: bool,
+    pub show_editor: bool,
+    pub zoom: f32,
+    pub cwd: String,
+}
+
+impl Default for MatLayout {
+    fn default() -> Self {
+        MatLayout { show_left: true, show_right: true, show_cmdwin: true, show_editor: true, zoom: 1.0, cwd: String::new() }
+    }
+}
+
+impl craft_settings::Settings for MatLayout {
+    const APP_ID: &'static str = "matcraft";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Crash-safe write: atomic replace via `craft-atomic` on native targets.
+/// On wasm32 there is no filesystem — `std::fs::write` errors cleanly,
+/// while `craft-atomic`'s temp-name (`std::process::id`) would panic.
+pub(crate) fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        craft_atomic::atomic_write(path, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 /// One open document tab in the centre area.
 #[derive(Clone, Copy, PartialEq)]
 enum Doc {
@@ -131,11 +173,16 @@ pub struct MatApp {
     /// The debugger's current stop — drives the `K>>` prompt, the debug
     /// toolbar, the status line and the editor's paused-line highlight.
     dbg: Option<DebugPause>,
-    /// Write `layout.json` on drop (set by the eframe entry point).
-    persist_layout: bool,
-    /// Zoom factor restored from `layout.json`, applied on the first frame.
+    /// The unsaved-changes prompt is up (a close request with dirty editors).
+    close_prompt: bool,
+    /// The user confirmed discarding unsaved buffers on close.
+    discard_confirmed: bool,
+    /// `config.toml` store for the persisted layout (`MatApp::new` only).
+    #[cfg(not(target_arch = "wasm32"))]
+    settings_store: Option<craft_settings::SettingsStore<MatLayout>>,
+    /// Zoom factor restored from the layout, applied on the first frame.
     want_zoom: Option<f32>,
-    /// Last seen interface zoom — saved with the layout on drop.
+    /// Last seen interface zoom — saved with the layout on exit.
     last_zoom: f32,
 }
 
@@ -143,8 +190,9 @@ impl MatApp {
     /// `eframe::run_native` entry point.
     pub fn new(cc: &eframe::CreationContext<'_>, opts: MatAppOptions) -> Self {
         cc.egui_ctx.set_visuals(ribbon::studio_visuals());
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut app = Self::with_options(opts);
-        app.persist_layout = true;
+        #[cfg(not(target_arch = "wasm32"))]
         app.restore_layout();
         app
     }
@@ -186,7 +234,10 @@ impl MatApp {
             find_files: FindFiles::default(),
             fig_popped: std::collections::BTreeSet::new(),
             dbg: None,
-            persist_layout: false,
+            close_prompt: false,
+            discard_confirmed: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            settings_store: None,
             want_zoom: None,
             last_zoom: 1.0,
         };
@@ -480,7 +531,7 @@ impl MatApp {
                 Ok(png) => {
                     let mut out = json!({"ok": true, "bytes": png.len(), "width": image.width(), "height": image.height()});
                     match path {
-                        Some(p) => match std::fs::write(&p, &png) {
+                        Some(p) => match write_file(std::path::Path::new(&p), &png) {
                             Ok(()) => out["path"] = json!(p),
                             Err(e) => out = json!({"ok": false, "error": format!("cannot write {p}: {e}")}),
                         },
@@ -555,7 +606,10 @@ impl MatApp {
         }
     }
 
-    /// `%APPDATA%\matcraft\layout.json` on Windows, `$HOME/.matcraft` elsewhere.
+    /// The pre-`config.toml` layout file — `%APPDATA%\matcraft\layout.json`
+    /// on Windows, `$HOME/.matcraft/layout.json` elsewhere. Imported once by
+    /// the settings store's legacy hook; newer sessions never touch it.
+    #[cfg(not(target_arch = "wasm32"))]
     fn layout_path() -> Option<std::path::PathBuf> {
         if let Some(d) = std::env::var_os("APPDATA") {
             return Some(std::path::PathBuf::from(d).join("matcraft").join("layout.json"));
@@ -563,27 +617,31 @@ impl MatApp {
         std::env::var_os("HOME").map(|d| std::path::PathBuf::from(d).join(".matcraft").join("layout.json"))
     }
 
-    /// The persisted desktop state: panel toggles, zoom, working directory.
-    fn layout_json(&self, zoom: f32, cwd: &std::path::Path) -> Json {
-        json!({
-            "show_left": self.show_left,
-            "show_right": self.show_right,
-            "show_cmdwin": self.show_cmdwin,
-            "show_editor": self.show_editor,
-            "zoom": zoom,
-            "cwd": cwd.display().to_string(),
-        })
-    }
-
-    /// Read `layout.json` and apply it (called from `MatApp::new`).
+    /// Load the persisted layout through `craft-settings` (`config.toml` in
+    /// the platform config dir, or `config/` beside a portable exe) and keep
+    /// the store for the save on exit (called from `MatApp::new`).
+    #[cfg(not(target_arch = "wasm32"))]
     fn restore_layout(&mut self) {
-        let Some(v) = Self::layout_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<Json>(&s).ok()) else {
-            return;
-        };
-        self.apply_layout(&v);
+        let legacy = Self::layout_path()
+            .map(|path| craft_settings::LegacyFile::<MatLayout> {
+                path,
+                // The field names match `layout.json`'s keys, so the old
+                // file parses as a `MatLayout` directly.
+                parse: |bytes| serde_json::from_slice::<MatLayout>(bytes).map_err(|e| e.to_string()),
+            })
+            .into_iter()
+            .collect();
+        let (store, _report) =
+            craft_settings::SettingsStore::<MatLayout>::open_with(craft_settings::OpenOptions::new(craft_settings::Location::Auto).legacy(legacy));
+        if let Ok(v) = serde_json::to_value(store.get()) {
+            self.apply_layout(&v);
+        }
+        self.settings_store = Some(store);
     }
 
     /// Apply a parsed layout object (split out so tests need no filesystem).
+    /// On wasm there is no persisted layout; only tests call this.
+    #[cfg(any(not(target_arch = "wasm32"), test))]
     fn apply_layout(&mut self, v: &Json) {
         for (key, field) in [
             ("show_left", &mut self.show_left),
@@ -1087,6 +1145,15 @@ impl eframe::App for MatApp {
                 self.doc_sel = self.doc_sel.min(self.docs.len().saturating_sub(1));
             }
         }
+        // A close request with unsaved editor buffers asks first — the
+        // window stays open and the prompt renders in `ui`.
+        if ctx.input(|i| i.viewport().close_requested()) && self.editors.iter().any(|e| e.dirty) && !self.discard_confirmed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_prompt = true;
+        }
+        // Last, so it sees our `CancelClose`: where the platform has its own
+        // quit (macOS) the window close is routed through it.
+        craft_quit::on_close_request(ctx);
         // Keep the app live while control requests may arrive.
         if self.control_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1533,6 +1600,55 @@ impl eframe::App for MatApp {
             }
         }
 
+        // Unsaved-changes prompt — raised from `logic` on a close request.
+        if self.close_prompt {
+            let mut open = true;
+            let mut save = false;
+            let mut discard = false;
+            let mut cancel = false;
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    let n = self.editors.iter().filter(|e| e.dirty).count();
+                    ui.label(format!("{n} editor buffer(s) have unsaved changes. Save before closing?"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save All").clicked() {
+                            save = true;
+                        }
+                        if ui.button("Don't Save").clicked() {
+                            discard = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if save {
+                for e in &mut self.editors {
+                    if e.dirty {
+                        e.save();
+                    }
+                }
+                // Close only once every buffer saved — a failed or cancelled
+                // save keeps the app open with the prompt still up.
+                if self.editors.iter().all(|e| !e.dirty) {
+                    self.close_prompt = false;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            if discard {
+                self.discard_confirmed = true;
+                self.close_prompt = false;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if !open || cancel {
+                self.close_prompt = false;
+            }
+        }
+
         // Deferred runs (single borrow of self per line).
         if let Some((file, line)) = link_open {
             self.open_link(&file, line);
@@ -1555,21 +1671,24 @@ impl eframe::App for MatApp {
     }
 }
 
+/// Persist the desktop layout — panel toggles, zoom, working directory —
+/// through the settings store (atomic write with a backup of the previous
+/// file) so the next session restores it. Only the real eframe app opens a
+/// store (`MatApp::new`), so headless tests never write.
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for MatApp {
-    /// Persist the desktop layout (`layout.json`) — panel toggles, zoom,
-    /// working directory — so the next session restores it. Only the real
-    /// eframe app opts in (`MatApp::new`), so headless tests never write.
     fn drop(&mut self) {
-        if !self.persist_layout {
-            return;
-        }
-        let Some(p) = Self::layout_path() else { return };
+        let Some(store) = &mut self.settings_store else { return };
         let cwd = std::env::current_dir().unwrap_or_default();
-        let json = self.layout_json(self.last_zoom, &cwd);
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&p, serde_json::to_string_pretty(&json).unwrap_or_default());
+        store.set(MatLayout {
+            show_left: self.show_left,
+            show_right: self.show_right,
+            show_cmdwin: self.show_cmdwin,
+            show_editor: self.show_editor,
+            zoom: self.last_zoom,
+            cwd: cwd.display().to_string(),
+        });
+        let _ = store.flush();
     }
 }
 
@@ -1580,7 +1699,6 @@ mod tests {
     #[test]
     fn apply_layout_restores_toggles_and_zoom() {
         let mut app = MatApp::with_options(MatAppOptions::default());
-        assert!(!app.persist_layout);
         app.apply_layout(&json!({"show_left": false, "show_cmdwin": false, "zoom": 1.5}));
         assert!(!app.show_left);
         assert!(!app.show_cmdwin);

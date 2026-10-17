@@ -339,7 +339,7 @@ pub fn folder_ui(ui: &mut egui::Ui, cache: &mut FileCache, cwd: &Path, sel: &mut
                     Some(PendingOp::NewScript) => {
                         let file = if name.ends_with(".m") { name.clone() } else { format!("{name}.m") };
                         let p = cwd.join(&file);
-                        if std::fs::write(&p, "% MatCraft script\n").is_ok() {
+                        if crate::write_file(&p, b"% MatCraft script\n").is_ok() {
                             cmd = Some(FileCmd::Open(p));
                         }
                         cache.invalidate();

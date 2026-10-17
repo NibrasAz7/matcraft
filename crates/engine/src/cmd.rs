@@ -79,6 +79,20 @@ mod group_tests {
     }
 }
 
+/// Crash-safe write: atomic replace via `craft-atomic` on native targets.
+/// On wasm32 there is no filesystem — `std::fs::write` errors cleanly,
+/// while `craft-atomic`'s temp-name (`std::process::id`) would panic.
+fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        craft_atomic::atomic_write(path, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 fn need_str<'a>(p: &'a Json, key: &str, cmd: &str) -> Result<&'a str, EngineError> {
     p.get(key).and_then(Json::as_str).ok_or_else(|| EngineError::bad_params(cmd, format!("missing string `{key}`")))
 }
@@ -297,7 +311,7 @@ fn figure_export(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
     let n = opt_usize(p, "figure").unwrap_or_else(|| s.lang().current_figure());
     let svg = s.lang().figure_svg(n).ok_or_else(|| EngineError::Other(format!("no figure {n}")))?;
     let bytes = svg.len();
-    std::fs::write(path, &svg).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
+    write_file(std::path::Path::new(path), svg.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
     Ok(json!({"ok": true, "path": path, "bytes": bytes}))
 }
 
