@@ -126,7 +126,7 @@ impl Editor {
 
     /// Load a file into the buffer (also used by `apps/matcraft file.m`).
     pub fn open_path(&mut self, path: &std::path::Path) {
-        match std::fs::read_to_string(path) {
+        match matlang::read_m_source(path) {
             Ok(t) => {
                 self.text = t;
                 self.path = path.to_string_lossy().to_string();

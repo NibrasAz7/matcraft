@@ -1384,7 +1384,7 @@ impl eframe::App for MatApp {
                     Some(FileCmd::Cd(d)) => cd_dirs.push((d, true)),
                     Some(FileCmd::Open(p)) => self.open_editor(&p),
                     Some(FileCmd::Run(p)) => {
-                        if let Ok(src) = std::fs::read_to_string(&p) {
+                        if let Ok(src) = matlang::read_m_source(&p) {
                             let path = p.to_string_lossy().to_string();
                             self.run_editor_buffer(src, p.parent().map(|d| d.to_path_buf()), Some(path), true);
                         }

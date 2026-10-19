@@ -46,7 +46,7 @@ fn main() -> ExitCode {
                 return fail(&format!("{sub} needs {} and optionally --cmd", if sub == "run" { "a file path" } else { "code" }));
             };
             if sub == "run" {
-                match std::fs::read_to_string(first) {
+                match matlang::read_m_source(std::path::Path::new(first)) {
                     Ok(src) => {
                         let mut session = Session::new();
                         // The script's own directory is on the function path.

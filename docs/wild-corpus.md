@@ -22,36 +22,47 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **20** |
-| parse-ok (fdef) / parse-fail | **557 / 48** | — |
-| parse-fail (script) | — | 35 |
-| unknown builtin/function | 2 | 65 |
-| runtime error | 9 | 16 |
-| non-UTF-8 source | 29 | 7 |
+| clean run | — | **21** |
+| parse-ok (fdef) / parse-fail | **582 / 52** | — |
+| parse-fail (script) | — | 41 |
+| unknown builtin/function | 2 | 63 |
+| runtime error | 9 | 18 |
+| non-UTF-8 source | 0 | 0 |
 | **total** | 645 | 143 |
 
-- **Parser coverage: 557/616 decodable function files (90%)** parse cleanly
-  (29 files fail earlier on non-UTF-8 encoding — see below). Against the
-  previous sweep's 87%, the `@`-handle and N-D work moved most of the wall.
+- **Parser coverage: 582/645 function files (90%)** parse cleanly — *all*
+  files now decode since `read_m_source` falls back to latin-1 (the 36
+  non-UTF-8 files are gone; the newly-decodable ones re-entered as
+  parse-ok (+25) or honest parse-fails, which is why the raw parse-fail
+  count rose). Against the original sweep's 87%, the `@`-handle, N-D and
+  encoding work moved most of the wall.
 - The previous #1 blocker — `@` anonymous functions and handles — is
   **resolved**: `f = @(x) x.^2`, `@sin`, `feval`/`arrayfun`/`cellfun`/
   `func2str`/`str2func`/`functions` all land since f623a3e.
 - N-D indexing (`x(i,j,k)`), the previous #3, is **resolved** since fbaa859:
   `zeros(2,3,4)`, merged-tail last subscripts, `ndims`/`cat(dim)`/`squeeze`.
-- Several `unknown function` hits are repo-internal functions in sibling
-  *subdirectories* (`simulationClass`, `Read_WAMIT`, `optset`, `inpaint_nans`,
-  `iread`, `plotColors`, `setSeed`…) — these need `addpath(genpath(pwd))`
-  even in MATLAB, so they are expected failures, not MatCraft gaps.
+- The builtins sweep landed ~134 functions from this list (6007c27): file
+  I/O (`fopen`/`fread`/`fscanf`/`textscan`/`dlmread`/`writematrix`), regex
+  (`regexp`/`regexprep`), stats (`cov`/`prctile`/`quantile`/`hist`/nan-*),
+  sets/bits/integer casts, degree trig, `fir1`/`peaks`/`fspecial`,
+  `imread`/`imwrite`/`im2double` (pure-Rust PNG), system/env, date/time,
+  `ind2sub`/`sub2ind`/`ndgrid`/`accumarray`/`bsxfun`, `inline`/`optimset`.
+- Remaining `unknown function` hits are mostly repo-internal functions in
+  sibling *subdirectories* (`simulationClass`, `Read_WAMIT`, `optset`,
+  `inpaint_nans`, `iread`, `plotColors`, `setSeed`…) — these need
+  `addpath(genpath(pwd))` even in MATLAB, so they are expected failures,
+  not MatCraft gaps. Genuine remaining builtins are a thin tail
+  (`borders`, `ncreadatt`, `vline`, `wmean`…).
 
 ## What the corpus teaches now (ranked)
 
 | Rank | Failure class | Files | Status |
 | --- | --- | --- | --- |
-| 1 | Missing builtins | 67 | Now the top class, but the tail is thin: only a handful are *real* builtins (`global`, `inline`, `peaks`, `fspecial`, `borders`, `ncreadatt`, `vline`, `wmean`); the rest are repo-internal helpers (expected fails). In flight this round: file I/O (`fopen`/`fread`/`fscanf`/`textscan`), regex (`regexp`/`regexprep`), stats (`prctile`/`hist`/`cov`), DSP/image (`fir1`/`peaks`/`im2double`/`imread`). |
-| 2 | Parse fails (residual) | 83 total | Mostly `classdef` OOP, `try/catch` edge forms, and exotic command syntax — the long tail after `@` handles landed. |
-| 3 | Non-UTF-8 sources | 36 | Legacy `.m` files are latin-1/cp1252, not UTF-8. Fix: decode latin-1 when UTF-8 fails (in flight — `read_m_source` already exported for it). |
-| 4 | `classdef` OOP | subset of parse-fail | Documented big lift — the last major language feature gap. |
-| 5 | `imread`-class image data | subset of builtins | PNG decode via the `png` dep (already used by matplot exports) — in flight with the builtins sweep. |
+| 1 | Parse fails (residual) | 93 total | Now the top class — mostly `classdef` OOP plus `try/catch` edge forms and exotic command syntax; includes the newly-decoded latin-1 files. |
+| 2 | Missing builtins / repo-local helpers | 65 | Thin tail after the 6007c27 sweep; mostly expected repo-internal helpers, a handful of real builtins remain. |
+| 3 | `classdef` OOP | subset of parse-fail | Documented big lift — the last major language feature gap. |
+| 4 | `global`/`persistent` semantics | unknown count | Keyword-level state semantics not yet implemented. |
+| ~~5~~ | ~~Non-UTF-8 sources~~ | ~~36~~ | **Resolved** — `read_m_source` decodes latin-1 when UTF-8 fails; wired into CLI, engine `script.run`, `run`, function loading and the Studio editor. |
 
 ## Reproducing
 

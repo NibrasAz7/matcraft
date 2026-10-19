@@ -235,7 +235,7 @@ fn eval_line(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
 
 fn script_run(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
     let path = need_str(p, "path", "script.run")?;
-    let src = std::fs::read_to_string(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+    let src = matlang::read_m_source(std::path::Path::new(path)).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     // The script's directory joins the search path so it can call sibling
     // `<name>.m` function files.
     if let Some(dir) = std::path::Path::new(path).parent() {
