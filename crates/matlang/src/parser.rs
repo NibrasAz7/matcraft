@@ -13,7 +13,7 @@
 //!   primary     := num | str | ident ['(' args ')'] | '(' expr ')'
 //!                | '[' rows ']' | ':' | 'end'
 
-use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
+use crate::ast::{BinOp, ClassMethod, ClassProp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::lexer::{Lexed, Tok};
 use crate::LangError;
 
@@ -205,7 +205,10 @@ impl Parser {
             }
         }
         if self.at_ident("function") {
-            return self.parse_function(depth);
+            return self.parse_function(depth, &[]);
+        }
+        if self.at_ident("classdef") {
+            return self.parse_classdef(depth);
         }
         if self.at_ident("try") {
             self.next();
@@ -461,7 +464,10 @@ impl Parser {
 
     /// `function [a b] = name(p, q)` / `function y = name(p)` / `function name`
     /// — `end` is optional at file scope (next `function` or EOF closes it).
-    fn parse_function(&mut self, depth: usize) -> Result<Stmt, LangError> {
+    /// `extra_stops` adds keywords that also end the body (`methods` blocks
+    /// stop a function at the next `properties`/`methods`/… section, not
+    /// just `end`/`function`).
+    fn parse_function(&mut self, depth: usize, extra_stops: &[&str]) -> Result<Stmt, LangError> {
         self.next(); // 'function'
         let mut outputs = Vec::new();
         if self.peek() == &Tok::LBracket {
@@ -503,7 +509,9 @@ impl Parser {
         }
         self.skip_inline_separators();
         // `end` optional: the body also terminates at 'function' or EOF.
-        let body = self.block_or_eof(&["end", "function"], depth)?;
+        let mut stops: Vec<&str> = vec!["end", "function"];
+        stops.extend_from_slice(extra_stops);
+        let body = self.block_or_eof(&stops, depth)?;
         if self.at_ident("end") {
             self.next();
         }
@@ -519,6 +527,236 @@ impl Parser {
                 Tok::Ident(k) if Self::closes_block(k, keywords) => return Ok(out),
                 Tok::Eof => return Ok(out),
                 _ => out.push(self.statement(depth + 1)?),
+            }
+        }
+    }
+
+    /// `classdef Name < super (& super)* ... end` — a class definition of
+    /// `properties`/`methods`/`enumeration`/`events` sections. Section
+    /// attribute lists (`properties (Access = private)`,
+    /// `methods (Static)`) are consumed for syntax; only `Static` on a
+    /// `methods` section changes what gets recorded.
+    fn parse_classdef(&mut self, depth: usize) -> Result<Stmt, LangError> {
+        self.next(); // 'classdef'
+                     // Optional class attributes: `classdef (Sealed, …) Name`.
+        let _ = self.attr_parens()?;
+        let name = match self.next() {
+            Tok::Ident(n) => n,
+            t => return self.err(format!("expected a class name after 'classdef', found {t:?}")),
+        };
+        // `< super (& super)*` — superclass names may be dotted (`a.b.C`).
+        let mut supers = Vec::new();
+        while matches!(self.peek(), Tok::Lt | Tok::Amp) {
+            self.next();
+            supers.push(self.dotted_name()?);
+        }
+        let mut props = Vec::new();
+        let mut methods = Vec::new();
+        let mut enums = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Tok::Ident(k) if k == "properties" => {
+                    self.next();
+                    let _ = self.attr_parens()?;
+                    self.class_props(&mut props, depth)?;
+                }
+                Tok::Ident(k) if k == "methods" => {
+                    self.next();
+                    let attrs = self.attr_parens()?;
+                    let is_static = attr_bool(&attrs, "Static");
+                    self.class_methods(&mut methods, is_static, depth)?;
+                }
+                Tok::Ident(k) if k == "enumeration" => {
+                    self.next();
+                    let _ = self.attr_parens()?;
+                    self.class_enums(&mut enums, depth)?;
+                }
+                Tok::Ident(k) if k == "events" => {
+                    self.next();
+                    let _ = self.attr_parens()?;
+                    // Event names are parsed but dropped — they only
+                    // matter for handle-class listeners, which MatCraft
+                    // doesn't model.
+                    let mut drop = Vec::new();
+                    self.class_props(&mut drop, depth)?;
+                }
+                Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
+                    self.next();
+                    return Ok(Stmt::ClassDef { name, supers, props, methods, enums });
+                }
+                Tok::Eof => return self.err("missing 'end' for 'classdef'"),
+                t => return self.err(format!("expected a classdef section or 'end', found {t:?}")),
+            }
+        }
+    }
+
+    /// `name` lines with an optional `= expr` default, up to the closing
+    /// `end` (consumed) — a `properties` (or `events`) block.
+    fn class_props(&mut self, out: &mut Vec<ClassProp>, depth: usize) -> Result<(), LangError> {
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
+                    self.next();
+                    return Ok(());
+                }
+                Tok::Eof => return self.err("missing 'end' for 'properties'"),
+                Tok::Ident(n) => {
+                    let n = n.clone();
+                    self.next();
+                    let default = if self.peek() == &Tok::Eq {
+                        self.next();
+                        Some(self.expr(depth + 1)?)
+                    } else {
+                        None
+                    };
+                    out.push(ClassProp { name: n, default });
+                }
+                t => return self.err(format!("expected a property name or 'end', found {t:?}")),
+            }
+        }
+    }
+
+    /// `member [(value)]` entries up to `end` (consumed) — an
+    /// `enumeration` block.
+    fn class_enums(&mut self, out: &mut Vec<ClassProp>, depth: usize) -> Result<(), LangError> {
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
+                    self.next();
+                    return Ok(());
+                }
+                Tok::Eof => return self.err("missing 'end' for 'enumeration'"),
+                Tok::Ident(n) => {
+                    let n = n.clone();
+                    self.next();
+                    // `member (value)` — the member's backing value.
+                    let default = if self.peek() == &Tok::LParen {
+                        let args = self.arg_list(depth, &Tok::RParen)?;
+                        args.into_iter().next()
+                    } else {
+                        None
+                    };
+                    out.push(ClassProp { name: n, default });
+                }
+                t => return self.err(format!("expected an enumeration member or 'end', found {t:?}")),
+            }
+        }
+    }
+
+    /// `methods`-block items up to `end` (consumed): `function`
+    /// definitions plus bodiless signatures (`out = f(args)` — abstract
+    /// or implemented elsewhere in the file/`@dir`).
+    fn class_methods(&mut self, out: &mut Vec<ClassMethod>, is_static: bool, depth: usize) -> Result<(), LangError> {
+        // A method body also ends at the next section keyword — inside a
+        // classdef those names are sections, not callables.
+        const SECTION_STOPS: &[&str] = &["properties", "methods", "enumeration", "events"];
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
+                    self.next();
+                    return Ok(());
+                }
+                Tok::Eof => return self.err("missing 'end' for 'methods'"),
+                Tok::Ident(k) if k == "function" => {
+                    let f = self.parse_function(depth, SECTION_STOPS)?;
+                    let Stmt::Function { name, params, outputs, body } = f else {
+                        return self.err("internal: expected a function definition");
+                    };
+                    out.push(ClassMethod { name, params, outputs, body, is_static });
+                }
+                _ => out.push(self.method_signature(is_static)?),
+            }
+        }
+    }
+
+    /// A bodiless method signature: `[a b] = f(p)` | `a = f(p)` |
+    /// `f(p)` | `f`. No `function` keyword and no body — the
+    /// declaration form abstract/extern methods use.
+    fn method_signature(&mut self, is_static: bool) -> Result<ClassMethod, LangError> {
+        let mut outputs = Vec::new();
+        if self.peek() == &Tok::LBracket {
+            self.next();
+            loop {
+                match self.next() {
+                    Tok::Ident(n) => outputs.push(n),
+                    Tok::Tilde => outputs.push("~".into()),
+                    Tok::RBracket => break,
+                    Tok::Comma | Tok::Newline => {}
+                    t => return self.err(format!("expected an output name or ']', found {t:?}")),
+                }
+            }
+            self.expect(&Tok::Eq)?;
+        } else if matches!(self.peek(), Tok::Ident(_)) && self.peek2() == &Tok::Eq {
+            if let Tok::Ident(n) = self.next() {
+                outputs.push(n);
+            }
+            self.next(); // '='
+        }
+        let name = match self.next() {
+            Tok::Ident(n) => n,
+            t => return self.err(format!("expected a method name in the signature, found {t:?}")),
+        };
+        let mut params = Vec::new();
+        if self.peek() == &Tok::LParen {
+            self.next();
+            loop {
+                match self.next() {
+                    Tok::Ident(n) => params.push(n),
+                    Tok::Tilde => params.push("~".into()),
+                    Tok::RParen => break,
+                    Tok::Comma => {}
+                    t => return self.err(format!("expected a parameter or ')', found {t:?}")),
+                }
+            }
+        }
+        let _ = self.stmt_end()?;
+        Ok(ClassMethod { name, params, outputs, body: Vec::new(), is_static })
+    }
+
+    /// `a.b.C` — a possibly package-qualified name.
+    fn dotted_name(&mut self) -> Result<String, LangError> {
+        let mut name = match self.next() {
+            Tok::Ident(n) => n,
+            t => return self.err(format!("expected a name, found {t:?}")),
+        };
+        while self.peek() == &Tok::Dot {
+            self.next();
+            match self.next() {
+                Tok::Ident(n) => {
+                    name.push('.');
+                    name.push_str(&n);
+                }
+                t => return self.err(format!("expected a name after '.', found {t:?}")),
+            }
+        }
+        Ok(name)
+    }
+
+    /// `(attr, attr = value, …)` — consume a balanced paren group,
+    /// returning the tokens inside (outer parens excluded). Used for
+    /// `properties`/`methods`/`enumeration`/`events`/classdef attribute
+    /// lists, which are syntactically accepted and mostly ignored.
+    fn attr_parens(&mut self) -> Result<Vec<Tok>, LangError> {
+        let mut toks = Vec::new();
+        if self.peek() != &Tok::LParen {
+            return Ok(toks);
+        }
+        let mut depth = 0usize;
+        loop {
+            match self.next() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Ok(toks);
+                    }
+                }
+                Tok::Eof => return self.err("unterminated '(' attribute list"),
+                t => toks.push(t),
             }
         }
     }
@@ -749,6 +987,16 @@ impl Parser {
                     let args = self.arg_list(depth, &Tok::RBrace)?;
                     e = Expr::BraceIdx(Box::new(e), args);
                 }
+                // `expr@Super(args)` — superclass constructor/method call.
+                // The `@` must be glued (`obj@Super`); a spaced `@` after an
+                // operand starts nothing valid anyway, and inside `[…]` it
+                // keeps `{a @f}` working as a handle literal.
+                Tok::At if !self.ws_before(self.pos) => {
+                    self.next();
+                    let sup = self.dotted_name()?;
+                    let args = if self.peek() == &Tok::LParen { self.arg_list(depth, &Tok::RParen)? } else { Vec::new() };
+                    e = Expr::SuperCall(Box::new(e), sup, args);
+                }
                 _ => break,
             }
         }
@@ -899,6 +1147,22 @@ impl Parser {
 /// `s.c{1}.f` → `[Name(c), Brace(1), Name(f)]`, `c{1}(2)` →
 /// `[Brace(1), Paren(2)]` rooted at `c`.
 type FieldLhs = (String, Vec<PathStep>);
+
+/// `Name` in a classdef attribute list means `Name = true` unless it is
+/// followed by `= false`/`= 0` (`methods (Static = false)` counts false).
+fn attr_bool(attrs: &[Tok], name: &str) -> bool {
+    for (i, t) in attrs.iter().enumerate() {
+        if !matches!(t, Tok::Ident(n) if n == name) {
+            continue;
+        }
+        return match (attrs.get(i + 1), attrs.get(i + 2)) {
+            (Some(Tok::Eq), Some(Tok::Ident(v))) => matches!(v.as_str(), "true" | "on" | "yes"),
+            (Some(Tok::Eq), Some(Tok::Num(v))) => *v != 0.0,
+            _ => true,
+        };
+    }
+    false
+}
 
 /// Surface text for a token — used when raw source is needed back for a
 /// command-syntax word or a `!` shell-escape line. `None` for tokens that

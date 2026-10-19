@@ -40,6 +40,11 @@ pub enum Expr {
     /// `@(a, b) expr` — an anonymous function; captures the workspace
     /// visible at definition time (M-code semantics).
     AnonFunc(Vec<String>, Box<Expr>),
+    /// `expr@Super(args)` — explicit superclass call inside a method.
+    /// `obj@Super(...)` invokes the superclass constructor on the object
+    /// bound to `obj`; `name@Super(obj, ...)` (or `obj.name@Super(...)`)
+    /// invokes the superclass's version of method `name`.
+    SuperCall(Box<Expr>, String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,6 +157,42 @@ pub enum Stmt {
     /// `endfunction`/`endif`/… appearing where M-code would not need it.
     /// Parses and executes as nothing.
     Noop,
+    /// `classdef Name < super ... end` — a class definition made of
+    /// `properties`, `methods`, `enumeration` and `events` sections.
+    /// Section attributes (`properties (Access = private)`,
+    /// `methods (Static)`) are parsed and mostly ignored; `Static` is
+    /// recorded on the methods it decorates.
+    ClassDef {
+        name: String,
+        /// `< super` names in declaration order, dotted names kept
+        /// verbatim (`matlab.unittest.TestCase`).
+        supers: Vec<String>,
+        props: Vec<ClassProp>,
+        methods: Vec<ClassMethod>,
+        /// `enumeration` members — `name (value)` entries.
+        enums: Vec<ClassProp>,
+    },
+}
+
+/// One `properties`/`enumeration` entry: a name with an optional default
+/// (`x = 0`) or member value (`member (4)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassProp {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
+/// A `methods`-block entry: either a `function` definition or a bodiless
+/// signature (`out = f(args)` — an abstract or externally implemented
+/// declaration). `is_static` comes from the section's `(Static)`
+/// attribute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassMethod {
+    pub name: String,
+    pub params: Vec<String>,
+    pub outputs: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub is_static: bool,
 }
 
 /// One slot of a `[a, b] = f(…)` multi-output target list.

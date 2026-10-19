@@ -54,6 +54,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls fir1"),
     ("solvers", "fzero fminsearch integral quad optimset optimget"),
     ("function handles", "feval func2str str2func functions arrayfun cellfun inline"),
+    ("objects", "isobject methods properties"),
     ("debugging", "dbstop dbclear dbcont dbstatus dbstep dbquit run"),
     ("strings", "num2str int2str mat2str str2double str2num str2mat strcmp strcmpi strncmp strncmpi strmatch strcat upper lower strtrim strrep strfind strtok blanks deblank double logical char regexp regexpi regexprep"),
     ("text scan", "fscanf sscanf textscan strread dlmread dlmwrite csvwrite readmatrix writematrix"),
@@ -180,6 +181,7 @@ fn value_size(v: &Value) -> (usize, usize) {
         Value::Cell(c) => c.shape(),
         Value::Struct(s) => (s.rows(), s.cols()),
         Value::Sparse(s) => (s.rows(), s.cols()),
+        Value::Object(_) => (1, 1),
         Value::Func(_) => (1, 1),
     }
 }
@@ -215,6 +217,7 @@ fn value_to_json(v: &Value, long: bool) -> Json {
         }
         Value::Cell(_) => json!({"class": class, "size": [r, c], "display": display}),
         Value::Struct(m) => json!({"class": class, "size": [r, c], "display": display, "fields": m.field_names()}),
+        Value::Object(o) => json!({"class": class, "size": [r, c], "display": display, "fields": o.prop_names()}),
         // Sparse ships dense data + a sparse flag — the grid display is
         // identical, and `nnz` is in the display string.
         Value::Sparse(s) => {

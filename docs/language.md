@@ -20,6 +20,10 @@ by observing MathWorks software.
   nested cells included.
 - `struct` — struct **array** with named fields; `s.f = v` creates/extends it,
   `s(2).f` indexes elements. Scalars are 1×1 struct arrays.
+- `<class>` — a `classdef` object: a class tag over a scalar property
+  struct. Value classes copy on assignment; `classdef X < handle` shares
+  its store, so method writes reach the caller's object. Object *arrays*
+  are not in — every object is a scalar.
 - `sparse` — sparse double matrix (`sparse`/`speye`/`spalloc`); mixed
   sparse+full arithmetic densifies.
 - `complex` — `a+bi` doubles via `i`/`j`; real values promote on contact and
@@ -148,6 +152,67 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   call through `f(args)` or `feval(f, args)`. Anonymous bodies capture the
   workspace at creation (by value).
 
+## Classes (`classdef`)
+
+- `classdef Name < super (& super)* ... end` defines a class. Sections:
+  `properties` (`name` or `name = default` lines), `methods` (`function`
+  definitions and bodiless signatures like `y = f(x)`), `enumeration`
+  (`member` or `member (value)` lines) and `events` (names parsed,
+  ignored). The class name itself is a callable: `Name(args)` builds an
+  object — property defaults apply first (superclasses' then the class's
+  own, duplicates overwritten), then the `methods`-block function named
+  `Name` runs as the constructor with the object pre-bound to its first
+  output. A class with no constructor method just gets defaults.
+- Section/class attribute lists — `classdef (Sealed, …)`,
+  `properties (Access = private)`, `properties (SetAccess = protected,
+  GetAccess = public, Dependent)`, `methods (Static = false)` — parse in
+  every form (`name`, `name = value`, comma or space separated). They are
+  accepted for compatibility, not enforced, **except** `methods (Static)`
+  which drops the implicit object argument.
+- Properties: `obj.prop` reads, `obj.prop = v` writes (also through
+  chains like `obj.a.b(2)`). Writing an undeclared property creates it —
+  MATLAB errors there; the deviation keeps ad-hoc tagging working.
+- Methods dispatch both ways M-code allows: `obj.m(args)` and
+  `m(obj, args)` — the latter wins over path functions and builtins when
+  any argument is an object (dominant-argument rule). A bare `obj.m`
+  calls `m` with no extra arguments. `methods (Static)` methods take no
+  implicit object and also run as `Class.m(…)` (the class name evaluates
+  to a default instance first).
+- Inheritance: `< super` records the superclass; method and property
+  lookup walk the first-declared chain (`a.b.C` supers resolve on the
+  last component). `isa(obj,'Base')` is true for ancestors —
+  `isa(obj,'handle')` included. `obj@Super(args)` inside a constructor
+  runs the superclass ctor on the object; `name@Super(obj,…)` and
+  `obj.name@Super(…)` call the superclass's version of `name`.
+  `handle` and the builtin types (`double`/`uint8`/…) are valid super
+  names with no ctor work to do.
+- Value vs handle: plain `classdef` objects have **value semantics** —
+  copies detach, so a method that mutates its object argument must be
+  re-assigned (`obj = obj.mutate()`). `classdef X < handle` (or
+  inheriting one) shares storage — `obj.mutate()` writes through.
+- `@ClassName/` directories on the path act as class method folders:
+  `@C/C.m` is the class definition (or an old-style `class(s,'C')`
+  constructor — `class(struct,'name' [,parentObj])` works too), and
+  `@C/m.m` is method `m` — private to the class, it never shadows a
+  same-named global for non-object calls. Method lookup order: the
+  classdef `methods` block, then `@dir` files, then the superclass chain.
+- Introspection: `class(obj)` → class name; `isa`, `isobject`,
+  `methods(obj|'C')`, `properties(obj|'C')` (inherited included),
+  `fieldnames`, `get(obj,'p')`/`get(obj)`, `set(obj,'p',v,…)` (returns
+  the updated object), `disp`/`display` honor a class `display` method.
+- Operator overloads: `+ - * .* / ./ \ ^ .^` map to
+  `plus minus mtimes times mrdivide rdivide mldivide mpower power`,
+  comparisons to `eq ne lt le gt ge`, `& |` to `and or`, `-x +x ~x` to
+  `uminus uplus not`, `'`/`.'` to `ctranspose`/`transpose`, and
+  `[a b]`/`[a; b]` object literals to `horzcat`/`vertcat` — when the
+  class defines the method, else a clear "not defined for class" error.
+- `Class.member` evaluates an `enumeration` member's backing value.
+  Not in (parse harmlessly or error clearly): object arrays, `events`
+  listeners, `Constant`/`Dependent`/`Abstract`/`Sealed`/`Hidden`
+  enforcement, `Access` visibility, `metaclass`/`superclasses`, packages,
+  `handle.notify`, `.mat` save/load of objects (errors), `subsref`/
+  `subsasgn`, `builtin('method', obj, …)` dispatch, dynamic props.
+
 ## Builtin library
 
 | Group | Functions |
@@ -166,10 +231,10 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
 | DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap fir1` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`; `fir1(n,wn[,type][,win])` is a windowed-sinc FIR designer) |
 | Solvers | `fzero fminsearch integral quad` — first arg is a function handle or a name string (`fzero('cos', 1)`, `integral(@(x) x.^2, 0, 1)`) |
-| Predicates | `isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isa isequal isequaln` |
+| Predicates | `isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isa isequal isequaln isobject` — `isa(obj,'C')` covers ancestors and `'handle'` |
 | Strings | `num2str int2str mat2str str2double str2num strcmp strcmpi strncmp strncmpi strcat upper lower strtrim strrep strfind strtok strmatch cellstr blanks deblank str2mat double logical char` + regex `regexp regexpi regexprep` (Rust regex syntax; outputs `'start' 'end' 'matchextents' 'match' 'tokens' 'split'`, options `'once' 'ignorecase' 'matchcase'`, `regexprep` honours `$1` group refs; look-around/backrefs are unsupported) |
 | Cells | `cell iscell iscellstr cell2mat num2cell celldisp` (`num2cell(A,dim)`, `num2cell` on char) |
-| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` |
+| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` — `fieldnames`/`isfield`/`get`/`set` also take objects; `methods`/`properties` list a class's members |
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |

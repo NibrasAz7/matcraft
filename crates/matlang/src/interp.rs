@@ -105,6 +105,27 @@ struct FuncDef {
     /// Path of the `.m` file the function was defined in ("" for eval'd
     /// code) — backs `mfilename`.
     file: String,
+    /// `methods (Static)` — the call passes no implicit object argument.
+    is_static: bool,
+}
+
+/// A `classdef` (or an `@dir` class shell) known to the session.
+#[derive(Debug, Clone, Default)]
+struct ClassDef {
+    /// `< super` names verbatim; resolution walks the first one (and
+    /// compares on its last `.`-separated component).
+    supers: Vec<String>,
+    /// Own `properties` entries: (name, default expression).
+    props: Vec<(String, Option<Expr>)>,
+    /// `methods`-block functions with bodies, by name.
+    methods: HashMap<String, FuncDef>,
+    /// Bodiless signatures (name → is_static) — abstract methods, or
+    /// declarations implemented by file-local functions/`@dir` files.
+    sigs: HashMap<String, bool>,
+    /// `enumeration` members: (name, value expression).
+    enums: Vec<(String, Option<Expr>)>,
+    /// `.m` file the classdef came from ("" for session-eval'd defs).
+    file: String,
 }
 
 /// One file behind an `fopen` fid. Shared `Read`/`Write`/`Seek` access on
@@ -138,8 +159,92 @@ pub enum Value {
     /// set; `StructArray::fields` stores each field's values per element
     /// (column-major element order), like MATLAB's field-oriented storage.
     Struct(StructArray),
+    /// `classdef` instance — a class tag over a scalar property struct.
+    /// Value classes own their props (copy-on-write); `classdef X < handle`
+    /// shares them through an `Rc`, MATLAB's handle-class semantics.
+    Object(MObject),
     /// Function handle — `@name` or an anonymous function `@(args) expr`.
     Func(FuncHandle),
+}
+
+/// A class instance's property store.
+#[derive(Debug, Clone)]
+enum ObjStore {
+    /// Value class: each `Value` clone owns its copy — writes detach.
+    Owned(StructArray),
+    /// Handle class: clones share storage, so a method that writes
+    /// `obj.p` mutates the caller's object too.
+    Shared(std::rc::Rc<std::cell::RefCell<StructArray>>),
+}
+
+/// A `classdef` object: a class name plus a scalar struct of properties.
+#[derive(Debug, Clone)]
+pub struct MObject {
+    /// Class name as written in `classdef`/`class(s,'name')`.
+    pub class_name: String,
+    props: ObjStore,
+}
+
+impl PartialEq for MObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.class_name == other.class_name && self.props_map() == other.props_map()
+    }
+}
+
+impl MObject {
+    fn new(class_name: String, props: StructArray, handle: bool) -> Self {
+        MObject {
+            class_name,
+            props: if handle { ObjStore::Shared(std::rc::Rc::new(std::cell::RefCell::new(props))) } else { ObjStore::Owned(props) },
+        }
+    }
+
+    /// Value-class constructor helper (`class(s,'name')` objects own
+    /// their props).
+    fn owned(class_name: String, props: StructArray) -> Self {
+        MObject::new(class_name, props, false)
+    }
+
+    /// `obj.prop` — property value by name.
+    fn prop(&self, name: &str) -> Option<Value> {
+        match &self.props {
+            ObjStore::Owned(s) => s.field_at(0, name).cloned(),
+            ObjStore::Shared(s) => s.borrow().field_at(0, name).cloned(),
+        }
+    }
+
+    fn has_prop(&self, name: &str) -> bool {
+        match &self.props {
+            ObjStore::Owned(s) => s.has_field(name),
+            ObjStore::Shared(s) => s.borrow().has_field(name),
+        }
+    }
+
+    /// `obj.prop = v` — writes through the shared store on handle
+    /// classes, into the owned copy on value classes.
+    fn set_prop(&mut self, name: &str, v: Value) {
+        match &mut self.props {
+            ObjStore::Owned(s) => {
+                let _ = s.set_field(0, name, v);
+            }
+            ObjStore::Shared(s) => {
+                let _ = s.borrow_mut().set_field(0, name, v);
+            }
+        }
+    }
+
+    /// Property field names (engine/JSON introspection).
+    pub fn prop_names(&self) -> Vec<String> {
+        self.props_map().field_names()
+    }
+
+    /// Snapshot of the property struct (display, `fieldnames`, `get`).
+    fn props_map(&self) -> StructArray {
+        match &self.props {
+            ObjStore::Owned(s) => s.clone(),
+            ObjStore::Shared(s) => s.borrow().clone(),
+        }
+    }
 }
 
 /// What a `Value::Func` refers to.
@@ -662,6 +767,7 @@ impl Value {
             Value::Str(_) => Err(LangError::new("string used where a number was expected", 0)),
             Value::Cell(_) => Err(LangError::new("cell array used where a number was expected", 0)),
             Value::Struct(_) => Err(LangError::new("struct used where a number was expected", 0)),
+            Value::Object(o) => Err(LangError::new(format!("'{}' object used where a number was expected", o.class_name), 0)),
             Value::Func(_) => Err(LangError::new("function handle used where a number was expected", 0)),
         }
     }
@@ -724,6 +830,7 @@ impl Value {
             }
             Value::Cell(c) => c.shape(),
             Value::Struct(s) => (s.rows(), s.cols()),
+            Value::Object(_) => (1, 1),
             Value::Sparse(s) => s.shape(),
             Value::Func(_) => (1, 1),
         }
@@ -752,6 +859,10 @@ pub struct Session {
     fmt_long: bool,
     /// `function` definitions (hoisted from scripts + loaded `.m` files).
     funcs: HashMap<String, FuncDef>,
+    /// Known `classdef`/old-style (`class(s,'name')`) classes by name.
+    classes: HashMap<String, ClassDef>,
+    /// `@dir` method lookup cache — (class, method) → definition.
+    method_cache: HashMap<(String, String), FuncDef>,
     /// Directories searched for `<name>.m` function files.
     paths: Vec<std::path::PathBuf>,
     /// Argument/result counts of the innermost active call (`nargin`/`nargout`).
@@ -817,6 +928,8 @@ impl Session {
             print_buf: String::new(),
             fmt_long: false,
             funcs: HashMap::new(),
+            classes: HashMap::new(),
+            method_cache: HashMap::new(),
             paths,
             call_ctx: None,
             call_depth: 0,
@@ -1268,15 +1381,68 @@ impl Session {
         Ok(out)
     }
 
-    /// Register every top-level `function` before running — script-local
-    /// functions are callable throughout the file, like M-code.
+    /// Register every top-level `function`/`classdef` before running —
+    /// script-local functions are callable throughout the file, like
+    /// M-code. Class methods stay class-scoped (they never shadow path
+    /// functions); file-local `function`s matching a bodiless method
+    /// signature wire in as its implementation.
     fn hoist_functions(&mut self, stmts: &[Stmt], file: &str) {
         for s in stmts {
-            if let Stmt::Function { name, params, outputs, body } = s {
-                self.funcs
-                    .insert(name.clone(), FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string() });
+            match s {
+                Stmt::Function { name, params, outputs, body } => {
+                    self.funcs.insert(
+                        name.clone(),
+                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static: false },
+                    );
+                }
+                Stmt::ClassDef { .. } => self.register_class(s, file),
+                _ => {}
             }
         }
+        for s in stmts {
+            let Stmt::Function { name, params, outputs, body } = s else { continue };
+            for def in self.classes.values_mut() {
+                if def.file == file && def.sigs.contains_key(name) && !def.methods.contains_key(name) {
+                    let is_static = def.sigs.get(name).copied().unwrap_or(false);
+                    def.methods.insert(
+                        name.clone(),
+                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static },
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Record a `Stmt::ClassDef` into `classes` — a later re-registration
+    /// (edited file, re-run script) replaces the definition wholesale.
+    fn register_class(&mut self, s: &Stmt, file: &str) {
+        let Stmt::ClassDef { name, supers, props, methods, enums } = s else { return };
+        let mut def = ClassDef {
+            supers: supers.clone(),
+            props: props.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+            enums: enums.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+            file: file.to_string(),
+            ..ClassDef::default()
+        };
+        for m in methods {
+            if m.body.is_empty() {
+                def.sigs.insert(m.name.clone(), m.is_static);
+            } else {
+                def.sigs.remove(&m.name);
+                def.methods.insert(
+                    m.name.clone(),
+                    FuncDef {
+                        params: m.params.clone(),
+                        outputs: m.outputs.clone(),
+                        body: m.body.clone(),
+                        file: file.to_string(),
+                        is_static: m.is_static,
+                    },
+                );
+            }
+        }
+        self.classes.insert(name.clone(), def);
     }
 
     /// Run a block of statements; stops early on non-Normal flow.
@@ -1501,7 +1667,7 @@ impl Session {
             Stmt::Return => return Ok(Flow::Return),
             // Already registered by `hoist_functions`; executing the node
             // is a no-op.
-            Stmt::Function { .. } | Stmt::Noop => {}
+            Stmt::Function { .. } | Stmt::ClassDef { .. } | Stmt::Noop => {}
             Stmt::AssignMany { targets, value, suppress } => {
                 let call = match value {
                     Expr::CallOrIndex(n, a) => Some((n, a)),
@@ -1526,6 +1692,18 @@ impl Session {
                     let outs = self.call_handle(&h, argv, targets.len())?;
                     self.bind_targets(targets, outs, fname, *suppress, out)?;
                     return Ok(Flow::Normal);
+                }
+                // `[a,b] = f(obj)` — a method of the object's class
+                // shadows path functions for a dominant object argument.
+                if self.may_be_method(fname) {
+                    let argv = self.eval_args(fargs)?;
+                    if let Some(Value::Object(o)) = argv.iter().find(|v| matches!(v, Value::Object(_))) {
+                        if let Some(def) = self.find_method(&o.class_name, fname)? {
+                            let outs = self.call_def(fname, &def, argv, targets.len(), None)?;
+                            self.bind_targets(targets, outs, fname, *suppress, out)?;
+                            return Ok(Flow::Normal);
+                        }
+                    }
                 }
                 if !self.is_function(fname)? {
                     // Multi-output builtins: [M,I]=max(A), [V,D]=eig(A), …
@@ -1714,6 +1892,25 @@ impl Session {
                     }
                     return Ok(Some(Value::Cell(built.unwrap_or_else(|| CellArray::new(0, 0)))));
                 }
+                // Object concat: `[a b; c d]` where every element is an
+                // object routes through `horzcat`/`vertcat` overloads.
+                if grid.iter().flatten().all(|v| matches!(v, Value::Object(_))) && grid.iter().any(|r| !r.is_empty()) {
+                    let mut rows_out: Vec<Value> = Vec::with_capacity(grid.len());
+                    for row in &grid {
+                        let mut it = row.iter().cloned();
+                        let mut acc = it.next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                        for v in it {
+                            acc = self.object_cat(acc, v, "horzcat")?;
+                        }
+                        rows_out.push(acc);
+                    }
+                    let mut it = rows_out.into_iter();
+                    let mut acc = it.next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                    for v in it {
+                        acc = self.object_cat(acc, v, "vertcat")?;
+                    }
+                    return Ok(Some(acc));
+                }
                 // Sparse concat: `[S T]` / `[S; T]` stays sparse when all
                 // elements are sparse.
                 if grid.iter().flatten().all(|v| matches!(v, Value::Sparse(_))) && grid.iter().any(|r| !r.is_empty()) {
@@ -1871,6 +2068,9 @@ impl Session {
                         )),
                         None => Err(LangError::new(format!("reference to non-existent field '{field}'"), 0)),
                     },
+                    // `obj.prop`/`obj.method` — property, enum member or
+                    // zero-extra-arg method call.
+                    Value::Object(o) => self.object_dot(&o, field),
                     _ => Err(LangError::new("'.' field access needs a struct", 0)),
                 }
             }
@@ -1889,10 +2089,33 @@ impl Session {
                         )),
                         None => Err(LangError::new(format!("reference to non-existent field '{field}'"), 0)),
                     },
+                    Value::Object(o) => self.object_dot(&o, &field),
                     _ => Err(LangError::new("'.' field access needs a struct", 0)),
                 }
             }
             Expr::Index(base, args) => {
+                // `obj.m(args)` — method-call syntax on a class instance:
+                // when `m` isn't a property the parens are the call's
+                // argument list, not subscripts (MATLAB resolves by
+                // declaration).
+                if let Expr::Field(b, fname) = base.as_ref() {
+                    if let Value::Object(o) = self.eval(b)? {
+                        if o.has_prop(fname) {
+                            let v = o.prop(fname).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                            if let Value::Func(h) = v {
+                                let argv = self.eval_args(args)?;
+                                return Ok(self.call_handle(&h, argv, 1)?.into_iter().next());
+                            }
+                            return self.index_into(&v, args).map(Some);
+                        }
+                        let def = self
+                            .find_method(&o.class_name, fname)?
+                            .ok_or_else(|| LangError::new(format!("'{fname}' is not a property or method of class '{}'", o.class_name), 0))?;
+                        let mut argv = if def.is_static { Vec::new() } else { vec![Value::Object(o.clone())] };
+                        argv.extend(self.eval_args(args)?);
+                        return Ok(self.call_def(fname, &def, argv, 1, None)?.into_iter().next());
+                    }
+                }
                 // Chained subscript: `c{1}(2)`, `s.f(i)` — index the value
                 // the base expression produced. A handle is called instead:
                 // `c{1}(x)` when `c{1}` is a function handle calls it.
@@ -1912,6 +2135,20 @@ impl Session {
             }
             Expr::Unary(op, e) => {
                 let v = self.eval(e)?;
+                // Operator overload: `-obj`/`+obj`/`~obj` route to the
+                // class's `uminus`/`uplus`/`not` methods when defined.
+                if let Value::Object(o) = &v {
+                    let mname = match op {
+                        UnOp::Neg => "uminus",
+                        UnOp::Pos => "uplus",
+                        UnOp::Not => "not",
+                    };
+                    let o = o.clone();
+                    return match self.find_method(&o.class_name, mname)? {
+                        Some(def) => Ok(self.call_def(mname, &def, vec![Value::Object(o)], 1, None)?.into_iter().next()),
+                        None => Err(LangError::new(format!("'{mname}' is not defined for class '{}'", o.class_name), 0)),
+                    };
+                }
                 if let Value::Sparse(s) = &v {
                     return match op {
                         UnOp::Neg => Ok(Some(Value::Sparse(s.map(|x| -x)))),
@@ -1936,6 +2173,15 @@ impl Session {
             }
             Expr::Transpose(e, conj) => {
                 let v = self.eval(e)?;
+                // `obj'`/`obj.'` — `ctranspose`/`transpose` overloads.
+                if let Value::Object(o) = &v {
+                    let mname = if *conj { "ctranspose" } else { "transpose" };
+                    let o = o.clone();
+                    return match self.find_method(&o.class_name, mname)? {
+                        Some(def) => Ok(self.call_def(mname, &def, vec![Value::Object(o)], 1, None)?.into_iter().next()),
+                        None => Err(LangError::new(format!("'{mname}' is not defined for class '{}'", o.class_name), 0)),
+                    };
+                }
                 // `x'` on a char array: MATLAB yields a char column; our
                 // `Str` has no shape to flip, so it promotes to a double
                 // column of code points. Class change is a documented
@@ -2004,11 +2250,30 @@ impl Session {
                         }
                         t => self.index_into(&t, args).map(Some),
                     }
-                } else if self.is_function(name)? {
-                    let outs = self.call_function(name, args, 1)?;
-                    Ok(outs.into_iter().next())
                 } else {
-                    self.builtin(name, args)
+                    // `f(obj,…)` — a class method shadows both path
+                    // functions and builtins when an object is among the
+                    // arguments (MATLAB dominant-argument dispatch). The
+                    // `may_be_method` gate keeps the common case from a
+                    // speculative argument evaluation.
+                    if self.may_be_method(name) {
+                        let argv = self.eval_args(args)?;
+                        if let Some(Value::Object(o)) = argv.iter().find(|v| matches!(v, Value::Object(_))) {
+                            if let Some(def) = self.find_method(&o.class_name, name)? {
+                                return Ok(self.call_def(name, &def, argv, 1, None)?.into_iter().next());
+                            }
+                        }
+                        if self.is_function(name)? {
+                            return Ok(self.call_function_argv(name, argv, 1)?.into_iter().next());
+                        }
+                        return Ok(self.builtin_values(name, argv, 1)?.into_iter().next());
+                    }
+                    if self.is_function(name)? {
+                        let outs = self.call_function(name, args, 1)?;
+                        Ok(outs.into_iter().next())
+                    } else {
+                        self.builtin(name, args)
+                    }
                 }
             }
             Expr::FuncRef(name) => Ok(Some(Value::Func(FuncHandle::Named(name.clone())))),
@@ -2017,6 +2282,9 @@ impl Session {
                 // later edits to those variables don't reach it.
                 Ok(Some(Value::Func(FuncHandle::Closure { params: params.clone(), body: body.clone(), env: self.vars.clone() })))
             }
+            // `obj@Super(…)` — explicit superclass dispatch (ctor or
+            // method form).
+            Expr::SuperCall(callee, sup, args) => self.super_call(callee, sup, args),
         }
     }
 
@@ -2254,6 +2522,14 @@ impl Session {
         let Some((step, rest)) = path.split_first() else { return Ok(v) };
         match step {
             PathStep::Name(field) => {
+                // `obj.prop = v` — write into the object's store (shared
+                // for handle classes, copy-on-write for value classes).
+                if let Value::Object(mut o) = cur {
+                    let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                    let new = self.path_set(sub, rest, v, root)?;
+                    o.set_prop(field, new);
+                    return Ok(Value::Object(o));
+                }
                 let mut sa = match cur {
                     Value::Struct(m) => m,
                     // Assigning a field into `[]`/nothing creates a struct.
@@ -2516,6 +2792,9 @@ impl Session {
     }
 
     fn index_into(&mut self, target: &Value, args: &[Expr]) -> Result<Value, LangError> {
+        if let Value::Object(_) = target {
+            return Err(LangError::new("indexing into an object is not supported (object arrays are not implemented)", 0));
+        }
         if let Value::Cell(ca) = target {
             // `c(:)` on an empty cell yields an empty cell, not an index error.
             if ca.numel() == 0 && matches!(args, [Expr::Colon]) {
@@ -2755,6 +3034,11 @@ impl Session {
     }
 
     fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, LangError> {
+        // Operator overloading: an object operand defers to its class's
+        // `plus`/`mtimes`/`eq`/… method — MATLAB's dominant-argument rule.
+        if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            return self.object_binary(op, a, b);
+        }
         // Either side complex → the whole op runs in complex arithmetic.
         if matches!(a, Value::Cplx(_)) || matches!(b, Value::Cplx(_)) {
             return self.cbinary(op, &a, &b);
@@ -3290,6 +3574,15 @@ impl Session {
             "fieldnames" => {
                 let v = self.eval_args(args)?;
                 match v.first() {
+                    Some(Value::Object(o)) => {
+                        // `fieldnames(obj)` lists the object's props.
+                        let names = o.props_map().field_names();
+                        let mut c = CellArray::new(names.len(), 1);
+                        for (i, k) in names.iter().enumerate() {
+                            c.set_linear(i, Value::Str(k.clone()));
+                        }
+                        Ok(Some(Value::Cell(c)))
+                    }
                     Some(Value::Struct(m)) => {
                         // MATLAB returns a column cell of char row vectors.
                         let names = m.field_names();
@@ -3302,6 +3595,38 @@ impl Session {
                     _ => Err(LangError::new("fieldnames needs a struct", 0)),
                 }
             }
+            "properties" | "methods" => {
+                // `properties(obj|'Class')` / `methods(…)` — a column
+                // cellstr of names, inherited included.
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs an object or a class name"), 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let mut names: Vec<String> = Vec::new();
+                for d in &chain {
+                    if name == "properties" {
+                        for (p, _) in &d.props {
+                            if !names.contains(p) {
+                                names.push(p.clone());
+                            }
+                        }
+                    } else {
+                        for k in d.methods.keys().chain(d.sigs.keys()) {
+                            if !names.contains(k) {
+                                names.push(k.clone());
+                            }
+                        }
+                    }
+                }
+                let mut c = CellArray::new(names.len(), 1);
+                for (i, n) in names.iter().enumerate() {
+                    c.set_linear(i, Value::Str(n.clone()));
+                }
+                Ok(Some(Value::Cell(c)))
+            }
             "isstruct" => {
                 let v = self.eval_args(args)?;
                 Ok(Some(Value::Num(matches!(v.first(), Some(Value::Struct(_))) as u8 as f64)))
@@ -3309,7 +3634,8 @@ impl Session {
             "isfield" => {
                 let v = self.eval_args(args)?;
                 let m = match v.first() {
-                    Some(Value::Struct(m)) => m,
+                    Some(Value::Struct(m)) => m.clone(),
+                    Some(Value::Object(o)) => o.props_map(),
                     _ => return Err(LangError::new("isfield needs a struct and a field name", 0)),
                 };
                 match v.get(1) {
@@ -3892,6 +4218,22 @@ impl Session {
             "disp" | "display" => {
                 let v = self.eval_args(args)?;
                 match v.first() {
+                    // `disp(obj)` routes through the class's `display`
+                    // method when defined (MATLAB's customization hook).
+                    Some(Value::Object(o)) => {
+                        let o = o.clone();
+                        match self.find_method(&o.class_name, "display")? {
+                            Some(def) => {
+                                let _ = self.call_def("display", &def, vec![Value::Object(o)], 0, None)?;
+                                Ok(None)
+                            }
+                            None => {
+                                let long = self.fmt_long;
+                                self.print_buf.push_str(&format!("{}\n", fmt_value(&Value::Object(o), long)));
+                                Ok(None)
+                            }
+                        }
+                    }
                     Some(val) => {
                         let long = self.fmt_long;
                         self.print_buf.push_str(&format!("{}\n", fmt_value(val, long)));
@@ -4033,6 +4375,17 @@ impl Session {
                 // (a fixed virtual screen: headless, there is no real
                 // display), a positive integer is a figure number.
                 let v = self.eval_args(args)?;
+                // `get(obj,'prop')`/`get(obj)` — object property access.
+                if let Some(Value::Object(o)) = v.first() {
+                    let o = o.clone();
+                    return match v.get(1) {
+                        Some(Value::Str(s)) => {
+                            o.prop(s).map(Some).ok_or_else(|| LangError::new(format!("get: no property '{s}' on class '{}'", o.class_name), 0))
+                        }
+                        None => Ok(Some(Value::Struct(o.props_map()))),
+                        Some(_) => Err(LangError::new("get: property name must be a string", 0)),
+                    };
+                }
                 let h = v.first().ok_or_else(|| LangError::new("get needs a handle", 0))?.scalar()?;
                 let prop = match v.get(1) {
                     Some(Value::Str(s)) => Some(s.to_lowercase()),
@@ -4097,6 +4450,22 @@ impl Session {
                 // `set(h,'prop',v,...)` — h=0 stores root `Default*` props,
                 // a figure number writes the props `get` reports.
                 let v = self.eval_args(args)?;
+                // `set(obj,'prop',v,…)` — writes through on handle
+                // classes, returns the updated object on value classes.
+                if let Some(Value::Object(o)) = v.first() {
+                    let mut o = o.clone();
+                    let mut i = 1;
+                    while i + 1 < v.len() {
+                        let pname = match &v[i] {
+                            Value::Str(s) => s.clone(),
+                            _ => return Err(LangError::new("set: property name must be a string", 0)),
+                        };
+                        let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
+                        o.set_prop(&pname, val.clone());
+                        i += 2;
+                    }
+                    return Ok(Some(Value::Object(o)));
+                }
                 let h = v.first().ok_or_else(|| LangError::new("set needs a handle", 0))?.scalar()?;
                 if v.len() < 3 || v.len() % 2 == 0 {
                     return Err(LangError::new("set: property/value pairs expected", 0));
@@ -4812,7 +5181,7 @@ impl Session {
                 Ok(Some(Value::Num(if e { 1.0 } else { 0.0 })))
             }
             "isscalar" | "isvector" | "isrow" | "iscolumn" | "ismatrix" | "isnumeric" | "ischar" | "islogical" | "isreal" | "isa" | "isequal"
-            | "isequaln" => self.predicate(name, args),
+            | "isequaln" | "isobject" => self.predicate(name, args),
             "complex" => {
                 let v = self.eval_args(args)?;
                 let re = v.first().ok_or_else(|| LangError::new("complex needs real and imaginary parts", 0))?.to_numeric()?;
@@ -6290,32 +6659,361 @@ impl Session {
         Ok(out)
     }
 
-    /// True when `name` resolves to a function — already defined or loadable
-    /// from a `<name>.m` file on the search path.
+    /// True when `name` resolves to a function or a class — already
+    /// defined or loadable from a `<name>.m`/`@name/` path entry.
     fn is_function(&mut self, name: &str) -> Result<bool, LangError> {
-        if self.funcs.contains_key(name) {
+        if self.funcs.contains_key(name) || self.classes.contains_key(name) {
             return Ok(true);
         }
         self.load_function_file(name)
     }
 
-    /// Look for `<name>.m` on the search path; if found, hoist every
-    /// `function` in it and report whether `name` is now defined.
+    /// Look for `<name>.m` (or `@<name>/<name>.m`) on the search path and
+    /// absorb whatever the file defines — plain functions, a `classdef`,
+    /// or an old-style `@dir` class shell. Reports whether `name` is now
+    /// callable (a function, or a class constructor).
     fn load_function_file(&mut self, name: &str) -> Result<bool, LangError> {
         for dir in self.paths.clone() {
             let file = dir.join(format!("{name}.m"));
-            if !file.is_file() {
-                continue;
+            if file.is_file() {
+                return self.absorb_file(&file, name);
             }
-            let src = read_m_source(&file)?;
-            let stmts = crate::parser::parse(&src).map_err(|mut e| {
-                e.message = format!("{}: {}", file.display(), e.message);
-                e
-            })?;
-            self.hoist_functions(&stmts, &file.display().to_string());
-            return Ok(self.funcs.contains_key(name));
+            let cfile = dir.join(format!("@{name}")).join(format!("{name}.m"));
+            if cfile.is_file() {
+                return self.absorb_file(&cfile, name);
+            }
+            // An `@name/` directory without `name.m` still defines a
+            // class — objects come from `class(s,'name')`, methods from
+            // `@name/m.m`.
+            if dir.join(format!("@{name}")).is_dir() {
+                self.classes.entry(name.to_string()).or_default();
+                return Ok(true);
+            }
         }
         Ok(false)
+    }
+
+    /// Ensure `name`'s file (function or class) is loaded; a cheap no-op
+    /// once it is.
+    fn ensure_loaded(&mut self, name: &str) -> Result<(), LangError> {
+        if self.funcs.contains_key(name) || self.classes.contains_key(name) {
+            return Ok(());
+        }
+        let _ = self.load_function_file(name)?;
+        Ok(())
+    }
+
+    /// Parse a `.m` file and absorb its definitions: a top-level
+    /// `classdef` registers the class (sibling `function`s fill its
+    /// bodiless signatures and hoist as helpers); a plain file hoists
+    /// its functions. Files inside `@Class/` also register the class
+    /// name so `class()`-made objects get dispatch.
+    fn absorb_file(&mut self, file: &std::path::Path, name: &str) -> Result<bool, LangError> {
+        let src = read_m_source(file)?;
+        let stmts = crate::parser::parse(&src).map_err(|mut e| {
+            e.message = format!("{}: {}", file.display(), e.message);
+            e
+        })?;
+        // `@Class/…` — mark the class known even when this file is only
+        // a method or an old-style `class(s,'Name')` constructor.
+        if let Some(cn) = file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|n| n.strip_prefix('@')) {
+            self.classes.entry(cn.to_string()).or_default();
+        }
+        self.hoist_functions(&stmts, &file.display().to_string());
+        Ok(self.funcs.contains_key(name) || self.classes.contains_key(name))
+    }
+
+    /// The class plus its resolvable superclasses, ancestors first.
+    /// Unknown superclasses (`handle`, builtin types, missing files) end
+    /// the walk.
+    fn class_chain(&mut self, name: &str) -> Result<Vec<ClassDef>, LangError> {
+        let mut chain = Vec::new();
+        let mut cur = Some(name.to_string());
+        let mut hops = 0usize;
+        while let Some(cn) = cur {
+            hops += 1;
+            if hops > 32 {
+                return Err(LangError::new("class hierarchy too deep (cyclic superclasses?)", 0));
+            }
+            self.ensure_loaded(&cn)?;
+            let Some(def) = self.classes.get(&cn).cloned() else { break };
+            cur = def.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string());
+            chain.push(def);
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// `isa(obj, 'name')` — the class itself or any ancestor along the
+    /// resolvable superclass chain ('handle' included).
+    fn is_a(&mut self, class: &str, target: &str) -> Result<bool, LangError> {
+        if class == target {
+            return Ok(true);
+        }
+        let chain = self.class_chain(class)?;
+        Ok(chain.iter().any(|d| d.supers.iter().any(|s| s == target || s.rsplit('.').next().unwrap_or(s) == target)))
+    }
+
+    /// `Name(args)` on a classdef: apply inherited-then-own property
+    /// defaults (later entries overwrite), pre-bind the object to the
+    /// ctor's first output, run the ctor method when one exists.
+    fn construct_object(&mut self, name: &str, argv: Vec<Value>) -> Result<Value, LangError> {
+        let chain = self.class_chain(name)?;
+        let mut sa = StructArray::new();
+        for def in &chain {
+            for (pname, dexpr) in &def.props {
+                let v = match dexpr {
+                    Some(e) => self.eval(e)?,
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                };
+                sa.set_field(0, pname, v)?;
+            }
+        }
+        // `classdef X < handle` (or inheriting one) shares its property
+        // storage — writes inside methods land on the caller's object.
+        let handle = chain.iter().any(|d| d.supers.iter().any(|s| s == "handle"));
+        let obj = Value::Object(MObject::new(name.to_string(), sa, handle));
+        let Some(ctor) = self.find_method(name, name)? else { return Ok(obj) };
+        let outs = self.call_def(name, &ctor, argv, 1, Some(obj.clone()))?;
+        Ok(outs.into_iter().next().unwrap_or(obj))
+    }
+
+    /// Resolve `method` on `class`: `methods`-block functions, then
+    /// `@class/method.m` files, then the same on each superclass
+    /// (first-declared chain).
+    fn find_method(&mut self, class: &str, method: &str) -> Result<Option<FuncDef>, LangError> {
+        let mut cur = Some(class.to_string());
+        let mut hops = 0usize;
+        while let Some(cn) = cur {
+            hops += 1;
+            if hops > 32 {
+                return Err(LangError::new("class hierarchy too deep (cyclic superclasses?)", 0));
+            }
+            self.ensure_loaded(&cn)?;
+            let def = self.classes.get(&cn).cloned();
+            if let Some(d) = &def {
+                if let Some(m) = d.methods.get(method) {
+                    return Ok(Some(m.clone()));
+                }
+            }
+            if let Some(m) = self.load_at_dir_method(&cn, method)? {
+                return Ok(Some(m));
+            }
+            cur = def.and_then(|d| d.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()));
+        }
+        Ok(None)
+    }
+
+    /// `@class/method.m` on the search path → the method's `FuncDef`
+    /// (cached; the file's functions also hoist like any function file).
+    fn load_at_dir_method(&mut self, class: &str, method: &str) -> Result<Option<FuncDef>, LangError> {
+        let key = (class.to_string(), method.to_string());
+        if let Some(d) = self.method_cache.get(&key) {
+            return Ok(Some(d.clone()));
+        }
+        for dir in self.paths.clone() {
+            let f = dir.join(format!("@{class}")).join(format!("{method}.m"));
+            if f.is_file() {
+                // @dir methods are class-private: absorb, lift the def
+                // into the cache, then restore the funcs slot so the method can
+                // never shadow a same-named global for non-object calls.
+                let old = self.funcs.get(method).cloned();
+                self.absorb_file(&f, method)?;
+                let d = self.funcs.get(method).cloned();
+                match old {
+                    Some(prev) => {
+                        self.funcs.insert(method.to_string(), prev);
+                    }
+                    None => {
+                        self.funcs.remove(method);
+                    }
+                }
+                if let Some(d) = d {
+                    self.method_cache.insert(key, d.clone());
+                    return Ok(Some(d));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Cheap gate for method dispatch: true when `name` is a
+    /// methods-block function/signature of a known class or an `@dir`
+    /// file — guards the speculative argument evaluation in `f(obj,…)`.
+    fn may_be_method(&self, name: &str) -> bool {
+        if self.classes.values().any(|d| d.methods.contains_key(name) || d.sigs.contains_key(name)) {
+            return true;
+        }
+        self.classes.keys().any(|c| self.paths.iter().any(|d| d.join(format!("@{c}")).join(format!("{name}.m")).is_file()))
+    }
+
+    /// `obj.name` — property first, then `Class.enum_member`, then a
+    /// zero-extra-arg method call (`obj.m` invokes `m`).
+    fn object_dot(&mut self, o: &MObject, name: &str) -> Result<Option<Value>, LangError> {
+        if let Some(v) = o.prop(name) {
+            return Ok(Some(v));
+        }
+        if let Some(v) = self.enum_value(&o.class_name, name)? {
+            return Ok(Some(v));
+        }
+        match self.find_method(&o.class_name, name)? {
+            Some(def) => {
+                let argv = if def.is_static { Vec::new() } else { vec![Value::Object(o.clone())] };
+                Ok(self.call_def(name, &def, argv, 1, None)?.into_iter().next())
+            }
+            None => Err(LangError::new(format!("'{name}' is not a property, enumeration member or method of class '{}'", o.class_name), 0)),
+        }
+    }
+
+    /// `Class.member` — evaluate a class's `enumeration` member.
+    fn enum_value(&mut self, class: &str, member: &str) -> Result<Option<Value>, LangError> {
+        self.ensure_loaded(class)?;
+        let Some(def) = self.classes.get(class).cloned() else { return Ok(None) };
+        for (n, e) in &def.enums {
+            if n == member {
+                return Ok(Some(match e {
+                    Some(x) => self.eval(x)?,
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `obj@Super(args)` / `name@Super(obj,…)` / `obj.name@Super(…)` —
+    /// explicit superclass dispatch. The ctor form pre-binds the object
+    /// to the superclass ctor's first output (MATLAB semantics).
+    fn super_call(&mut self, callee: &Expr, sup: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
+        let sname = sup.rsplit('.').next().unwrap_or(sup).to_string();
+        match callee {
+            // `obj@Super(args)` — run the superclass constructor on the
+            // object bound to `obj`.
+            Expr::Ident(n) if matches!(self.var_get(n), Some(Value::Object(_))) => {
+                let obj = match self.var_get(n) {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("internal: object binding changed", 0)),
+                };
+                let argv = self.eval_args(args)?;
+                self.super_ctor(&sname, obj, argv).map(Some)
+            }
+            // `obj.name@Super(args)` — the superclass's version of `name`
+            // invoked on the object.
+            Expr::Field(b, mname) => {
+                let bv = self.eval(b)?;
+                let mut argv = match bv {
+                    v @ Value::Object(_) => vec![v],
+                    _ => Vec::new(),
+                };
+                argv.extend(self.eval_args(args)?);
+                let def = self.find_method(&sname, mname)?.ok_or_else(|| LangError::new(format!("class '{sup}' has no method '{mname}'"), 0))?;
+                if def.is_static && !argv.is_empty() {
+                    argv.remove(0);
+                }
+                Ok(self.call_def(mname, &def, argv, 1, None)?.into_iter().next())
+            }
+            // `name@Super(obj, args)` — superclass's `name` on the object
+            // passed as the first argument (`char@Camera(c)`).
+            Expr::Ident(mname) => {
+                let argv = self.eval_args(args)?;
+                let def = self.find_method(&sname, mname)?.ok_or_else(|| LangError::new(format!("class '{sup}' has no method '{mname}'"), 0))?;
+                Ok(self.call_def(mname, &def, argv, 1, None)?.into_iter().next())
+            }
+            _ => Err(LangError::new("'@' superclass syntax needs an object or method name on the left", 0)),
+        }
+    }
+
+    /// `obj@Super(args)` — run `Super`'s constructor method on `obj`,
+    /// pre-bound to the ctor's first output. Builtin/abstract supers
+    /// (`handle`, numeric classes) are no-ops; a class with no ctor
+    /// method is too.
+    fn super_ctor(&mut self, sname: &str, obj: MObject, argv: Vec<Value>) -> Result<Value, LangError> {
+        self.ensure_loaded(sname)?;
+        if !self.classes.contains_key(sname) {
+            const BUILTIN_TYPES: &[&str] = &[
+                "handle",
+                "double",
+                "single",
+                "logical",
+                "char",
+                "cell",
+                "struct",
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+                "int64",
+                "uint64",
+                "function_handle",
+            ];
+            if BUILTIN_TYPES.contains(&sname) {
+                return Ok(Value::Object(obj));
+            }
+            return Err(LangError::new(format!("superclass '{sname}' is not defined"), 0));
+        }
+        match self.find_method(sname, sname)? {
+            Some(def) => {
+                let outs = self.call_def(sname, &def, argv, 1, Some(Value::Object(obj)))?;
+                outs.into_iter().next().ok_or_else(|| LangError::new(format!("constructor '{sname}' produced no object"), 0))
+            }
+            None => Ok(Value::Object(obj)),
+        }
+    }
+
+    /// Binary op with an object operand → the class's `plus`/`eq`/…
+    /// overload (dominant-argument rule: the object's class wins).
+    fn object_binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, LangError> {
+        let mname = match op {
+            BinOp::Add => "plus",
+            BinOp::Sub => "minus",
+            BinOp::Mul => "mtimes",
+            BinOp::ElemMul => "times",
+            BinOp::Div => "mrdivide",
+            BinOp::ElemDiv => "rdivide",
+            BinOp::Backslash => "mldivide",
+            BinOp::Pow => "mpower",
+            BinOp::ElemPow => "power",
+            BinOp::Eq => "eq",
+            BinOp::Neq => "ne",
+            BinOp::Lt => "lt",
+            BinOp::Le => "le",
+            BinOp::Gt => "gt",
+            BinOp::Ge => "ge",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::ScAnd | BinOp::ScOr => return Err(LangError::new("internal: short-circuit handled in eval", 0)),
+        };
+        let cname = match (&a, &b) {
+            (Value::Object(o), _) => o.class_name.clone(),
+            (_, Value::Object(o)) => o.class_name.clone(),
+            _ => String::new(),
+        };
+        match self.find_method(&cname, mname)? {
+            Some(def) => self
+                .call_def(mname, &def, vec![a, b], 1, None)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| LangError::new(format!("operator '{mname}' produced no value"), 0)),
+            None => Err(LangError::new(format!("operator is not defined for class '{cname}' (no '{mname}' method)"), 0)),
+        }
+    }
+
+    /// `[a b]`/`[a; b]` over objects → `horzcat`/`vertcat` overloads.
+    fn object_cat(&mut self, a: Value, b: Value, mname: &str) -> Result<Value, LangError> {
+        let cname = match (&a, &b) {
+            (Value::Object(o), _) => o.class_name.clone(),
+            (_, Value::Object(o)) => o.class_name.clone(),
+            _ => String::new(),
+        };
+        match self.find_method(&cname, mname)? {
+            Some(def) => self
+                .call_def(mname, &def, vec![a, b], 1, None)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| LangError::new("concatenation produced no value", 0)),
+            None => Err(LangError::new(format!("'[…]' concatenation is not defined for class '{cname}' (no '{mname}' method)"), 0)),
+        }
     }
 
     /// Call a registered function: evaluate args, run its body in a fresh
@@ -6328,19 +7026,42 @@ impl Session {
     /// `call_function` with pre-evaluated argument values — used by
     /// `feval`/function-handle dispatch where args arrive as `Value`s.
     fn call_function_argv(&mut self, name: &str, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
-        let def = self.funcs.get(name).cloned().ok_or_else(|| LangError::new(format!("unknown function '{name}'"), 0))?;
+        match self.funcs.get(name).cloned() {
+            Some(def) => self.call_def(name, &def, argv, nargout, None),
+            // `Name(args)` where Name is a classdef — construct an instance.
+            None if self.classes.contains_key(name) => {
+                let obj = self.construct_object(name, argv)?;
+                Ok(vec![obj])
+            }
+            None => Err(LangError::new(format!("unknown function '{name}'"), 0)),
+        }
+    }
+
+    /// Depth-checked call of a resolved `FuncDef` — shared by plain
+    /// functions and class methods. `prebound` pre-assigns the first
+    /// output variable — how `obj@Super` and constructors get the
+    /// pre-created object (MATLAB: the output object exists, property
+    /// defaults applied, before the constructor body's first line).
+    fn call_def(&mut self, name: &str, def: &FuncDef, argv: Vec<Value>, nargout: usize, prebound: Option<Value>) -> Result<Vec<Value>, LangError> {
         if self.call_depth >= MAX_CALL_DEPTH {
             return Err(LangError::new("call depth limit exceeded (runaway recursion?)", 0));
         }
         self.call_depth += 1;
         // On early return the depth must still be restored — route through
         // a scope guard pattern: compute, then decrement before `?`.
-        let result = self.call_function_argv_inner(name, &def, argv, nargout);
+        let result = self.call_function_argv_inner(name, def, argv, nargout, prebound);
         self.call_depth = self.call_depth.saturating_sub(1);
         result
     }
 
-    fn call_function_argv_inner(&mut self, name: &str, def: &FuncDef, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
+    fn call_function_argv_inner(
+        &mut self,
+        name: &str,
+        def: &FuncDef,
+        argv: Vec<Value>,
+        nargout: usize,
+        prebound: Option<Value>,
+    ) -> Result<Vec<Value>, LangError> {
         // Fresh local scope: caller workspace is fully swapped out, and
         // `global`/`persistent` declarations reset — M-code scopes them
         // per function (each function re-declares the names it shares).
@@ -6362,6 +7083,13 @@ impl Session {
             // `varargin` is a 1×n cell of the extra arguments.
             let extras: Vec<Value> = argv.iter().skip(fixed).cloned().collect();
             self.vars.insert("varargin".to_string(), Value::Cell(CellArray::row(extras)));
+        }
+        // `obj@Super`/ctor pre-bound output: the object exists (property
+        // defaults applied) before the constructor body's first line.
+        if let (Some(v), Some(o)) = (prebound, def.outputs.first()) {
+            if o != "~" {
+                self.vars.insert(o.clone(), v);
+            }
         }
 
         // Function-body echoes (unsuppressed assigns, disp) accumulate in the
@@ -8199,6 +8927,37 @@ impl Session {
                 Ok(vec![])
             }
             "class" => {
+                // `class(s, 'name' [,parent])` — old-style class
+                // constructor (objects live in `@name/` method dirs).
+                if v.len() >= 2 {
+                    let cname = match v.get(1) {
+                        Some(Value::Str(s)) => s.clone(),
+                        _ => return Err(LangError::new("class needs a class-name string", 0)),
+                    };
+                    let mut sa = match v.first() {
+                        Some(Value::Struct(m)) => m.clone(),
+                        Some(Value::Object(o)) => o.props_map(),
+                        _ => return Err(LangError::new("class needs a struct as its first argument", 0)),
+                    };
+                    if let Some(Value::Object(p)) = v.get(2) {
+                        // Optional parent object — its properties are the
+                        // base; the child's own fields win, its class
+                        // becomes a superclass.
+                        let mut base = p.props_map();
+                        for f in sa.field_names() {
+                            if let Some(val) = sa.field_at(0, &f) {
+                                let _ = base.set_field(0, &f, val.clone());
+                            }
+                        }
+                        sa = base;
+                        let d = self.classes.entry(cname.clone()).or_default();
+                        if !d.supers.contains(&p.class_name) {
+                            d.supers.push(p.class_name.clone());
+                        }
+                    }
+                    self.classes.entry(cname.clone()).or_default();
+                    return Ok(vec![Value::Object(MObject::owned(cname, sa))]);
+                }
                 let s = match v.first() {
                     Some(Value::Num(_)) | Some(Value::Mat(_)) => "double",
                     Some(Value::Cplx(_)) => "double",
@@ -8206,6 +8965,7 @@ impl Session {
                     Some(Value::Str(_)) => "char",
                     Some(Value::Cell(_)) => "cell",
                     Some(Value::Struct(_)) => "struct",
+                    Some(Value::Object(o)) => return Ok(vec![Value::Str(o.class_name.clone())]),
                     Some(Value::Func(_)) => "function_handle",
                     None => "unknown",
                 };
@@ -9853,24 +10613,30 @@ impl Session {
             // imaginary part — auto-demoted Cplx are real again.
             "isreal" => matches!(first, Some(x) if !matches!(x, Value::Cplx(m) if !m.is_real())),
             "ischar" => matches!(first, Some(Value::Str(_))),
+            "isobject" => matches!(first, Some(Value::Object(_))),
             "islogical" => matches!(first, Some(x) if x.to_matrix().map(|m| m.data().iter().all(|&v| v == 0.0 || v == 1.0)).unwrap_or(false)),
             "isa" => {
                 let cls = match v.get(1) {
-                    Some(Value::Str(s)) => s.as_str(),
-                    _ => "",
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => String::new(),
                 };
-                let actual = match first {
-                    Some(Value::Num(_)) | Some(Value::Mat(_)) => "double",
-                    // Complex values class as `double` with `isreal` == 0.
-                    Some(Value::Cplx(_)) => "double",
-                    Some(Value::Sparse(_)) => "double",
-                    Some(Value::Str(_)) => "char",
-                    Some(Value::Cell(_)) => "cell",
-                    Some(Value::Struct(_)) => "struct",
-                    Some(Value::Func(_)) => "function_handle",
-                    None => "",
-                };
-                cls == actual || cls == "numeric" && actual == "double"
+                if let Some(Value::Object(o)) = first {
+                    // Class name or any ancestor — 'handle' included.
+                    self.is_a(&o.class_name.clone(), &cls)?
+                } else {
+                    let actual = match first {
+                        Some(Value::Num(_)) | Some(Value::Mat(_)) => "double",
+                        // Complex values class as `double` with `isreal` == 0.
+                        Some(Value::Cplx(_)) => "double",
+                        Some(Value::Sparse(_)) => "double",
+                        Some(Value::Str(_)) => "char",
+                        Some(Value::Cell(_)) => "cell",
+                        Some(Value::Struct(_)) => "struct",
+                        Some(Value::Func(_)) => "function_handle",
+                        _ => "",
+                    };
+                    cls == actual || cls == "numeric" && actual == "double"
+                }
             }
             "isequal" | "isequaln" => {
                 let mut eq = v.len() >= 2;
@@ -9888,6 +10654,11 @@ impl Session {
                             }
                         }
                         (Some(Value::Struct(x)), Some(Value::Struct(y))) => {
+                            if x != y {
+                                eq = false;
+                            }
+                        }
+                        (Some(Value::Object(x)), Some(Value::Object(y))) => {
                             if x != y {
                                 eq = false;
                             }
@@ -10234,6 +11005,7 @@ impl Session {
                         }
                         Value::Cell(_) => return Err(LangError::new(format!("cannot save cell array '{n}' to an ASCII file"), 0)),
                         Value::Struct(_) => return Err(LangError::new(format!("cannot save struct '{n}' to an ASCII file"), 0)),
+                        Value::Object(_) => return Err(LangError::new(format!("cannot save object '{n}' to an ASCII file"), 0)),
                         Value::Func(_) => return Err(LangError::new(format!("cannot save function handle '{n}' to an ASCII file"), 0)),
                     }
                 }
@@ -10833,6 +11605,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Struct(x), Value::Struct(y)) => x == y,
+        (Value::Object(x), Value::Object(y)) => x == y,
         _ => {
             // Complex either side compares elementwise on re+im.
             if matches!(a, Value::Cplx(_)) || matches!(b, Value::Cplx(_)) {
@@ -11333,6 +12106,9 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "celldisp",
     "struct",
     "isstruct",
+    "isobject",
+    "methods",
+    "properties",
     "fieldnames",
     "isfield",
     "rmfield",
@@ -12055,6 +12831,12 @@ fn expr_idents(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
             }
             out.extend(inner);
         }
+        Expr::SuperCall(c, _, args) => {
+            expr_idents(c, out);
+            for a in args {
+                expr_idents(a, out);
+            }
+        }
         Expr::Num(_) | Expr::CNum(_) | Expr::Str(_) | Expr::Colon | Expr::End | Expr::FuncRef(_) => {}
     }
 }
@@ -12648,6 +13430,7 @@ pub fn describe(v: &Value) -> String {
         Value::Str(s) => format!("1x{} char", s.chars().count()),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
+        Value::Object(o) => format!("1x1 {}", o.class_name),
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(_) => "1x1 function_handle".into(),
     }
@@ -12671,6 +13454,7 @@ impl Scalar for Value {
             Value::Str(_) => Err(LangError::new("expected a scalar, got a string", 0)),
             Value::Cell(_) => Err(LangError::new("expected a scalar, got a cell array", 0)),
             Value::Struct(_) => Err(LangError::new("expected a scalar, got a struct", 0)),
+            Value::Object(_) => Err(LangError::new("expected a scalar, got an object", 0)),
             Value::Func(_) => Err(LangError::new("expected a scalar, got a function handle", 0)),
             // A 1x1 sparse reads as its stored value (0 when empty).
             Value::Sparse(s) => {
@@ -12798,6 +13582,7 @@ fn expr_text(e: &Expr) -> String {
         Expr::Transpose(e, conj) => format!("{}{}", pexpr(e), if *conj { "'" } else { ".'" }),
         Expr::FuncRef(n) => format!("@{n}"),
         Expr::AnonFunc(params, body) => format!("@({}){}", params.join(","), expr_text(body)),
+        Expr::SuperCall(c, s, args) => format!("{}@{}({})", pexpr(c), s, expr_text_args(args)),
     }
 }
 
@@ -12843,6 +13628,7 @@ fn fmt_cell_item(v: &Value, long: bool) -> String {
         Value::Str(s) => format!("'{s}'"),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
+        Value::Object(o) => format!("1x1 {}", o.class_name),
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(h) => func_text(h),
     }
@@ -12880,6 +13666,16 @@ pub fn fmt_value(v: &Value, long: bool) -> impl fmt::Display + '_ {
                     }
                     for ((r, c), v) in s.entries() {
                         writeln!(f, "   ({},{}) {:>12}", r + 1, c + 1, fmt_num(v, self.1))?;
+                    }
+                    Ok(())
+                }
+                Value::Object(o) => {
+                    // `Foo` object with properties: — class tag + field list.
+                    let props = o.props_map();
+                    writeln!(f, "   {} object with properties:", o.class_name)?;
+                    for name in props.field_names() {
+                        let val = props.field_at(0, &name).cloned().unwrap_or(Value::Mat(Matrix::zeros(0, 0)));
+                        writeln!(f, "       {name}: {}", fmt_cell_item(&val, self.1))?;
                     }
                     Ok(())
                 }
@@ -12996,6 +13792,7 @@ fn split_format_args(v: &[Value]) -> Result<(String, Vec<FmtArg>), LangError> {
             Value::Str(s) => args.push(FmtArg::Txt(s.clone())),
             Value::Cell(c) => args.push(FmtArg::Txt(format!("{}x{} cell", c.shape().0, c.shape().1))),
             Value::Struct(s) => args.push(FmtArg::Txt(format!("{}x{} struct", s.rows(), s.cols()))),
+            Value::Object(o) => args.push(FmtArg::Txt(format!("1x1 {}", o.class_name))),
             Value::Sparse(s) => args.extend(s.full().data().iter().map(|&x| FmtArg::Num(x))),
             Value::Func(h) => args.push(FmtArg::Txt(func_text(h))),
         }
@@ -15758,5 +16555,342 @@ legend('sig'); grid on; saveas('{f}')"
         let mut s = Session::new();
         s.run("a = argv(); n = numel(a);").unwrap();
         assert_eq!(s.get("n"), Some(&Value::Num(0.0)));
+    }
+
+    #[test]
+    fn classdef_ctor_props_methods() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Counter
+    properties
+        value = 0
+        tag = 'c'
+    end
+    methods
+        function obj = Counter(v)
+            if nargin >= 1
+                obj.value = v;
+            end
+        end
+        function y = get(obj)
+            y = obj.value;
+        end
+        function obj = bump(obj, k)
+            obj.value = obj.value + k;
+        end
+    end
+end",
+        )
+        .unwrap();
+        // Constructor + property read.
+        s.run("c = Counter(5); a = c.value;").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(5.0)));
+        // Property write.
+        s.run("c.value = 7; b = c.value;").unwrap();
+        assert_eq!(s.get("b"), Some(&Value::Num(7.0)));
+        // Dot-call and function-first method forms both dispatch.
+        s.run("d = c.get(); e = get(c);").unwrap();
+        assert_eq!(s.get("d"), Some(&Value::Num(7.0)));
+        assert_eq!(s.get("e"), Some(&Value::Num(7.0)));
+        // Value semantics: a mutating method must be re-assigned.
+        s.run("c2 = c.bump(3); f = c2.value; g = c.value;").unwrap();
+        assert_eq!(s.get("f"), Some(&Value::Num(10.0)));
+        assert_eq!(s.get("g"), Some(&Value::Num(7.0)));
+        // class / isa / isobject.
+        s.run("n = class(c); t1 = isa(c,'Counter'); t2 = isa(c,'Nope'); t3 = isobject(c); t4 = isobject(3);").unwrap();
+        assert_eq!(s.get("n"), Some(&Value::Str("Counter".into())));
+        assert_eq!(s.get("t1"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("t2"), Some(&Value::Num(0.0)));
+        assert_eq!(s.get("t3"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("t4"), Some(&Value::Num(0.0)));
+    }
+
+    #[test]
+    fn classdef_attributes_and_sections() {
+        let mut s = Session::new();
+        // Attribute lists in every form parse; `methods (Static)` drops
+        // the implicit object argument.
+        s.run(
+            "classdef Att < handle
+    properties (Access = private, Constant = false)
+        a = 1
+        b
+    end
+    properties (SetAccess = protected, GetAccess = public, Dependent)
+        c = 2
+    end
+    methods ( Access = public , Static = false , Abstract = false )
+        function obj = Att()
+            obj.a = 1;
+        end
+    end
+    methods (Static)
+        function y = twice(x)
+            y = 2 * x;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("o = Att(); v = o.c; w = o.twice(4);").unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("w"), Some(&Value::Num(8.0)));
+        // `b` had no default — reads back as the empty matrix.
+        s.run("e = isempty(o.b);").unwrap();
+        assert_eq!(s.get("e"), Some(&Value::Num(1.0)));
+    }
+
+    #[test]
+    fn classdef_inheritance_and_super_ctor() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Base
+    properties
+        x = 1
+    end
+    methods
+        function obj = Base(v)
+            if nargin >= 1
+                obj.x = v;
+            end
+        end
+        function y = id(obj)
+            y = obj.x * 10;
+        end
+    end
+end
+classdef Kid < Base
+    properties
+        y = 2
+    end
+    methods
+        function obj = Kid(v)
+            obj = obj@Base(v);
+            obj.y = obj.y + 1;
+        end
+    end
+end",
+        )
+        .unwrap();
+        // Superclass ctor ran on the subclass object; inherited method
+        // and inherited property both work.
+        s.run("k = Kid(3); a = k.x; b = k.y; c = k.id();").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("c"), Some(&Value::Num(30.0)));
+        s.run("t = isa(k,'Base'); u = isa(k,'Kid');").unwrap();
+        assert_eq!(s.get("t"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("u"), Some(&Value::Num(1.0)));
+    }
+
+    #[test]
+    fn classdef_super_method_call() {
+        let mut s = Session::new();
+        s.run(
+            "classdef A1
+    methods
+        function y = f(obj)
+            y = 11;
+        end
+    end
+end
+classdef B1 < A1
+    methods
+        function y = f(obj)
+            y = f@A1(obj) + 1;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("b = B1(); v = b.f();").unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(12.0)));
+    }
+
+    #[test]
+    fn classdef_handle_shares_state() {
+        let mut s = Session::new();
+        s.run(
+            "classdef H < handle
+    properties
+        n = 0
+    end
+    methods
+        function obj = H(v)
+            obj.n = v;
+        end
+        function bump(obj)
+            obj.n = obj.n + 1;
+        end
+    end
+end",
+        )
+        .unwrap();
+        // Handle classes write through — no re-assignment needed.
+        s.run("h = H(1); h.bump(); h.bump(); a = h.n;").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(3.0)));
+        // A copy is the same underlying object.
+        s.run("h2 = h; h2.n = 9; b = h.n;").unwrap();
+        assert_eq!(s.get("b"), Some(&Value::Num(9.0)));
+        s.run("t = isa(h,'handle');").unwrap();
+        assert_eq!(s.get("t"), Some(&Value::Num(1.0)));
+    }
+
+    #[test]
+    fn classdef_value_semantics() {
+        let mut s = Session::new();
+        s.run(
+            "classdef P
+    properties
+        x = 0
+    end
+    methods
+        function obj = P(v)
+            if nargin
+                obj.x = v;
+            end
+        end
+        function setx(obj, v)
+            obj.x = v;
+        end
+    end
+end",
+        )
+        .unwrap();
+        // Value classes: mutation inside a method does not leak without
+        // re-assigning the returned object…
+        s.run("p = P(1); p.setx(9); a = p.x;").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
+        // …and a plain assignment copies.
+        s.run("p2 = p; p2.x = 5; b = p.x;").unwrap();
+        assert_eq!(s.get("b"), Some(&Value::Num(1.0)));
+    }
+
+    #[test]
+    fn classdef_enumeration() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Col
+    enumeration
+        red (1)
+        blue (2)
+    end
+end",
+        )
+        .unwrap();
+        // `Class.member` evaluates the member's backing value.
+        s.run("a = Col.red; b = Col.blue;").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(2.0)));
+    }
+
+    #[test]
+    fn classdef_operator_overload() {
+        let mut s = Session::new();
+        s.run(
+            "classdef V
+    properties
+        x = 0
+    end
+    methods
+        function obj = V(v)
+            if nargin
+                obj.x = v;
+            end
+        end
+        function r = plus(a, b)
+            r = a.x + b.x;
+        end
+        function r = eq(a, b)
+            r = a.x == b.x;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("a = V(2); b = V(3); s = a + b; t = (a == V(2));").unwrap();
+        assert_eq!(s.get("s"), Some(&Value::Num(5.0)));
+        assert_eq!(s.get("t"), Some(&Value::Num(1.0)));
+    }
+
+    #[test]
+    fn classdef_at_dir_dispatch() {
+        let dir = std::env::temp_dir().join(format!("matcraft_atdir_{}", std::process::id()));
+        let cdir = dir.join("@Widget");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(
+            cdir.join("Widget.m"),
+            "classdef Widget\n properties\n  x = 0\n end\n methods\n  function obj = Widget(v)\n   if nargin\n    obj.x = v;\n   end\n  end\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(cdir.join("twice.m"), "function y = twice(obj)\ny = obj.x * 2;\nend\n").unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        // `Widget` loads as a class from `@Widget/Widget.m`; `twice` is a
+        // method file that stays class-private.
+        s.run("w = Widget(21); a = twice(w); b = w.twice();").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(42.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(42.0)));
+        // The @dir method does NOT shadow a same-named global function.
+        std::fs::write(dir.join("twice.m"), "function y = twice(x)\ny = x + 100;\nend\n").unwrap();
+        s.run("c = twice(1);").unwrap();
+        assert_eq!(s.get("c"), Some(&Value::Num(101.0)));
+        s.run("d = isa(w,'Widget'); e = class(w);").unwrap();
+        assert_eq!(s.get("d"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("e"), Some(&Value::Str("Widget".into())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classdef_methods_properties_builtins() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Mp
+    properties
+        a = 1
+        b = 2
+    end
+    methods
+        function obj = Mp()
+        end
+        function y = geta(obj)
+            y = obj.a;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("o = Mp(); m = methods(o); p = properties(o);").unwrap();
+        if let Some(Value::Cell(m)) = s.get("m") {
+            let names: Vec<&str> = (0..m.numel())
+                .filter_map(|i| match m.get_linear(i) {
+                    Some(Value::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"Mp") && names.contains(&"geta"));
+        } else {
+            panic!("methods(o) is not a cell");
+        }
+        if let Some(Value::Cell(p)) = s.get("p") {
+            let names: Vec<&str> = (0..p.numel())
+                .filter_map(|i| match p.get_linear(i) {
+                    Some(Value::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"a") && names.contains(&"b"));
+        } else {
+            panic!("properties(o) is not a cell");
+        }
+        // fieldnames / get / set on objects.
+        s.run("f = fieldnames(o); v = get(o,'a'); o = set(o,'b',9); w = o.b;").unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("w"), Some(&Value::Num(9.0)));
+        if let Some(Value::Cell(f)) = s.get("f") {
+            assert_eq!(f.numel(), 2);
+        } else {
+            panic!("fieldnames(o) is not a cell");
+        }
     }
 }

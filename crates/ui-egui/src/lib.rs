@@ -1093,6 +1093,12 @@ impl MatApp {
                 matlang::Value::Func(_) => {
                     ui.weak("function handle — read-only (edit by reassigning the variable)");
                 }
+                matlang::Value::Object(o) => {
+                    ui.weak(format!("{} object — properties (read-only; edit via obj.prop = …):", o.class_name));
+                    for f in o.prop_names() {
+                        ui.monospace(format!("  .{f}"));
+                    }
+                }
                 // Sparse was materialized to dense above — never reached.
                 matlang::Value::Sparse(_) => {}
                 matlang::Value::Struct(m) => {

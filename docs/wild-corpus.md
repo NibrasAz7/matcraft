@@ -22,19 +22,30 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **22** |
+| clean run | — | **39** |
 | parse-ok (fdef) / parse-fail | **632 / 1** | — |
-| parse-fail (script) | — | 18 |
+| parse-fail (script) | — | 1 |
 | unknown builtin/function | 2 | 75 |
 | runtime error | 10 | 28 |
 | non-UTF-8 source | 0 | 0 |
 | **total** | 645 | 143 |
 
 - **Parser coverage: 632/645 function files (98%)** parse cleanly; the one
-  remaining function fail is a bare non-code line in a doc-style file.
-  All 18 script parse-fails are `classdef` OOP (`<` superclass,
-  `properties (Access = …)` blocks) except two genuinely-invalid files
-  (bare URL / bare changelog text). This wave's grammar work —
+  remaining function fail is a bare non-code line in a doc-style file
+  (an FEX help dump). The single script parse-fail is likewise a prose
+  doc file (`methods_of_inpaint_nans.m`).
+- **`classdef` OOP — the last major language feature — landed.** All
+  17 classdef/property-block files that failed parsing now run:
+  `classdef X < super`, `properties`/`methods`/`enumeration`/`events`
+  sections, attribute lists (`properties (Access = private)`,
+  `methods (Static)`), bodiless method signatures, and `obj@Super(…)`
+  superclass calls parse; constructors, `obj.prop` get/set, both
+  `obj.m(…)` and `m(obj,…)` call forms, value semantics, handle-class
+  shared state, single-inheritance method/property resolution, `@dir`
+  method dispatch, `isa`/`class`/`isobject`, `methods`/`properties`,
+  `fieldnames`/`get`/`set` on objects, `Class.enum` member values,
+  `display` override for `disp`, and `plus`/`eq`/`horzcat`-style
+  operator overloads all execute. The grammar wave before it —
   double-quoted strings, `#!` shebangs, Octave `end`-variants
   (`endfunction`/`endif`/…), `import pkg.*`, command args with quoted or
   punctuated words (`cpu etoc 'x'`, `FieldTrip:fileio:id`,
@@ -82,9 +93,9 @@
 
 | Rank | Failure class | Files | Status |
 | --- | --- | --- | --- |
-| 1 | Parse fails (residual) | 19 total | **Drained 93 → 19** — all that remains is `classdef` OOP (16 script files) plus two bare non-code lines and one `properties (Access = …)` block. |
+| ~~1~~ | ~~Parse fails (residual)~~ | ~~19~~ → 2 | **Drained 93 → 2** — `classdef` OOP landed; the only remaining fails are two non-code doc files (prose saved as `.m`). |
 | 2 | Missing builtins / repo-local helpers | 77 | Real builtins landed (`vline` `wmean` `filesep` `get` `set` `argv`); remainder is repo-local helpers, external toolboxes (CasADi `SX` ×12), and documented rejects. |
-| 3 | `classdef` OOP | 16 of parse-fail | Documented big lift — the last major language feature gap, now nearly the entire residual parse-fail class. |
+| ~~3~~ | ~~`classdef` OOP~~ | ~~16 of parse-fail~~ | **Resolved** — `classdef`/`properties`/`methods`/`enumeration` sections, ctors, dispatch (`obj.m(…)`, `m(obj,…)`, `obj@Super`), `@dir` methods, `isa`/`class`/`isobject`, handle classes. Deferred: object arrays, `events`, `Constant`/`Dependent`/`Abstract` enforcement, packages, `metaclass`, enumeration objects. |
 | 4 | `global`/`persistent` semantics | unknown count | **Resolved** — `global x` links a frame to the shared store, `persistent x` keeps values across calls of the same function. |
 | ~~5~~ | ~~Non-UTF-8 sources~~ | ~~36~~ | **Resolved** — `read_m_source` decodes latin-1 when UTF-8 fails; wired into CLI, engine `script.run`, `run`, function loading and the Studio editor. |
 
