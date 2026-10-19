@@ -8,6 +8,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(not(target_arch = "wasm32"))]
+mod ai;
 pub mod control;
 mod editor;
 pub mod figure;
@@ -46,13 +48,43 @@ pub struct MatLayout {
     pub show_right: bool,
     pub show_cmdwin: bool,
     pub show_editor: bool,
+    /// The AI side panel (native only — hidden on wasm regardless).
+    pub show_ai: bool,
     pub zoom: f32,
     pub cwd: String,
+    /// AI provider config — `ai::Ai::persist_json` in struct form (TOML-safe;
+    /// the token stays empty unless `remember_token` is on).
+    pub ai: AiSettings,
+}
+
+/// The `ai.*` settings that survive a restart — field names match
+/// `matcraft_engine::ai::Ai::persist_json` so the two convert directly.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// "Api" or "Local".
+    pub kind: String,
+    pub endpoint: String,
+    pub model: String,
+    /// Plain-text only when `remember_token` was on at save time.
+    pub token: String,
+    pub remember_token: bool,
+    pub lang: String,
+    pub local_id: String,
 }
 
 impl Default for MatLayout {
     fn default() -> Self {
-        MatLayout { show_left: true, show_right: true, show_cmdwin: true, show_editor: true, zoom: 1.0, cwd: String::new() }
+        MatLayout {
+            show_left: true,
+            show_right: true,
+            show_cmdwin: true,
+            show_editor: true,
+            show_ai: false,
+            zoom: 1.0,
+            cwd: String::new(),
+            ai: AiSettings::default(),
+        }
     }
 }
 
@@ -153,6 +185,9 @@ pub struct MatApp {
     show_left: bool,
     show_right: bool,
     show_cmdwin: bool,
+    /// The AI side panel (VIEW ▸ LAYOUT, or the `ai.panel` command). The
+    /// panel content is native-only; the flag exists on wasm too.
+    show_ai: bool,
     /// Command History multi-selection (entry indices).
     hist_sel: std::collections::BTreeSet<usize>,
     /// Workspace rename dialog: the variable being renamed + name field.
@@ -223,6 +258,7 @@ impl MatApp {
             show_left: true,
             show_right: true,
             show_cmdwin: true,
+            show_ai: false,
             hist_sel: std::collections::BTreeSet::new(),
             ws_rename: None,
             ws_rename_buf: String::new(),
@@ -253,14 +289,15 @@ impl MatApp {
     }
 
     /// The raised editor buffer, if the current tab is an editor.
-    fn cur_editor(&self) -> Option<&Editor> {
+    /// `pub(crate)` so the AI panel can read/apply the buffer.
+    pub(crate) fn cur_editor(&self) -> Option<&Editor> {
         match self.docs.get(self.doc_sel) {
             Some(Doc::Edit(i)) => self.editors.get(*i),
             _ => self.editors.first(),
         }
     }
 
-    fn cur_editor_mut(&mut self) -> Option<&mut Editor> {
+    pub(crate) fn cur_editor_mut(&mut self) -> Option<&mut Editor> {
         match self.docs.get(self.doc_sel) {
             Some(Doc::Edit(i)) => self.editors.get_mut(*i),
             _ => self.editors.first_mut(),
@@ -361,6 +398,13 @@ impl MatApp {
     /// Run an engine command, returning `{ok:true, …}` or `{ok:false,error}`.
     /// Marks figures dirty since commands may draw.
     pub fn exec_command(&mut self, id: &str, params: Json) -> Json {
+        // `ai.panel` is chrome, not engine work — intercepted here so the
+        // control channel's `engine.execute` can still toggle the panel.
+        #[cfg(not(target_arch = "wasm32"))]
+        if id == "ai.panel" {
+            self.show_ai = !self.show_ai;
+            return json!({"ok": true, "show_ai": self.show_ai});
+        }
         let out = match self.session.execute(id, params) {
             Ok(mut v) => {
                 if let Some(o) = v.as_object_mut() {
@@ -510,6 +554,18 @@ impl MatApp {
         }
     }
 
+    /// AI workers report over a channel — drain it each frame and keep the
+    /// repaint timer alive while a job runs so progress narration flows.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_ai(&mut self, ctx: &egui::Context) {
+        if self.session.ai_drain() {
+            ctx.request_repaint();
+        }
+        if self.session.ai_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// When a `Screenshot` event lands, answer every queued `ui.screenshot`.
     fn resolve_screenshots(&mut self, ctx: &egui::Context) {
         if self.pending_shots.is_empty() {
@@ -648,11 +704,15 @@ impl MatApp {
             ("show_right", &mut self.show_right),
             ("show_cmdwin", &mut self.show_cmdwin),
             ("show_editor", &mut self.show_editor),
+            ("show_ai", &mut self.show_ai),
         ] {
             if let Some(b) = v.get(key).and_then(Json::as_bool) {
                 *field = b;
             }
         }
+        // AI provider config — endpoint/model/lang (token only if the user
+        // opted in). A no-op stub on wasm.
+        self.session.ai_restore(&v["ai"]);
         self.want_zoom = v.get("zoom").and_then(Json::as_f64).map(|z| z as f32);
         if let Some(d) = v.get("cwd").and_then(Json::as_str) {
             let p = std::path::PathBuf::from(d);
@@ -1072,6 +1132,8 @@ impl eframe::App for MatApp {
     /// texture refresh. Runs before `ui`, also while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_control(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.drain_ai(ctx);
         self.sync_debug();
         self.resolve_screenshots(ctx);
         if self.figs_dirty {
@@ -1195,6 +1257,8 @@ impl eframe::App for MatApp {
                     right: &mut self.show_right,
                     cmdwin: &mut self.show_cmdwin,
                     editor: &mut self.show_editor,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    ai: &mut self.show_ai,
                 },
             );
             match rc {
@@ -1361,6 +1425,14 @@ impl eframe::App for MatApp {
                     }
                     None => {}
                 }
+            });
+        }
+
+        // ---- AI assistant (right side, inside the workspace column) ------
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.show_ai {
+            egui::Panel::right("ai_col").resizable(true).default_size(300.0).show(ui, |ui| {
+                ai::panel(self, ui);
             });
         }
 
@@ -1556,6 +1628,7 @@ impl eframe::App for MatApp {
                         self.show_right = true;
                         self.show_cmdwin = true;
                         self.show_editor = true;
+                        self.show_ai = false;
                         ui.ctx().set_zoom_factor(1.0);
                     }
                     ui.weak("Pane visibility lives on the VIEW tab; per-session for now.");
@@ -1685,8 +1758,10 @@ impl Drop for MatApp {
             show_right: self.show_right,
             show_cmdwin: self.show_cmdwin,
             show_editor: self.show_editor,
+            show_ai: self.show_ai,
             zoom: self.last_zoom,
             cwd: cwd.display().to_string(),
+            ai: serde_json::from_value(self.session.ai_persist()).unwrap_or_default(),
         });
         let _ = store.flush();
     }

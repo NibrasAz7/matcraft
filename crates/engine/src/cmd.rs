@@ -396,6 +396,117 @@ fn functions_list(_s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
     Ok(json!({"groups": groups}))
 }
 
+// ---- AI assistant -----------------------------------------------------------
+// Native only — craft-ai's probe/fetch don't build on wasm. Slow jobs
+// (handshake, download, load, ask, comment translation) run on a worker and
+// report through `ai.status` / `ui.state`'s `ai` section; `ai.complete` and
+// `ai.translate` are the synchronous primitives for scripts and agents.
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_status(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    Ok(s.ai().status_json())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_provider_set(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let ai = s.ai_mut();
+    if p.get("clear").and_then(Json::as_bool) == Some(true) {
+        ai.reset_provider();
+        return Ok(json!({"ok": true, "ready": false}));
+    }
+    if let Some(v) = p.get("url").and_then(Json::as_str) {
+        ai.endpoint = v.to_string();
+    }
+    if let Some(v) = p.get("model").and_then(Json::as_str) {
+        ai.model = v.to_string();
+    }
+    if let Some(v) = p.get("token").and_then(Json::as_str) {
+        ai.token = v.to_string();
+    }
+    if let Some(v) = p.get("lang").and_then(Json::as_str) {
+        ai.lang = v.to_string();
+    }
+    if let Some(b) = p.get("remember_token").and_then(Json::as_bool) {
+        ai.remember_token = b;
+    }
+    if let Some(v) = p.get("local_id").and_then(Json::as_str) {
+        ai.local_id = v.to_string();
+    }
+    // Endpoint + model present → (re)build the BYO provider.
+    if !ai.endpoint.trim().is_empty() && !ai.model.trim().is_empty() {
+        ai.configure_api();
+    }
+    Ok(json!({"ok": true, "ready": ai.ready()}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_provider_test(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    s.ai_mut().test_endpoint().map_err(EngineError::Other)?;
+    Ok(json!({"ok": true, "started": true}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_detect(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    let Some(c) = s.ai_mut().detect() else {
+        return Err(EngineError::Other("no usable cache folder on this system".into()));
+    };
+    Ok(json!({
+        "ok": true,
+        "caps": {"ram_gb": c.ram_gb, "threads": c.threads, "disk_free_gb": c.disk_free_gb, "avx2": c.avx2},
+        "suggested": craft_ai::suggest(c).map(|m| m.id),
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_models_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    Ok(json!({"models": s.ai().models_json()}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_model_download(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let id = s.ai_mut().download(p.get("id").and_then(Json::as_str)).map_err(EngineError::Other)?;
+    Ok(json!({"ok": true, "started": true, "id": id}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_model_load(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let id = s.ai_mut().load(p.get("id").and_then(Json::as_str)).map_err(EngineError::Other)?;
+    Ok(json!({"ok": true, "started": true, "id": id}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_complete(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let prompt = need_str(p, "prompt", "ai.complete")?;
+    let max_tokens = opt_usize(p, "max_tokens").map(|n| n as u32);
+    let text = s.ai_mut().complete(prompt, max_tokens).map_err(|e| EngineError::Other(e.to_string()))?;
+    Ok(json!({"ok": true, "text": text}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_ask(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let prompt = need_str(p, "prompt", "ai.ask")?.to_string();
+    let var = p.get("var").and_then(Json::as_str).map(str::to_string);
+    let max_tokens = opt_usize(p, "max_tokens").map(|n| n as u32);
+    s.ai_mut().ask(prompt, var, max_tokens).map_err(EngineError::Other)?;
+    Ok(json!({"ok": true, "started": true}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_translate(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let text = need_str(p, "text", "ai.translate")?.to_string();
+    let lang = p.get("lang").and_then(Json::as_str).map(str::to_string).unwrap_or_else(|| s.ai().lang.clone());
+    let out = s.ai_mut().translate(&text, &lang).map_err(|e| EngineError::Other(e.to_string()))?;
+    Ok(json!({"ok": true, "text": out}))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_comments_translate(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
+    let text = need_str(p, "text", "ai.comments_translate")?.to_string();
+    let lang = p.get("lang").and_then(Json::as_str).map(str::to_string);
+    s.ai_mut().translate_comments(text, lang).map_err(EngineError::Other)?;
+    Ok(json!({"ok": true, "started": true}))
+}
+
 fn engine_version(_s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
     Ok(json!({"app": "matcraft", "version": env!("CARGO_PKG_VERSION")}))
 }
@@ -436,6 +547,53 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "model.list", label: "List the loaded SimCraft model's blocks and wires", params: "{} → {blocks,wires}", run: model_list },
     CommandSpec { id: "model.get_param", label: "Read a SimCraft block's params", params: "{block} → {path,type,params}", run: model_get_param },
     CommandSpec { id: "model.set_param", label: "Set a SimCraft block param (loaded model)", params: "{block, param, value}", run: model_set_param },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.status", label: "AI provider, model and job status", params: "{} → {ready,provider,models,busy,…}", run: ai_status },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec {
+        id: "ai.provider.set",
+        label: "Configure the AI provider (BYO OpenAI-compatible endpoint)",
+        params: "{url?, token?, model?, lang?, local_id?, remember_token?, clear?} → {ready}",
+        run: ai_provider_set,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.provider.test", label: "Handshake-test the configured endpoint", params: "{} → {started}", run: ai_provider_test },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.detect", label: "Probe this PC and suggest a local model", params: "{} → {caps, suggested?}", run: ai_detect },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.models.list", label: "Curated local models with download state", params: "{} → {models}", run: ai_models_list },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec {
+        id: "ai.model.download",
+        label: "Download a local model (resumable, tokenizer included)",
+        params: "{id?} → {started}",
+        run: ai_model_download,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec {
+        id: "ai.model.load",
+        label: "Load a downloaded local model (needs the ai-local feature)",
+        params: "{id?} → {started}",
+        run: ai_model_load,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.complete", label: "One AI completion (blocks the caller)", params: "{prompt, max_tokens?} → {text}", run: ai_complete },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec {
+        id: "ai.ask",
+        label: "Ask the AI (async; answer lands in ai.status, `var` gets a workspace char)",
+        params: "{prompt, var?, max_tokens?} → {started}",
+        run: ai_ask,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec { id: "ai.translate", label: "Translate text via the AI provider", params: "{text, lang?} → {text}", run: ai_translate },
+    #[cfg(not(target_arch = "wasm32"))]
+    CommandSpec {
+        id: "ai.comments_translate",
+        label: "Translate a .m buffer's % comments only (code untouched)",
+        params: "{text, lang?} → {started}; result in ai.status.translation",
+        run: ai_comments_translate,
+    },
 ];
 
 #[cfg(test)]
@@ -570,5 +728,50 @@ mod tests {
         assert_eq!(vars["vars"].as_array().unwrap().len(), 0);
         let paths = s.execute("path.list", json!({})).unwrap();
         assert!(paths["paths"].as_array().unwrap().iter().any(|p| p == "/tmp/mymat"));
+    }
+
+    // ---- AI commands: everything must fail cleanly with no provider and
+    // make no network calls in tests. ---------------------------------
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ai_status_reports_unconfigured() {
+        let mut s = Session::new();
+        let r = s.execute("ai.status", json!({})).unwrap();
+        assert_eq!(r["ready"], json!(false));
+        assert!(r["provider"].is_null());
+        assert!(r["models"].as_array().unwrap().len() > 1);
+        assert_eq!(r["models"][0]["downloaded"], json!(false));
+        // The token never leaks into status.
+        s.execute("ai.provider.set", json!({"url": "http://x/v1", "model": "m", "token": "secret"})).unwrap();
+        assert!(!s.execute("ai.status", json!({})).unwrap().to_string().contains("secret"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ai_commands_fail_cleanly_unconfigured() {
+        let mut s = Session::new();
+        // Empty endpoint: the test refuses before touching the network.
+        s.execute("ai.provider.set", json!({"url": "", "model": ""})).unwrap();
+        assert!(s.execute("ai.provider.test", json!({})).is_err());
+        assert!(s.execute("ai.complete", json!({"prompt": "hi"})).is_err());
+        assert!(s.execute("ai.ask", json!({"prompt": "hi"})).is_err());
+        assert!(s.execute("ai.translate", json!({"text": "hi", "lang": "French"})).is_err());
+        assert!(s.execute("ai.comments_translate", json!({"text": "% hi\nx = 1"})).is_err());
+        // Bad params and unknown model ids are errors, not panics.
+        assert!(matches!(s.execute("ai.complete", json!({})), Err(EngineError::BadParams { .. })));
+        assert!(s.execute("ai.model.download", json!({"id": "nope"})).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ai_provider_set_builds_and_clears() {
+        let mut s = Session::new();
+        let r = s.execute("ai.provider.set", json!({"url": "http://localhost:11434/v1", "model": "qwen"})).unwrap();
+        assert_eq!(r["ready"], json!(true));
+        assert_eq!(s.ai_status()["ready"], json!(true));
+        let r = s.execute("ai.provider.set", json!({"clear": true})).unwrap();
+        assert_eq!(r["ready"], json!(false));
+        assert_eq!(s.ai_status()["ready"], json!(false));
     }
 }

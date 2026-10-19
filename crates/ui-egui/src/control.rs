@@ -119,6 +119,11 @@ pub fn handle(app: &mut MatApp, ctx: &egui::Context, req: ControlRequest) {
                 "figures": lang.figures().len(),
                 "currentFigure": lang.current_figure(),
                 "vars": vars,
+                // The AI panel: provider config and privacy mode, job/busy
+                // progress, and the curated model list with download state.
+                // `Null` on wasm.
+                "ai": app.session.ai_status(),
+                "aiPanel": app.show_ai,
             }));
         }
         "ui.render" => {
@@ -272,6 +277,44 @@ mod tests {
         let (req, _pending) = ControlRequest::new("ui.screenshot".to_string(), json!({}));
         handle(&mut a, &egui::Context::default(), req);
         assert_eq!(a.pending_shots.len(), 1);
+    }
+
+    /// The AI panel is reachable headlessly: `ui.state` reports its
+    /// configuration and the curated models, `ai.panel` toggles the side
+    /// panel, and the commands that would touch the network or a provider
+    /// fail cleanly when nothing is configured — no silent calls, no crash.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn control_ai_reports_state_and_drives_the_panel() {
+        let mut a = app();
+        let ai = dispatch(&mut a, "ui.state", json!({}))["ai"].clone();
+        assert_eq!(ai["ready"], json!(false), "{ai}");
+        assert!(ai["models"].as_array().unwrap_or(&Vec::new()).len() > 1, "{ai}");
+        assert_eq!(ai["models"][0]["downloaded"], json!(false), "{ai}");
+
+        // `ai.panel` toggles the side panel and reports the new state.
+        assert_eq!(dispatch(&mut a, "engine.execute", json!({"command": "ai.panel"}))["show_ai"], json!(true));
+        assert_eq!(dispatch(&mut a, "ui.state", json!({}))["aiPanel"], json!(true));
+
+        // Provider config lands in ui.state; the token never does.
+        let r = dispatch(&mut a, "engine.execute", json!({"command": "ai.provider.set", "params": {"url": "", "model": "", "token": "secret"}}));
+        assert_eq!(r["ready"], json!(false), "{r}");
+        let st = dispatch(&mut a, "ui.state", json!({}));
+        assert!(!st.to_string().contains("secret"), "{st}");
+
+        // Nothing configured: the network-touching commands refuse cleanly.
+        let r = dispatch(&mut a, "engine.execute", json!({"command": "ai.provider.test"}));
+        assert_eq!(r["ok"], json!(false), "{r}");
+        let r = dispatch(&mut a, "engine.execute", json!({"command": "ai.ask", "params": {"prompt": "hi"}}));
+        assert_eq!(r["ok"], json!(false), "{r}");
+        let r = dispatch(&mut a, "engine.execute", json!({"command": "ai.complete", "params": {"prompt": "hi"}}));
+        assert_eq!(r["ok"], json!(false), "{r}");
+
+        // Models catalogue is real even offline.
+        let r = dispatch(&mut a, "engine.execute", json!({"command": "ai.models.list"}));
+        assert!(r["models"].as_array().unwrap_or(&Vec::new()).len() > 1, "{r}");
+
+        assert_eq!(dispatch(&mut a, "engine.execute", json!({"command": "ai.panel"}))["show_ai"], json!(false));
     }
 
     #[test]

@@ -48,6 +48,10 @@ pub struct ViewFlags<'a> {
     pub right: &'a mut bool,
     pub cmdwin: &'a mut bool,
     pub editor: &'a mut bool,
+    /// The AI side panel — shown only on native (the `ai` module is
+    /// cfg-gated off on wasm, where craft-ai's probe/fetch don't build).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub ai: &'a mut bool,
 }
 
 /// MATLAB-ish palette: pale chrome, white content, MatCraft accent blue.
@@ -295,6 +299,8 @@ fn view_tab(ui: &mut egui::Ui, view: &mut ViewFlags<'_>) {
         ui.checkbox(view.right, "Workspace + History");
         ui.checkbox(view.cmdwin, "Command Window");
         ui.checkbox(view.editor, "Editor");
+        #[cfg(not(target_arch = "wasm32"))]
+        ui.checkbox(view.ai, "AI Assistant");
         None
     });
     let _ = section(ui, "ZOOM", |ui| {

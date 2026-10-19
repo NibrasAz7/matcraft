@@ -9,6 +9,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ai;
 pub mod cmd;
 
 use std::fmt;
@@ -68,16 +70,30 @@ pub struct Session {
     /// Linked SimCraft session (the `sim('model.simcraft')` compute side);
     /// `None` until a sim command runs so plain sessions pay nothing.
     sim: Option<simcraft_engine::Session>,
+    /// AI assistant state (provider config, workers, last results) — the
+    /// `ai.*` command family. Absent on wasm, where craft-ai doesn't build.
+    #[cfg(not(target_arch = "wasm32"))]
+    ai: ai::Ai,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Session { lang: matlang::Session::new(), sim: None }
+        Session {
+            lang: matlang::Session::new(),
+            sim: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            ai: ai::Ai::default(),
+        }
     }
 
     /// Deterministic RNG for reproducible runs and tests.
     pub fn with_seed(seed: u64) -> Self {
-        Session { lang: matlang::Session::with_seed(seed), sim: None }
+        Session {
+            lang: matlang::Session::with_seed(seed),
+            sim: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            ai: ai::Ai::default(),
+        }
     }
 
     /// The language session (workspace, figures, search path).
@@ -95,6 +111,69 @@ impl Session {
     pub fn sim(&mut self) -> &mut simcraft_engine::Session {
         self.sim.get_or_insert_with(simcraft_engine::Session::new)
     }
+
+    /// The AI assistant state (native only — `ai.*` commands and the panel
+    /// don't exist on wasm).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai(&self) -> &ai::Ai {
+        &self.ai
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_mut(&mut self) -> &mut ai::Ai {
+        &mut self.ai
+    }
+
+    /// `ui.state`'s `ai` section — the same payload `ai.status` returns.
+    /// `Null` on wasm (mirroring the sibling apps' pattern).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_status(&self) -> Json {
+        self.ai.status_json()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn ai_status(&self) -> Json {
+        Json::Null
+    }
+
+    /// Apply AI worker results; `ai.ask`'s `var` injection writes into the
+    /// workspace. Call once per frame — returns true when anything landed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_drain(&mut self) -> bool {
+        self.ai.drain(&mut self.lang)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn ai_drain(&mut self) -> bool {
+        false
+    }
+
+    /// True while an AI job is running — the UI repaints on a timer so
+    /// progress narration keeps flowing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_busy(&self) -> bool {
+        self.ai.busy.is_some()
+    }
+
+    /// What survives a restart — `MatLayout`'s `ai` field (see ui-egui).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_persist(&self) -> Json {
+        self.ai.persist_json()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn ai_persist(&self) -> Json {
+        Json::Null
+    }
+
+    /// Restore `ai_persist` output; malformed values are ignored.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ai_restore(&mut self, v: &Json) {
+        self.ai.restore(v);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn ai_restore(&mut self, _v: &Json) {}
 
     /// Run command `id` with JSON `params`. A panic rolls the workspace
     /// back to its pre-call state and returns an error — the session

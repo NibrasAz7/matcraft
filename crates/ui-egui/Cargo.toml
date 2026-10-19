@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Local GGUF inference for the AI panel (candle). Off by default: the
+# dependency tree is heavy; BYO endpoints and model downloads work without it.
+ai-local = ["matcraft_engine/ai-local"]
+
 [lib]
 name = "matcraft_ui_egui"
 path = "src/lib.rs"
@@ -28,4 +33,6 @@ resvg = "0.45"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-atomic = { path = "../../../craft-libs/crates/atomic" }
+# AI panel: BYO endpoints and curated model downloads (registry rendering).
+craft-ai = { path = "../../../craft-libs/crates/ai" }
 rfd = "0.17"
