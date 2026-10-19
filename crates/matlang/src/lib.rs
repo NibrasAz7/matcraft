@@ -8,12 +8,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ast;
+mod imgpng;
 pub mod interp;
 pub mod lexer;
 pub mod matfile;
 pub mod parser;
 
-pub use interp::{describe, fmt_num, fmt_value, Breakpoint, CellArray, PauseInfo, Session, Value, BUILTIN_NAMES, DEBUG_PAUSE_ID};
+pub use interp::{describe, fmt_num, fmt_value, read_m_source, Breakpoint, CellArray, PauseInfo, Session, Value, BUILTIN_NAMES, DEBUG_PAUSE_ID};
 // Re-export the numeric core types callers need to inspect `Value::Cplx`
 // without taking a direct `matcore` dependency.
 pub use matcore::{CMatrix, CNum};

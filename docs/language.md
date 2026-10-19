@@ -22,6 +22,9 @@ by observing MathWorks software.
   sparse+full arithmetic densifies.
 - `complex` — `a+bi` doubles via `i`/`j`; real values promote on contact and
   demote back when every imaginary part is zero.
+- `function_handle` — `@name` references a builtin/user function by name;
+  `@(a,b) expr` is an anonymous function whose closure snapshots the
+  defining workspace.
 - Logicals are doubles `0`/`1` (comparisons and `~` produce them).
 
 ## Statements & syntax
@@ -118,37 +121,53 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 - `varargin` collects extra inputs as a 1×n cell; `varargout` is a cell of
   extra outputs (`varargin{k}`, `varargout{k} = …`).
 - `return` exits the function early; recursion works naturally.
+- Function handles: `f = @name`, `f = @(a,b) expr`, `f = inline('expr','a','b')`;
+  call through `f(args)` or `feval(f, args)`. Anonymous bodies capture the
+  workspace at creation (by value).
 
 ## Builtin library
 
 | Group | Functions |
 | --- | --- |
-| Construction | `zeros ones eye magic rand randn randi randperm linspace logspace reshape squeeze transpose repmat diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists). `zeros`/`ones`/`rand`/`randn`/`Inf`/`NaN` take extra dims (`zeros(2,3,4)` or `zeros([2 3 4])`), `reshape` takes an N-D dims vector or extra args, `squeeze` drops singleton dims, and `cat(d,a,b)` concatenates along any dim (`cat(3,…)` stacks pages; `horzcat`/`vertcat` work on N-D operands too) |
+| Construction | `zeros ones eye magic peaks rand randn randi randperm linspace logspace reshape squeeze transpose repmat repelem diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists). `zeros`/`ones`/`rand`/`randn`/`Inf`/`NaN` take extra dims (`zeros(2,3,4)` or `zeros([2 3 4])`), `reshape` takes an N-D dims vector or extra args, `squeeze` drops singleton dims, and `cat(d,a,b)` concatenates along any dim (`cat(3,…)` stacks pages; `horzcat`/`vertcat` work on N-D operands too). `peaks(n)`/`[X,Y,Z] = peaks(n)` is the standard demo surface; `repelem(v,n)` repeats each element (scalar `n`, per-element `n`, or `[r c]` block tiling on matrices) |
 | Shape | `size numel length ndims` — `size(x)` returns the whole dims vector as a row, `size(x,d)` one dim, multi-output `[r,c,…] = size(A)` folds trailing dims into the last output; `ndims` counts stored dims (≥2) |
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); N-D arrays reduce along `dim` over the whole array (`sum(ones(2,3,4),3)` → 2×3×1) and default to the first non-singleton dim; two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
 | Running | `cumsum cumprod diff sort unique find` (`find` multi-output; `cumsum`/`cumprod`/`diff` are 2-D-only) |
-| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` |
+| Statistics | `nansum nanmean nanprod nanmin nanmax nanstd nanvar nanmedian cov prctile quantile hist histc` — `nan*` skips `NaN`s; `cov(X)`, `cov(x,y)`, `cov(X,1)`; `prctile(x,p)`/`quantile(x,q)` interpolate per column; `hist(x,n|edges)` (2nd output = centres), `histc(x,edges)` per column |
+| Sets | `ismember setdiff union intersect setxor` (`[tf,loc] = ismember(A,B)`; `'rows'`/`'legacy'` unsupported) and `sortrows` (`sortrows(M)`, `sortrows(M,cols)`, `[M,I]`), `accumarray(subs,vals)` |
+| Indexing / N-D | `sub2ind ind2sub ndgrid permute ipermute shiftdim flip bsxfun` — `permute`/`ipermute` reorder dims, `shiftdim` shifts them, `flip(A,dim)` reverses along a dim, `bsxfun(f,A,B)` applies a builtin op or handle with singleton-dim expansion |
+| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` + degree trig `sind cosd tand asind acosd atand atan2d` |
+| Bits | `bitand bitor bitxor bitshift bitget bitset bitcmp` — operands convert to `u64` (integer, non-negative, < 2^53); `bitcmp(x)`/`bitcmp(x,n)` complements the low `n` bits (default 64) |
+| Casts | `single int8 int16 int32 int64 uint16 uint32 uint64` — saturate-and-round to the target range (storage stays `f64`, so `class` still reports `double`) |
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
-| DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`) |
-| Solvers | `fzero fminsearch integral quad` — first arg is a function name string (`fzero('cos', 1)`) |
+| DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap fir1` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`; `fir1(n,wn[,type][,win])` is a windowed-sinc FIR designer) |
+| Solvers | `fzero fminsearch integral quad` — first arg is a function handle or a name string (`fzero('cos', 1)`, `integral(@(x) x.^2, 0, 1)`) |
 | Predicates | `isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isa isequal isequaln` |
-| Strings | `num2str str2double str2num strcmp strcmpi strcat upper lower strtrim strrep strfind double logical char` |
+| Strings | `num2str int2str mat2str str2double str2num strcmp strcmpi strncmp strncmpi strcat upper lower strtrim strrep strfind strtok strmatch cellstr blanks deblank str2mat double logical char` + regex `regexp regexpi regexprep` (Rust regex syntax; outputs `'start' 'end' 'matchextents' 'match' 'tokens' 'split'`, options `'once' 'ignorecase' 'matchcase'`, `regexprep` honours `$1` group refs; look-around/backrefs are unsupported) |
 | Cells | `cell iscell iscellstr cell2mat num2cell celldisp` (`num2cell(A,dim)`, `num2cell` on char) |
 | Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` |
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
 | Workspace | `who whos clear disp display format save load type assert rng normrnd` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`) |
-| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval run error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`) |
+| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval evalc run error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it) |
+| System | `version ver computer ispc isunix ismac getenv setenv system fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license optimset optimget` — `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0 |
+| UI | `input waitbar drawnow beep ishandle findobj findall ishold gca` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
-| Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`) |
+| Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`), `nargchk(lo,hi,n)` (legacy message-string form) |
+| Handles | `feval func2str str2func functions arrayfun cellfun inline lasterror` — `feval(f,…)` calls a handle or name; `arrayfun(f,A)` maps over elements (scalar outputs only); `cellfun(f,C)` maps over cells (`'UniformOutput',false` gives a cell back); `functions(f)` inspects a handle; `lasterror` returns the last error struct (`message`/`identifier`) |
+| File I/O | `fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets fscanf delete` — `[fid,msg] = fopen(name,'r|w|a[+]'[,machfmt])` (fids ≥ 3, −1 on failure, `machfmt` containing `b`/`big` = big-endian; `fopen()` lists open fids, `fclose all` closes all); `[A,count] = fread(fid[,size][,prec][,skip])` and `count = fwrite(fid,A[,prec][,skip])` with `prec` in `'uchar'(default) 'schar' 'char' 'int8'…'uint64' 'single' 'float' 'double' 'short' 'long' 'bitN'…` (`size` = `n` column, `[m n]` filled column-major, `Inf` = to EOF; `*prec`/`src=>dst` forms read as char); `fseek(fid,off,'bof|cof|eof'|-1|0|1)`, `frewind`, `feof`, `pos = ftell`, `[msg,errnum] = ferror`, `fgetl`/`fgets` a line without/with the newline, `[A,count] = fscanf(fid,fmt[,size])` scans the rest of the file like `sscanf`, `delete 'file'` |
+| Text scan | `sscanf(s,fmt[,n])` → `[vals,count]` (`%d %f %e %g %i %s %c`, `%%`, `%*x` suppression, field widths, literal text); `C = textscan(s,fmt[,n])`/`strread(s,fmt)` → 1×ncol cell of column results, `'Delimiter'` and `'HeaderLines'` params |
+| Delimited | `csvwrite dlmwrite dlmread readmatrix writematrix` — `dlmread(f[,delim][,r,c])`/`readmatrix` auto-detect the delimiter; `dlmwrite(f,m[,delim][,r,c],'-append')` pads offsets; `writematrix(m,f)` |
+| Dates | `datenum now clock etime datestr` — serial day numbers with epoch 0000-01-01; `datenum(y,m,d[,h,mi,s])`, a date-string, or an N×3/N×6 datevec matrix; `datestr(x[,fmt])` for fmt 0/1/2/13/14/15/16/21/23/26/31 |
 | Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed) |
 | Plotting | `plot scatter stem bar area stairs errorbar histogram` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column |
 | Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
-| Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
+| Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style; `image` is an alias), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
+| Image I/O | `imread imwrite im2double fspecial` — PNG only, 8-bit gray or RGB; `imread` returns doubles 0–255 (M×N gray, M×N×3 RGB), `imwrite` writes values ≤ 1 as the [0,1] range and larger values as 0–255; `im2double` scales integral 0..255/0..65535 data to [0,1]; `fspecial('average'|'gaussian'|'disk'|'laplacian'|'log'|'motion'|'prewitt'|'sobel'|'unsharp',…)` builds filter kernels |
 | 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `mesh(Z)`/`mesh(X,Y,Z)` — orthographic projection under `view` |
 | Log plots | `semilogx semilogy loglog` — nonpositive points are dropped |
 | Grids | `meshgrid` (`[X,Y] = meshgrid(x,y)`), `histcounts` (`[n,e] = histcounts(v,k)`) |
@@ -210,7 +229,12 @@ Notes:
   window yet; no `contourf`/`contour3`, no `set`/`get` on graphics
   properties, no `camlight`/`lighting`.
 - Functions get a fresh scope but not yet `nargin`-style default *outputs*
-  (unassigned output args error) or closures/function handles.
+  (unassigned output args error). Function handles exist (`@name`,
+  `@(a,b) expr`, `inline`, `str2func`/`func2str`/`functions`,
+  `feval`/`arrayfun`/`cellfun`); closures capture the workspace by value,
+  so a handle can't mutate outer variables.
+- `imread`/`imwrite` are PNG-only and `regexp` uses the Rust regex dialect
+  (no look-around or backreferences). `system` is native-only.
 - Char arrays are row-only — `char` on a multi-element cellstr needs a
   2-D char matrix, which the `Str` value can't represent yet.
 - The debugger stops at top-level statement granularity: `dbstop in f at N`

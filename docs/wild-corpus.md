@@ -1,11 +1,12 @@
-# Real-world `.m` corpus sweep — 2025-10 compatibility report
+# Real-world `.m` corpus sweep — 2026-10 compatibility report
 
 ## Method
 
-- **Corpus:** 638 `.m` files from 32 public GitHub repositories across 8 domains
+- **Corpus:** 788 `.m` files from 32 public GitHub repositories across 8 domains
   (control, finance, general/education, image, numerics, physics, signal,
-  statistics), all in repos last pushed **before 2022** (2016–2021) — so every
-  file predates 2022.
+  statistics), all in repos last pushed **before 2022** — so every file
+  predates 2022. (Regrown from the lost Oct-2025 harvest; file count rose
+  from 638 to 788.)
 - **Harvest:** GitHub repository search (`language:MATLAB pushed:<2022-01-01`),
   per-repo git-tree enumeration, `.m` files < 12 KB, directory structure
   preserved so sibling function files resolve. Corpus lives in the gitignored
@@ -21,34 +22,36 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **7** |
-| parse-ok (fdef) / parse-fail | **401 / 60** | — |
-| parse-fail (script) | — | 68 |
-| unknown builtin/function | 0 | 48 |
-| runtime error | 10 | 40 |
-| timeout (>15 s) | 0 | 4 |
-| **total** | 471 | 167 |
+| clean run | — | **20** |
+| parse-ok (fdef) / parse-fail | **557 / 48** | — |
+| parse-fail (script) | — | 35 |
+| unknown builtin/function | 2 | 65 |
+| runtime error | 9 | 16 |
+| non-UTF-8 source | 29 | 7 |
+| **total** | 645 | 143 |
 
-- **Parser coverage: 401/461 function files (87%)** parse cleanly.
-- Scripts die overwhelmingly on missing builtins first (48) or a later parse
-  wall (68) — mostly the same `@` wall the function files hit.
+- **Parser coverage: 557/616 decodable function files (90%)** parse cleanly
+  (29 files fail earlier on non-UTF-8 encoding — see below). Against the
+  previous sweep's 87%, the `@`-handle and N-D work moved most of the wall.
+- The previous #1 blocker — `@` anonymous functions and handles — is
+  **resolved**: `f = @(x) x.^2`, `@sin`, `feval`/`arrayfun`/`cellfun`/
+  `func2str`/`str2func`/`functions` all land since f623a3e.
+- N-D indexing (`x(i,j,k)`), the previous #3, is **resolved** since fbaa859:
+  `zeros(2,3,4)`, merged-tail last subscripts, `ndims`/`cat(dim)`/`squeeze`.
 - Several `unknown function` hits are repo-internal functions in sibling
-  *subdirectories* (`design_array_1d`, `ml_plot_data`, `strain_to_*`…) — these
-  need `addpath(genpath(pwd))` even in MATLAB, so they are expected failures,
-  not MatCraft gaps. `genpath` + multi-path `addpath` now work.
+  *subdirectories* (`simulationClass`, `Read_WAMIT`, `optset`, `inpaint_nans`,
+  `iread`, `plotColors`, `setSeed`…) — these need `addpath(genpath(pwd))`
+  even in MATLAB, so they are expected failures, not MatCraft gaps.
 
-## What the corpus taught us (ranked)
+## What the corpus teaches now (ranked)
 
 | Rank | Failure class | Files | Status |
 | --- | --- | --- | --- |
-| 1 | **`@` anonymous functions / function handles** | ~91 parse-fails | **the #1 blocker** — `f = @(x) x.^2`, `@sin` handles, `cellfun`/`fminsearch` args. See G31. |
-| 2 | Missing builtins | 48 scripts | Fixed this round: `deg2rad` `rad2deg` `sinc` `randperm` `normrnd` `assert` `rng` `fullfile` `genpath` `csvread` `mkdir` `eps` `Inf(n,m)` `NaN(n)` `axis` `box` `db2pow` `pow2db` `uint8` `rectpuls` `tripuls`. Remaining: `imread` (needs N-D image data), `fir1`, `chi2inv`/`gamrnd`, `fspecial`/`im2double`, `syms` (symbolic — out of scope), `urlwrite` (network). |
-| 3 | N-D indexing (`x(i,j,k)`) | 3+ | `expected 1 or 2 indices, got 3` — needs N-D arrays (G22 tail). |
-| 4 | `classdef` OOP | 2+ | `classdef Foo < handle` — documented big lift. |
-| 5 | Misc syntax | ~20 | `expected a scalar` (14 — mostly downstream of unimplemented calls), string-in-numeric contexts, command-form edge cases. |
-
-**Fixed during the sweep** (syntax): `for(i=1:n)` parenthesised loop headers;
-`cd ..`/`cd ../x` bare-`..` command arguments.
+| 1 | Missing builtins | 67 | Now the top class, but the tail is thin: only a handful are *real* builtins (`global`, `inline`, `peaks`, `fspecial`, `borders`, `ncreadatt`, `vline`, `wmean`); the rest are repo-internal helpers (expected fails). In flight this round: file I/O (`fopen`/`fread`/`fscanf`/`textscan`), regex (`regexp`/`regexprep`), stats (`prctile`/`hist`/`cov`), DSP/image (`fir1`/`peaks`/`im2double`/`imread`). |
+| 2 | Parse fails (residual) | 83 total | Mostly `classdef` OOP, `try/catch` edge forms, and exotic command syntax — the long tail after `@` handles landed. |
+| 3 | Non-UTF-8 sources | 36 | Legacy `.m` files are latin-1/cp1252, not UTF-8. Fix: decode latin-1 when UTF-8 fails (in flight — `read_m_source` already exported for it). |
+| 4 | `classdef` OOP | subset of parse-fail | Documented big lift — the last major language feature gap. |
+| 5 | `imread`-class image data | subset of builtins | PNG decode via the `png` dep (already used by matplot exports) — in flight with the builtins sweep. |
 
 ## Reproducing
 

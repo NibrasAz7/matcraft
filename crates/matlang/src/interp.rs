@@ -102,6 +102,23 @@ struct FuncDef {
     params: Vec<String>,
     outputs: Vec<String>,
     body: Vec<Stmt>,
+    /// Path of the `.m` file the function was defined in ("" for eval'd
+    /// code) — backs `mfilename`.
+    file: String,
+}
+
+/// One file behind an `fopen` fid. Shared `Read`/`Write`/`Seek` access on
+/// `File` keeps a single logical position for mixed read/write handles.
+struct FileEnt {
+    f: std::fs::File,
+    readable: bool,
+    writable: bool,
+    /// `fopen(..., 'ieee-be')` — multibyte reads/writes swap endianness.
+    big_endian: bool,
+    /// Set when a read hit end-of-file (`feof`); `fseek`/`frewind` clear it.
+    eof: bool,
+    /// Last I/O error message, for `ferror`.
+    last_err: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -763,6 +780,13 @@ pub struct Session {
     /// Stopwatch for `tic`/`toc`. `Instant` doesn't exist on wasm.
     #[cfg(not(target_arch = "wasm32"))]
     tic: Option<std::time::Instant>,
+    /// `fopen` file table (fid → entry). Shared across `Clone` snapshots
+    /// via `Rc` — a panic-guard restore keeps the same open files.
+    files: std::rc::Rc<std::cell::RefCell<HashMap<u32, FileEnt>>>,
+    /// Next fid to issue (1/2 are stdout/stderr, files start at 3).
+    next_fid: std::rc::Rc<std::cell::Cell<u32>>,
+    /// `.m` files currently executing, innermost last — backs `mfilename`.
+    file_stack: Vec<String>,
 }
 
 impl Session {
@@ -787,6 +811,9 @@ impl Session {
             cur_fig: 0,
             #[cfg(not(target_arch = "wasm32"))]
             tic: None,
+            files: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            next_fid: std::rc::Rc::new(std::cell::Cell::new(3)),
+            file_stack: Vec::new(),
         }
     }
 
@@ -907,7 +934,7 @@ impl Session {
     pub fn run(&mut self, source: &str) -> Result<String, LangError> {
         let stmts = crate::parser::parse_lines(source)?;
         let bare: Vec<Stmt> = stmts.iter().map(|(_, s)| s.clone()).collect();
-        self.hoist_functions(&bare);
+        self.hoist_functions(&bare, "");
         let mut out = String::new();
         match self.exec_lines("", &stmts, false, &mut out) {
             Ok(()) => Ok(out),
@@ -930,17 +957,19 @@ impl Session {
             return Err(LangError::new("run recursion limit exceeded", 0));
         }
         let path = self.find_m_file(name).ok_or_else(|| LangError::new(format!("cannot find '{name}' on the search path"), 0))?;
-        let src = std::fs::read_to_string(&path).map_err(|e| LangError::new(format!("cannot read {}: {e}", path.display()), 0))?;
+        let src = read_m_source(&path)?;
         let label = path.display().to_string();
         let stmts = crate::parser::parse_lines(&src).map_err(|mut e| {
             e.message = format!("Error in {label} (line {}): {}", e.line, e.message);
             e
         })?;
         let bare: Vec<Stmt> = stmts.iter().map(|(_, s)| s.clone()).collect();
-        self.hoist_functions(&bare);
+        self.hoist_functions(&bare, &label);
         self.run_depth += 1;
+        self.file_stack.push(label.clone());
         let mut out = String::new();
         let r = self.exec_lines(&label, &stmts, false, &mut out);
+        self.file_stack.pop();
         self.run_depth = self.run_depth.saturating_sub(1);
         match r {
             Ok(()) => Ok(out),
@@ -1145,10 +1174,11 @@ impl Session {
 
     /// Register every top-level `function` before running — script-local
     /// functions are callable throughout the file, like M-code.
-    fn hoist_functions(&mut self, stmts: &[Stmt]) {
+    fn hoist_functions(&mut self, stmts: &[Stmt], file: &str) {
         for s in stmts {
             if let Stmt::Function { name, params, outputs, body } = s {
-                self.funcs.insert(name.clone(), FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone() });
+                self.funcs
+                    .insert(name.clone(), FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string() });
             }
         }
     }
@@ -5006,6 +5036,88 @@ impl Session {
                 Some(mut outs) => Ok(outs.drain(..1).next()),
                 None => Err(LangError::new(format!("'{name}' needs output targets"), 0)),
             },
+            // --- file handles (`fopen` family) -------------------------------
+            "fopen" | "fclose" | "fread" | "fwrite" | "fseek" | "ftell" | "feof" | "frewind" | "ferror" | "fgetl" | "fgets" | "delete" => {
+                let outs = self.fid_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- formatted scanning ------------------------------------------
+            "fscanf" | "sscanf" | "textscan" | "strread" => {
+                let outs = self.scan_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- set operations ------------------------------------------------
+            "ismember" | "setdiff" | "union" | "intersect" | "setxor" => {
+                let outs = self.set_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- indexing / grids ---------------------------------------------
+            "sub2ind" | "ind2sub" | "ndgrid" | "permute" | "ipermute" | "shiftdim" | "bsxfun" | "flip" | "sortrows" | "accumarray" => {
+                let outs = self.index_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- extra strings --------------------------------------------------
+            "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
+            | "regexpi" | "regexprep" => {
+                let outs = self.str_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- environment / system -------------------------------------------
+            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
+            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
+            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
+            | "inline" | "optimset" | "optimget" | "nargchk" => {
+                let outs = self.sys_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- integer/single casts (values stay f64; documented deviation) ----
+            "single" | "int8" | "int16" | "int32" | "int64" | "uint16" | "uint32" | "uint64" => self.cast_call(name, args),
+            // --- NaN-tolerant reductions ------------------------------------------
+            "nansum" | "nanmean" | "nanprod" | "nanmin" | "nanmax" | "nanstd" | "nanvar" | "nanmedian" => {
+                let v = self.eval_args(args)?;
+                if let Some(Value::Cplx(_)) = v.first() {
+                    return Err(LangError::new(format!("{name} on complex data is not supported"), 0));
+                }
+                let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_numeric()?;
+                let dim = self.dim_arg(args, m.dims())?;
+                // `reduce` strips the `nan` prefix and filters NaNs per slice.
+                self.reduce(name, &m, dim).map(Some)
+            }
+            "cov" | "prctile" | "quantile" | "hist" | "histc" => {
+                let outs = self.stat_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- DSP / image -------------------------------------------------------
+            "fir1" | "fspecial" | "peaks" | "im2double" => {
+                let outs = self.dspimg_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            "imread" | "imwrite" => self.image_io(name, args),
+            // --- bitwise ---------------------------------------------------------
+            "bitand" | "bitor" | "bitxor" | "bitshift" | "bitget" | "bitset" | "bitcmp" => self.bits_call(name, args),
+            // --- degree trigonometry ----------------------------------------------
+            "sind" => self.unary_mat(args, |x| x.to_radians().sin()),
+            "cosd" => self.unary_mat(args, |x| x.to_radians().cos()),
+            "tand" => self.unary_mat(args, |x| x.to_radians().tan()),
+            "asind" => self.unary_mat(args, |x| x.asin().to_degrees()),
+            "acosd" => self.unary_mat(args, |x| x.acos().to_degrees()),
+            "atand" => self.unary_mat(args, |x| x.atan().to_degrees()),
+            "atan2d" => {
+                let a = self.arg_matrix(args, 0)?;
+                let b = self.arg_matrix(args, 1)?;
+                a.broadcast(&b, |y, x| y.atan2(x).to_degrees()).map(mat_or_num).map(Some).map_err(lang)
+            }
+            // --- dates ------------------------------------------------------------
+            "datenum" | "now" | "clock" | "etime" | "datestr" => {
+                let outs = self.date_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            // --- delimited files ----------------------------------------------------
+            "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => {
+                let outs = self.delim_call(name, args)?;
+                Ok(outs.into_iter().next())
+            }
+            "repelem" => self.repelem_call(args),
             // --- file I/O ----------------------------------------------------
             "save" | "load" => self.file_io(name, args),
             "type" => {
@@ -5035,7 +5147,7 @@ impl Session {
                         None => return Err(LangError::new(format!("file '{fname}' not found"), 0)),
                     }
                 };
-                let text = std::fs::read_to_string(&path).map_err(|e| LangError::new(format!("cannot read {}: {e}", path.display()), 0))?;
+                let text = read_m_source(&path)?;
                 self.print_buf.push_str(&text);
                 if !text.ends_with('\n') {
                     self.print_buf.push('\n');
@@ -5739,12 +5851,12 @@ impl Session {
             if !file.is_file() {
                 continue;
             }
-            let src = std::fs::read_to_string(&file).map_err(|e| LangError::new(format!("cannot read {}: {e}", file.display()), 0))?;
+            let src = read_m_source(&file)?;
             let stmts = crate::parser::parse(&src).map_err(|mut e| {
                 e.message = format!("{}: {}", file.display(), e.message);
                 e
             })?;
-            self.hoist_functions(&stmts);
+            self.hoist_functions(&stmts, &file.display().to_string());
             return Ok(self.funcs.contains_key(name));
         }
         Ok(false)
@@ -5794,6 +5906,7 @@ impl Session {
         // Function-body echoes (unsuppressed assigns, disp) accumulate in the
         // shared print buffer, same as script output.
         let mut fbuf = std::mem::take(&mut self.print_buf);
+        self.file_stack.push(def.file.clone());
         let result: Result<Vec<Value>, LangError> = (|| {
             let flow = self.exec_block(&def.body, &mut fbuf)?;
             match flow {
@@ -5834,6 +5947,7 @@ impl Session {
             Ok(outs)
         })();
 
+        self.file_stack.pop();
         fbuf.push_str(&self.print_buf);
         self.print_buf = fbuf;
         self.vars = saved_vars;
@@ -6130,9 +6244,2549 @@ impl Session {
                 let (h, w) = self.dsp_freqz(args)?;
                 vec![cmat_or_value(h), Value::Mat(w)]
             }
+            // Corpus-coverage helpers each produce their natural output list;
+            // extra `nout` slots pad with `[]` (MATLAB fills unassigned
+            // trailing outputs the same way).
+            "fopen" | "fclose" | "fread" | "fwrite" | "fseek" | "ftell" | "feof" | "frewind" | "ferror" | "fgetl" | "fgets" | "delete" => {
+                self.fid_call(name, args)?
+            }
+            "fscanf" | "sscanf" | "textscan" | "strread" => self.scan_call(name, args)?,
+            "ismember" | "setdiff" | "union" | "intersect" | "setxor" => self.set_call(name, args)?,
+            "sub2ind" | "ind2sub" | "ndgrid" | "permute" | "ipermute" | "shiftdim" | "bsxfun" | "flip" | "sortrows" | "accumarray" => {
+                self.index_call(name, args)?
+            }
+            "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
+            | "regexpi" | "regexprep" => self.str_call(name, args)?,
+            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
+            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
+            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
+            | "inline" | "optimset" | "optimget" | "nargchk" => self.sys_call(name, args)?,
+            "cov" | "prctile" | "quantile" | "hist" | "histc" => self.stat_call(name, args)?,
+            "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
+            "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
+            "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
             _ => return Ok(None),
         };
+        let mut out = out;
+        while out.len() < nout {
+            out.push(Value::Mat(Matrix::zeros(0, 0)));
+        }
         Ok(Some(out))
+    }
+
+    /// `fopen`/`fclose`/`fread`/`fwrite`/`fseek`/`ftell`/`feof`/`frewind`/
+    /// `ferror`/`fgetl`/`fgets`/`delete` — fid-based binary + text file I/O.
+    /// Fids 1/2 are stdout/stderr (write-only); real files get fid ≥ 3.
+    fn fid_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        /// Read one text line from a file entry: chunked reads with a seek
+        /// correction, so each line costs ~1 syscall. `keep_nl` keeps the
+        /// terminator (`fgets`); `nchar` caps returned bytes. `None` = EOF.
+        fn read_line(f: &std::fs::File, keep_nl: bool, nchar: Option<usize>) -> std::io::Result<Option<Vec<u8>>> {
+            const CHUNK: usize = 4096;
+            const MAX_LINE: usize = 16 * 1024 * 1024;
+            let mut line: Vec<u8> = Vec::new();
+            let mut fr = f;
+            loop {
+                let mut buf = [0u8; CHUNK];
+                let want = match nchar {
+                    Some(n) => (n.saturating_sub(line.len())).min(CHUNK),
+                    None => CHUNK,
+                };
+                if want == 0 {
+                    break;
+                }
+                let got = Read::read(&mut fr, &mut buf[..want])?;
+                if got == 0 {
+                    break; // EOF
+                }
+                let mut take = got;
+                let mut hit = false;
+                if let Some(pos) = buf[..got].iter().position(|&b| b == b'\n') {
+                    take = pos + 1;
+                    hit = true;
+                }
+                line.extend_from_slice(&buf[..take]);
+                if take < got {
+                    // Rewind past the unread tail of the chunk.
+                    let back = (got - take) as i64;
+                    Seek::seek(&mut fr, SeekFrom::Current(-back))?;
+                }
+                if hit || line.len() > MAX_LINE {
+                    break;
+                }
+            }
+            if line.is_empty() {
+                return Ok(None);
+            }
+            if !keep_nl {
+                while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+                    line.pop();
+                }
+            }
+            Ok(Some(line))
+        }
+
+        match name {
+            "fopen" => {
+                let v = self.eval_args(args)?;
+                // fopen() with no args lists open fids.
+                if v.is_empty() {
+                    let ids: Vec<f64> = {
+                        let t = self.files.borrow();
+                        let mut ids: Vec<f64> = t.keys().map(|k| *k as f64).collect();
+                        ids.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        ids
+                    };
+                    return Ok(vec![mat_or_num(Matrix::row_vector(ids))]);
+                }
+                let fname = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("fopen needs a filename", 0)),
+                };
+                let perm = match v.get(1) {
+                    Some(Value::Str(s)) => s.trim().to_ascii_lowercase(),
+                    None => "r".to_string(),
+                    _ => return Err(LangError::new("fopen permission must be a string", 0)),
+                };
+                let mach = match v.get(2) {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let big_endian = mach.contains('b') || mach.contains("big");
+                let p = perm.trim_matches(['b', 't']);
+                let mut oo = std::fs::OpenOptions::new();
+                let (readable, writable) = match p {
+                    "r" => {
+                        oo.read(true);
+                        (true, false)
+                    }
+                    "w" => {
+                        oo.write(true).create(true).truncate(true);
+                        (false, true)
+                    }
+                    "a" => {
+                        oo.append(true).create(true);
+                        (false, true)
+                    }
+                    "r+" => {
+                        oo.read(true).write(true);
+                        (true, true)
+                    }
+                    "w+" => {
+                        oo.read(true).write(true).create(true).truncate(true);
+                        (true, true)
+                    }
+                    "a+" => {
+                        oo.read(true).append(true).create(true);
+                        (true, true)
+                    }
+                    _ => return Err(LangError::new(format!("fopen: unknown permission '{perm}'"), 0)),
+                };
+                match oo.open(&fname) {
+                    Ok(f) => {
+                        let fid = self.next_fid.get();
+                        self.next_fid.set(fid.saturating_add(1));
+                        self.files.borrow_mut().insert(fid, FileEnt { f, readable, writable, big_endian, eof: false, last_err: String::new() });
+                        Ok(vec![Value::Num(fid as f64), Value::Str(String::new())])
+                    }
+                    Err(e) => Ok(vec![Value::Num(-1.0), Value::Str(e.to_string())]),
+                }
+            }
+            "fclose" => {
+                let v = self.eval_args(args)?;
+                if matches!(v.first(), Some(Value::Str(s)) if s == "all") {
+                    self.files.borrow_mut().clear();
+                    return Ok(vec![Value::Num(0.0)]);
+                }
+                let fid = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(-1.0);
+                if fid.fract() != 0.0 || fid < 1.0 {
+                    return Ok(vec![Value::Num(-1.0)]);
+                }
+                let fid = fid as u32;
+                if fid <= 2 {
+                    // std streams aren't closable — report success.
+                    return Ok(vec![Value::Num(0.0)]);
+                }
+                let had = self.files.borrow_mut().remove(&fid).is_some();
+                Ok(vec![Value::Num(if had { 0.0 } else { -1.0 })])
+            }
+            "fread" | "fwrite" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new(format!("{name} needs a fid"), 0))?.scalar()?;
+                if fid.fract() != 0.0 {
+                    return Err(LangError::new(format!("{name}: bad fid {fid}"), 0));
+                }
+                let fid = fid as u32;
+                if name == "fwrite" {
+                    if fid <= 2 {
+                        return Err(LangError::new("fwrite to stdout/stderr is not supported — use fprintf", 0));
+                    }
+                    let data = match v.get(1) {
+                        Some(x) => x.clone(),
+                        None => return Err(LangError::new("fwrite needs data", 0)),
+                    };
+                    let prec = match v.get(2) {
+                        Some(Value::Str(s)) => s.clone(),
+                        _ => "uchar".to_string(),
+                    };
+                    let skip = v.get(3).map(|x| x.scalar()).transpose()?.unwrap_or(0.0).max(0.0) as usize;
+                    let mut t = self.files.borrow_mut();
+                    let ent = t.get_mut(&fid).ok_or_else(|| LangError::new("fwrite: fid not open", 0))?;
+                    if !ent.writable {
+                        return Err(LangError::new("fwrite: file not opened for writing", 0));
+                    }
+                    let bytes = match &data {
+                        Value::Str(s) => s.chars().map(|c| c as u32 as u8).collect::<Vec<u8>>(),
+                        other => {
+                            let m = other.to_numeric()?;
+                            encode_prec(m.data(), &prec, ent.big_endian)?
+                        }
+                    };
+                    // `skip` inserts gap bytes after each element — only
+                    // meaningful for fixed-width numeric writes; honour it by
+                    // writing element-by-element.
+                    if skip > 0 {
+                        let epb = prec_bytes(&prec).unwrap_or(1);
+                        let mut w = &ent.f;
+                        let mut written = 0usize;
+                        for ch in bytes.chunks(epb) {
+                            if let Err(e) = w.write_all(ch) {
+                                ent.last_err = e.to_string();
+                                return Ok(vec![Value::Num(written as f64)]);
+                            }
+                            written += 1;
+                            let pad = vec![0u8; skip];
+                            if let Err(e) = w.write_all(&pad) {
+                                ent.last_err = e.to_string();
+                                return Ok(vec![Value::Num(written as f64)]);
+                            }
+                        }
+                        return Ok(vec![Value::Num(written as f64)]);
+                    }
+                    let mut w = &ent.f;
+                    match w.write_all(&bytes) {
+                        Ok(()) => {
+                            let count = bytes.len() / prec_bytes(&prec).unwrap_or(1).max(1);
+                            Ok(vec![Value::Num(count as f64)])
+                        }
+                        Err(e) => {
+                            ent.last_err = e.to_string();
+                            Err(LangError::new(format!("fwrite: {e}"), 0))
+                        }
+                    }
+                } else {
+                    // fread
+                    if fid <= 2 {
+                        return Err(LangError::new("fread from stdin/stdout is not supported", 0));
+                    }
+                    // count: absent/Inf → "all remaining"; scalar n → column
+                    // vector; [m n] → m×n matrix filled column-major.
+                    let (out_dims, count) = match v.get(1) {
+                        None => (None, usize::MAX),
+                        Some(x) => {
+                            let m = x.to_matrix()?;
+                            match m.numel() {
+                                0 => (Some((0usize, 0usize)), 0usize),
+                                1 => {
+                                    let n = m.get_linear(0).unwrap_or(0.0);
+                                    if n == f64::INFINITY {
+                                        (None, usize::MAX)
+                                    } else {
+                                        (None, n.max(0.0) as usize)
+                                    }
+                                }
+                                _ => {
+                                    let r = m.get_linear(0).unwrap_or(0.0).max(0.0) as usize;
+                                    let c = m.get_linear(1).unwrap_or(0.0).max(0.0) as usize;
+                                    (Some((r, c)), r.saturating_mul(c))
+                                }
+                            }
+                        }
+                    };
+                    let prec = match v.get(2) {
+                        Some(Value::Str(s)) => s.clone(),
+                        _ => "uchar".to_string(),
+                    };
+                    let skip = v.get(3).map(|x| x.scalar()).transpose()?.unwrap_or(0.0).max(0.0) as usize;
+                    let epb = prec_bytes(&prec).ok_or_else(|| LangError::new(format!("fread: unknown precision '{prec}'"), 0))?;
+                    let mut t = self.files.borrow_mut();
+                    let ent = t.get_mut(&fid).ok_or_else(|| LangError::new("fread: fid not open", 0))?;
+                    if !ent.readable {
+                        return Err(LangError::new("fread: file not opened for reading", 0));
+                    }
+                    // Element budget: MAX_ELEMS keeps hostile requests finite.
+                    let want = count.min(MAX_ELEMS);
+                    let bytes_needed = want.saturating_mul(epb.saturating_add(skip));
+                    let mut buf = Vec::new();
+                    let mut rd = Read::take(&ent.f, bytes_needed as u64);
+                    match rd.read_to_end(&mut buf) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            ent.last_err = e.to_string();
+                            return Err(LangError::new(format!("fread: {e}"), 0));
+                        }
+                    }
+                    let (vals, nread) = decode_prec(&buf, &prec, epb, skip, ent.big_endian, want);
+                    if nread < want {
+                        ent.eof = true;
+                    }
+                    if prec_is_char(&prec) {
+                        let s: String = vals.iter().map(|&x| char::from_u32(x as u32).unwrap_or(' ')).collect();
+                        return Ok(vec![Value::Str(s), Value::Num(nread as f64)]);
+                    }
+                    match out_dims {
+                        Some((r, c)) => {
+                            let mut data = vals;
+                            data.resize(r.saturating_mul(c), 0.0);
+                            Ok(vec![mat_or_num(Matrix::from_col_major(r, c, data).map_err(lang)?), Value::Num(nread as f64)])
+                        }
+                        None => Ok(vec![mat_or_num(Matrix::col_vector(vals)), Value::Num(nread as f64)]),
+                    }
+                }
+            }
+            "fseek" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new("fseek needs a fid", 0))?.scalar()? as u32;
+                let off = v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0) as i64;
+                let origin = match v.get(2) {
+                    Some(Value::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                        "bof" => SeekFrom::Start(0),
+                        "cof" => SeekFrom::Current(0),
+                        "eof" => SeekFrom::End(0),
+                        _ => return Err(LangError::new("fseek: bad origin", 0)),
+                    },
+                    Some(x) => match x.scalar()? as i64 {
+                        -1 => SeekFrom::Start(0),
+                        0 => SeekFrom::Current(0),
+                        _ => SeekFrom::End(0),
+                    },
+                    None => SeekFrom::Start(0),
+                };
+                let mut t = self.files.borrow_mut();
+                let ent = t.get_mut(&fid).ok_or_else(|| LangError::new("fseek: fid not open", 0))?;
+                let seek = match origin {
+                    SeekFrom::Start(b) => SeekFrom::Start((b as i64 + off).max(0) as u64),
+                    SeekFrom::Current(b) => SeekFrom::Current(b + off),
+                    SeekFrom::End(b) => SeekFrom::End(b + off),
+                };
+                let mut fr = &ent.f;
+                match Seek::seek(&mut fr, seek) {
+                    Ok(_) => {
+                        ent.eof = false;
+                        Ok(vec![Value::Num(0.0)])
+                    }
+                    Err(e) => {
+                        ent.last_err = e.to_string();
+                        Ok(vec![Value::Num(-1.0)])
+                    }
+                }
+            }
+            "ftell" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new("ftell needs a fid", 0))?.scalar()? as u32;
+                let t = self.files.borrow();
+                let ent = t.get(&fid).ok_or_else(|| LangError::new("ftell: fid not open", 0))?;
+                let mut fr = &ent.f;
+                let pos = Seek::stream_position(&mut fr).unwrap_or(0);
+                Ok(vec![Value::Num(pos as f64)])
+            }
+            "feof" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new("feof needs a fid", 0))?.scalar()? as u32;
+                let t = self.files.borrow();
+                let ent = t.get(&fid).ok_or_else(|| LangError::new("feof: fid not open", 0))?;
+                Ok(vec![Value::Num(if ent.eof { 1.0 } else { 0.0 })])
+            }
+            "frewind" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new("frewind needs a fid", 0))?.scalar()? as u32;
+                let mut t = self.files.borrow_mut();
+                let ent = t.get_mut(&fid).ok_or_else(|| LangError::new("frewind: fid not open", 0))?;
+                let mut fr = &ent.f;
+                let _ = Seek::seek(&mut fr, SeekFrom::Start(0));
+                ent.eof = false;
+                Ok(vec![])
+            }
+            "ferror" => {
+                let v = self.eval_args(args)?;
+                let (msg, num) = if let Some(x) = v.first() {
+                    let fid = x.scalar()? as u32;
+                    let mut t = self.files.borrow_mut();
+                    match t.get_mut(&fid) {
+                        Some(ent) => (std::mem::take(&mut ent.last_err), 0.0),
+                        None => ("fid not open".to_string(), -1.0),
+                    }
+                } else {
+                    (String::new(), 0.0)
+                };
+                Ok(vec![Value::Str(msg), Value::Num(num)])
+            }
+            "fgetl" | "fgets" => {
+                let v = self.eval_args(args)?;
+                let fid = v.first().ok_or_else(|| LangError::new(format!("{name} needs a fid"), 0))?.scalar()? as u32;
+                let nchar = v.get(1).map(|x| x.scalar()).transpose()?.map(|n| n.max(0.0) as usize);
+                let mut t = self.files.borrow_mut();
+                let ent = t.get_mut(&fid).ok_or_else(|| LangError::new(format!("{name}: fid not open"), 0))?;
+                if !ent.readable {
+                    return Err(LangError::new(format!("{name}: file not opened for reading"), 0));
+                }
+                match read_line(&ent.f, name == "fgets", nchar) {
+                    Ok(Some(bytes)) => Ok(vec![Value::Str(bytes.iter().map(|&b| b as char).collect())]),
+                    Ok(None) => {
+                        ent.eof = true;
+                        Ok(vec![Value::Num(-1.0)])
+                    }
+                    Err(e) => {
+                        ent.last_err = e.to_string();
+                        Err(LangError::new(format!("{name}: {e}"), 0))
+                    }
+                }
+            }
+            "delete" => {
+                let v = self.eval_args(args)?;
+                for x in &v {
+                    match x {
+                        Value::Str(pat) => {
+                            // Wildcard file delete: `delete('*.tmp')`,
+                            // `delete('dir/f')` — names are glob-matched in
+                            // the pattern's own directory.
+                            let pp = std::path::Path::new(pat);
+                            let (dir, file_pat) = match pp.parent().filter(|p| !p.as_os_str().is_empty()) {
+                                Some(d) => (d.to_path_buf(), pp.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()),
+                                None => (std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")), pat.clone()),
+                            };
+                            if let Ok(rd) = std::fs::read_dir(&dir) {
+                                for e in rd.flatten() {
+                                    let n = e.file_name().to_string_lossy().to_string();
+                                    if glob_match(&file_pat, &n) && e.path().is_file() {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            // Numeric → figure handle: delete(n) closes
+                            // figure n (same as `close(n)`).
+                            let n = other.scalar()? as usize;
+                            if n >= 1 && n <= self.figs.len() {
+                                self.figs.remove(n - 1);
+                                if self.cur_fig > self.figs.len() {
+                                    self.cur_fig = self.figs.len();
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(vec![])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `fscanf`/`sscanf`/`textscan`/`strread` — formatted scanning. Numeric-
+    /// only formats yield a column vector (or `[m n]` matrix filled
+    /// column-major, zero-padded); formats with `%s`/`%c` yield the matched
+    /// text. `textscan`/`strread` return a 1×k cell of columns.
+    fn scan_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        use std::io::Read;
+        let v = self.eval_args(args)?;
+        // Source text: fid → read the rest of the file; Str → verbatim.
+        let (text, mut arg_idx) = match v.first() {
+            Some(Value::Str(s)) => (s.clone(), 1),
+            Some(x) => {
+                let fid = x.scalar()? as u32;
+                let mut t = self.files.borrow_mut();
+                let ent = t.get_mut(&fid).ok_or_else(|| LangError::new(format!("{name}: fid not open"), 0))?;
+                if !ent.readable {
+                    return Err(LangError::new(format!("{name}: file not opened for reading"), 0));
+                }
+                let mut buf = Vec::new();
+                let mut rd = Read::take(&ent.f, MAX_ELEMS as u64);
+                match rd.read_to_end(&mut buf) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        ent.last_err = e.to_string();
+                        return Err(LangError::new(format!("{name}: {e}"), 0));
+                    }
+                }
+                ent.eof = true;
+                (buf.iter().map(|&b| b as char).collect(), 1)
+            }
+            None => return Err(LangError::new(format!("{name} needs a fid or string"), 0)),
+        };
+        let fmt = match v.get(arg_idx) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return Err(LangError::new(format!("{name} needs a format string"), 0)),
+        };
+        arg_idx += 1;
+        let specs = parse_scan_fmt(&fmt)?;
+        if specs.iter().all(|s| s.suppress) {
+            return Err(LangError::new(format!("{name}: format has no conversions"), 0));
+        }
+        if name == "textscan" || name == "strread" {
+            // Remaining args: optional N, then 'Param', value pairs
+            // ('Delimiter' and 'HeaderLines' supported).
+            let mut max_n = usize::MAX;
+            let mut delim: Option<String> = None;
+            let mut header = 0usize;
+            let mut i = arg_idx;
+            while i < v.len() {
+                match v.get(i) {
+                    Some(Value::Str(s)) => {
+                        let val = v.get(i + 1);
+                        match s.trim().to_ascii_lowercase().as_str() {
+                            "delimiter" => {
+                                delim = Some(match val {
+                                    Some(Value::Str(d)) => d.clone(),
+                                    _ => String::new(),
+                                });
+                                i += 2;
+                            }
+                            "headerlines" => {
+                                header = val.map(|x| x.scalar()).transpose()?.unwrap_or(0.0).max(0.0) as usize;
+                                i += 2;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    Some(x) => {
+                        max_n = x.scalar()?.max(0.0) as usize;
+                        i += 1;
+                    }
+                    None => i += 1,
+                }
+            }
+            let mut src = text.as_str();
+            for _ in 0..header {
+                match src.find('\n') {
+                    Some(p) => src = &src[p + 1..],
+                    None => src = "",
+                }
+            }
+            let cols = textscan(src, &specs, max_n, delim.as_deref());
+            let mut items = Vec::with_capacity(cols.len());
+            for col in cols {
+                let item = match col {
+                    ScanCol::Nums(ns) => Value::Mat(Matrix::col_vector(ns)),
+                    ScanCol::Strs(ss) => Value::Cell(CellArray::col(ss.into_iter().map(Value::Str).collect())),
+                };
+                items.push(item);
+            }
+            return Ok(vec![Value::Cell(CellArray::row(items))]);
+        }
+        // fscanf/sscanf: optional count (n or [m n]).
+        let (out_dims, max_elems) = match v.get(arg_idx) {
+            None => (None, usize::MAX),
+            Some(x) => {
+                let m = x.to_matrix()?;
+                match m.numel() {
+                    0 => (Some((0usize, 0usize)), 0usize),
+                    1 => (None, m.get_linear(0).unwrap_or(0.0).max(0.0) as usize),
+                    _ => {
+                        let r = m.get_linear(0).unwrap_or(0.0).max(0.0) as usize;
+                        let c = m.get_linear(1).unwrap_or(0.0).max(0.0) as usize;
+                        (Some((r, c)), r.saturating_mul(c))
+                    }
+                }
+            }
+        };
+        let max_elems = max_elems.min(MAX_ELEMS);
+        let (nums, chars) = scan_seq(&text, &specs, max_elems);
+        if let Some(mut s) = chars {
+            if let Some((r, c)) = out_dims {
+                s.truncate(r.saturating_mul(c));
+            }
+            let n = s.chars().count();
+            return Ok(vec![Value::Str(s), Value::Num(n as f64)]);
+        }
+        let count = nums.len();
+        match out_dims {
+            Some((r, c)) => {
+                let mut data = nums;
+                data.resize(r.saturating_mul(c), 0.0);
+                Ok(vec![mat_or_num(Matrix::from_col_major(r, c, data).map_err(lang)?), Value::Num(count as f64)])
+            }
+            None => Ok(vec![mat_or_num(Matrix::col_vector(nums)), Value::Num(count as f64)]),
+        }
+    }
+
+    /// `ismember`/`setdiff`/`union`/`intersect`/`setxor` — classic set
+    /// operations on linearised numeric data ('rows'/'legacy' flags are not
+    /// supported; NaN never matches anything).
+    fn set_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        if v.iter().skip(2).any(|x| matches!(x, Value::Str(_))) {
+            return Err(LangError::new(format!("{name}: 'rows'/'legacy' flags are not supported"), 0));
+        }
+        let a = v.first().ok_or_else(|| LangError::new(format!("{name} needs two inputs"), 0))?.to_numeric()?;
+        let a_row = a.rows() == 1;
+        let a_dims = a.dims().to_vec();
+        let ad: Vec<f64> = a.data().to_vec();
+        let b = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs two inputs"), 0))?.to_numeric()?;
+        // First 1-based linear index of each value in B.
+        let mut first_b: HashMap<u64, usize> = HashMap::with_capacity(b.numel());
+        for (i, &x) in b.data().iter().enumerate() {
+            if !x.is_nan() {
+                first_b.entry(vkey(x)).or_insert(i + 1);
+            }
+        }
+        if name == "ismember" {
+            let mut lia = Vec::with_capacity(ad.len());
+            let mut locb = Vec::with_capacity(ad.len());
+            for &x in &ad {
+                match if x.is_nan() { None } else { first_b.get(&vkey(x)) } {
+                    Some(&i) => {
+                        lia.push(1.0);
+                        locb.push(i as f64);
+                    }
+                    None => {
+                        lia.push(0.0);
+                        locb.push(0.0);
+                    }
+                }
+            }
+            let la = Matrix::from_col_major_nd(&a_dims, lia).map_err(lang)?;
+            let lb = Matrix::from_col_major_nd(&a_dims, locb).map_err(lang)?;
+            return Ok(vec![Value::Mat(la), Value::Mat(lb)]);
+        }
+        // First 1-based linear index of each value in A.
+        let mut first_a: HashMap<u64, usize> = HashMap::with_capacity(ad.len());
+        for (i, &x) in ad.iter().enumerate() {
+            if !x.is_nan() {
+                first_a.entry(vkey(x)).or_insert(i + 1);
+            }
+        }
+        let sorted = |mut c: Vec<f64>| {
+            c.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            c
+        };
+        let (c, ia, ib): (Vec<f64>, Vec<f64>, Vec<f64>) = match name {
+            "setdiff" => {
+                let mut c = Vec::new();
+                let mut seen: HashMap<u64, ()> = HashMap::new();
+                for &x in &ad {
+                    if x.is_nan() || first_b.contains_key(&vkey(x)) || seen.insert(vkey(x), ()).is_some() {
+                        continue;
+                    }
+                    c.push(x);
+                }
+                let c = sorted(c);
+                let ia = c.iter().map(|x| first_a.get(&vkey(*x)).copied().unwrap_or(0) as f64).collect();
+                (c, ia, Vec::new())
+            }
+            "union" => {
+                let mut c = Vec::new();
+                let mut seen: HashMap<u64, ()> = HashMap::new();
+                for &x in ad.iter().chain(b.data()) {
+                    if x.is_nan() || seen.insert(vkey(x), ()).is_some() {
+                        continue;
+                    }
+                    c.push(x);
+                }
+                let c = sorted(c);
+                let mut ia = Vec::new();
+                let mut ib = Vec::new();
+                // MATLAB: C = [A(ia); B(ib)] — the A-portion indices come
+                // first, the B-only indices follow.
+                for &x in &c {
+                    match first_a.get(&vkey(x)) {
+                        Some(&i) => ia.push(i as f64),
+                        None => ib.push(first_b.get(&vkey(x)).copied().unwrap_or(0) as f64),
+                    }
+                }
+                (c, ia, ib)
+            }
+            "intersect" => {
+                let mut c = Vec::new();
+                let mut seen: HashMap<u64, ()> = HashMap::new();
+                for &x in &ad {
+                    if !x.is_nan() && first_b.contains_key(&vkey(x)) && seen.insert(vkey(x), ()).is_none() {
+                        c.push(x);
+                    }
+                }
+                let c = sorted(c);
+                let ia = c.iter().map(|x| first_a.get(&vkey(*x)).copied().unwrap_or(0) as f64).collect();
+                let ib = c.iter().map(|x| first_b.get(&vkey(*x)).copied().unwrap_or(0) as f64).collect();
+                (c, ia, ib)
+            }
+            _ => {
+                // setxor: values in exactly one of A/B.
+                let mut c = Vec::new();
+                let mut seen: HashMap<u64, ()> = HashMap::new();
+                for &x in &ad {
+                    if !x.is_nan() && !first_b.contains_key(&vkey(x)) && seen.insert(vkey(x), ()).is_none() {
+                        c.push(x);
+                    }
+                }
+                for &x in b.data() {
+                    if !x.is_nan() && !first_a.contains_key(&vkey(x)) && seen.insert(vkey(x), ()).is_none() {
+                        c.push(x);
+                    }
+                }
+                let c = sorted(c);
+                let ia: Vec<f64> = c.iter().filter_map(|x| first_a.get(&vkey(*x)).map(|&i| i as f64)).collect();
+                let ib: Vec<f64> =
+                    c.iter().filter_map(|x| if first_a.contains_key(&vkey(*x)) { None } else { first_b.get(&vkey(*x)).map(|&i| i as f64) }).collect();
+                (c, ia, ib)
+            }
+        };
+        // Shape follows A: row vector in → row out, anything else → column.
+        let cm = if a_row { Matrix::row_vector(c) } else { Matrix::col_vector(c) };
+        Ok(vec![Value::Mat(cm), mat_or_num(Matrix::col_vector(ia)), mat_or_num(Matrix::col_vector(ib))])
+    }
+
+    /// `sub2ind`/`ind2sub`/`ndgrid`/`permute`/`ipermute`/`shiftdim`/`bsxfun`/
+    /// `flip`/`sortrows`/`accumarray`.
+    fn index_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        match name {
+            "sub2ind" => {
+                let v = self.eval_args(args)?;
+                let dm = v.first().ok_or_else(|| LangError::new("sub2ind needs a size vector", 0))?.to_matrix()?;
+                let dims: Vec<usize> = dm.data().iter().map(|&x| x.max(0.0) as usize).collect();
+                if dims.len() < 2 || v.len() - 1 != dims.len() {
+                    return Err(LangError::new("sub2ind needs one index per dimension", 0));
+                }
+                let subs: Vec<Matrix> = (1..v.len()).map(|i| v[i].to_numeric()).collect::<Result<_, _>>()?;
+                let n = subs.first().map(|m| m.numel()).unwrap_or(0);
+                let mut out = Vec::with_capacity(n);
+                for k in 0..n {
+                    let mut idx = 0usize;
+                    let mut stride = 1usize;
+                    for (d, sub) in dims.iter().zip(subs.iter()) {
+                        let s = sub.get_linear(k).unwrap_or(0.0);
+                        if s.fract() != 0.0 || s < 1.0 || s > *d as f64 {
+                            return Err(LangError::new("sub2ind: subscript out of range", 0));
+                        }
+                        idx += (s as usize - 1) * stride;
+                        stride = stride.saturating_mul(*d);
+                    }
+                    out.push((idx + 1) as f64);
+                }
+                Ok(vec![mat_or_num(
+                    Matrix::from_col_major(subs.first().map(|m| m.rows()).unwrap_or(0), subs.first().map(|m| m.cols()).unwrap_or(0), out)
+                        .map_err(lang)?,
+                )])
+            }
+            "ind2sub" => {
+                let v = self.eval_args(args)?;
+                let dm = v.first().ok_or_else(|| LangError::new("ind2sub needs a size vector", 0))?.to_matrix()?;
+                let dims: Vec<usize> = dm.data().iter().map(|&x| x.max(1.0) as usize).collect();
+                let idx = v.get(1).ok_or_else(|| LangError::new("ind2sub needs an index", 0))?.to_numeric()?;
+                let total: usize = dims.iter().product();
+                let mut outs: Vec<Vec<f64>> = vec![Vec::with_capacity(idx.numel()); dims.len()];
+                for k in 0..idx.numel() {
+                    let i = idx.get_linear(k).unwrap_or(0.0);
+                    if i.fract() != 0.0 || i < 1.0 || i > total as f64 {
+                        return Err(LangError::new("ind2sub: index out of range", 0));
+                    }
+                    let mut rem = i as usize - 1;
+                    for (d, col) in dims.iter().zip(outs.iter_mut()) {
+                        col.push((rem % d + 1) as f64);
+                        rem /= d;
+                    }
+                }
+                Ok(outs.into_iter().map(|c| Value::Mat(Matrix::col_vector(c))).collect())
+            }
+            "ndgrid" => {
+                let v = self.eval_args(args)?;
+                let vecs: Vec<Vec<f64>> = (0..v.len()).map(|i| v[i].to_numeric().map(|m| m.data().to_vec())).collect::<Result<_, _>>()?;
+                let dims: Vec<usize> = vecs.iter().map(|x| x.len()).collect();
+                check_elems(dims.iter().product())?;
+                let mut outs = Vec::with_capacity(vecs.len());
+                for (k, xv) in vecs.iter().enumerate() {
+                    // ndgrid: output_k(i1..iN) = x_k(i_k).
+                    let mut data = Vec::with_capacity(dims.iter().product());
+                    let n: usize = dims.iter().product();
+                    for lin in 0..n {
+                        let mut rem = lin;
+                        let mut sub = 0usize;
+                        for (j, &d) in dims.iter().enumerate() {
+                            let s = rem % d;
+                            rem /= d;
+                            if j == k {
+                                sub = s;
+                            }
+                        }
+                        data.push(xv.get(sub).copied().unwrap_or(0.0));
+                    }
+                    let dims2 = if dims.len() >= 2 { dims.clone() } else { vec![dims.first().copied().unwrap_or(1), 1] };
+                    outs.push(Value::Mat(Matrix::from_col_major_nd(&dims2, data).map_err(lang)?));
+                }
+                Ok(outs)
+            }
+            "permute" | "ipermute" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs an array"), 0))?.to_numeric()?;
+                let om = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs a dimension order"), 0))?.to_matrix()?;
+                let mut order: Vec<usize> = om.data().iter().map(|&x| x.max(0.0) as usize).collect();
+                if name == "ipermute" {
+                    // invert the permutation: out[order[k]-1] = k+1.
+                    let mut inv = vec![0usize; order.len()];
+                    for (k, &o) in order.iter().enumerate() {
+                        if let Some(slot) = inv.get_mut(o.saturating_sub(1)) {
+                            *slot = k + 1;
+                        }
+                    }
+                    order = inv;
+                }
+                permute_mat(&m, &order).map(|r| vec![Value::Mat(r)])
+            }
+            "shiftdim" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("shiftdim needs an array", 0))?.to_numeric()?;
+                match v.get(1) {
+                    None => {
+                        // Drop leading singleton dims (keep ≥ 1).
+                        let mut dims = m.dims().to_vec();
+                        while dims.len() > 1 && dims.first() == Some(&1) {
+                            dims.remove(0);
+                        }
+                        if dims.len() == 1 {
+                            dims.push(1);
+                        }
+                        let dropped = m.ndims() - dims.len();
+                        let out = Matrix::from_col_major_nd(&dims, m.data().to_vec()).map_err(lang)?;
+                        Ok(vec![Value::Mat(out), Value::Num(dropped as f64)])
+                    }
+                    Some(x) => {
+                        let n = x.scalar()? as i64;
+                        let nd = m.ndims();
+                        if n < 0 {
+                            // Negative: prepend singleton dims.
+                            let mut dims = vec![1usize; (-n) as usize];
+                            dims.extend_from_slice(m.dims());
+                            let out = Matrix::from_col_major_nd(&dims, m.data().to_vec()).map_err(lang)?;
+                            Ok(vec![Value::Mat(out)])
+                        } else {
+                            // Positive: circular left shift of the dims.
+                            let shift = (n as usize) % nd.max(1);
+                            let order: Vec<usize> = (shift..nd).chain(0..shift).map(|i| i + 1).collect();
+                            permute_mat(&m, &order).map(|r| vec![Value::Mat(r)])
+                        }
+                    }
+                }
+            }
+            "bsxfun" => {
+                let v = self.eval_args(args)?;
+                let fun = v.first().ok_or_else(|| LangError::new("bsxfun needs a function", 0))?.clone();
+                let a = v.get(1).ok_or_else(|| LangError::new("bsxfun needs two arrays", 0))?.to_numeric()?;
+                let b = v.get(2).ok_or_else(|| LangError::new("bsxfun needs two arrays", 0))?.to_numeric()?;
+                // Broadcast dims: per-dim max, requiring each pair to agree
+                // or one side be 1.
+                let nd = a.ndims().max(b.ndims());
+                let mut dims = Vec::with_capacity(nd);
+                for i in 0..nd {
+                    let da = a.dims().get(i).copied().unwrap_or(1);
+                    let db = b.dims().get(i).copied().unwrap_or(1);
+                    if da != db && da != 1 && db != 1 {
+                        return Err(LangError::new("bsxfun: dimensions do not agree", 0));
+                    }
+                    dims.push(da.max(db));
+                }
+                let dims = if dims.len() >= 2 { dims } else { vec![1, 1] };
+                check_elems(dims.iter().product())?;
+                let ea = expand_to(&a, &dims);
+                let eb = expand_to(&b, &dims);
+                // Named ops take the fast elementwise path; handles are
+                // called per element.
+                if let Some(f) = bsxfun_op(&fun) {
+                    let data: Vec<f64> = ea.iter().zip(eb.iter()).map(|(&x, &y)| f(x, y)).collect();
+                    return Ok(vec![mat_or_num(Matrix::from_col_major_nd(&dims, data).map_err(lang)?)]);
+                }
+                let h = match &fun {
+                    Value::Func(h) => h.clone(),
+                    Value::Str(s) => FuncHandle::Named(s.clone()),
+                    _ => return Err(LangError::new("bsxfun: first arg must be a function name or handle", 0)),
+                };
+                let mut data = Vec::with_capacity(ea.len());
+                for (i, &x) in ea.iter().enumerate() {
+                    let outs = self.call_handle(&h, vec![Value::Num(x), Value::Num(eb[i])], 1)?;
+                    data.push(outs.first().map(|x| x.scalar()).transpose()?.unwrap_or(0.0));
+                }
+                Ok(vec![mat_or_num(Matrix::from_col_major_nd(&dims, data).map_err(lang)?)])
+            }
+            "flip" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("flip needs an array", 0))?.to_numeric()?;
+                // Default: first non-singleton dimension.
+                let dim = match v.get(1) {
+                    Some(x) => x.scalar()?.max(1.0) as usize,
+                    None => m.dims().iter().position(|&d| d > 1).map(|i| i + 1).unwrap_or(1),
+                };
+                if dim > m.ndims() {
+                    return Ok(vec![Value::Mat(m)]);
+                }
+                let dims = m.dims();
+                let mut data = vec![0.0; m.numel()];
+                for (i, slot) in data.iter_mut().enumerate() {
+                    // Decompose linear index → subs; flip along `dim`.
+                    let mut rem = i;
+                    let mut subs = vec![0usize; dims.len()];
+                    for (j, &d) in dims.iter().enumerate() {
+                        subs[j] = rem % d;
+                        rem /= d;
+                    }
+                    let d = dims[dim - 1];
+                    subs[dim - 1] = d.saturating_sub(1).saturating_sub(subs[dim - 1]);
+                    *slot = m.get_nd(&subs).unwrap_or(0.0);
+                }
+                Ok(vec![mat_or_num(Matrix::from_col_major_nd(dims, data).map_err(lang)?)])
+            }
+            "sortrows" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("sortrows needs a matrix", 0))?.to_numeric()?;
+                need_2d(&m, name)?;
+                let (rows, cols) = m.shape();
+                // Order spec: 'ascend'/'descend' or a signed column index
+                // (negative → descending by that column).
+                let mut col_keys: Vec<(usize, bool)> = (0..cols).map(|c| (c, false)).collect();
+                match v.get(1) {
+                    Some(Value::Str(s)) => {
+                        let desc = s.trim().eq_ignore_ascii_case("descend");
+                        for k in &mut col_keys {
+                            k.1 = desc;
+                        }
+                    }
+                    Some(x) => {
+                        let k = x.scalar()? as i64;
+                        let c = k.unsigned_abs().saturating_sub(1) as usize;
+                        if k == 0 || c >= cols {
+                            return Err(LangError::new("sortrows: column index out of range", 0));
+                        }
+                        col_keys = vec![(c, k < 0)];
+                    }
+                    None => {}
+                }
+                let mut order: Vec<usize> = (0..rows).collect();
+                order.sort_by(|&r1, &r2| {
+                    for &(c, desc) in &col_keys {
+                        let a = m.get(r1, c).unwrap_or(0.0);
+                        let b = m.get(r2, c).unwrap_or(0.0);
+                        // NaN sorts last ascending, first descending.
+                        let ord = match (a.is_nan(), b.is_nan()) {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => std::cmp::Ordering::Greater,
+                            (false, true) => std::cmp::Ordering::Less,
+                            _ => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                        };
+                        let ord = if desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                let mut data = Vec::with_capacity(m.numel());
+                let mut idx = Vec::with_capacity(rows);
+                for &r in &order {
+                    idx.push((r + 1) as f64);
+                }
+                for c in 0..cols {
+                    for &r in &order {
+                        data.push(m.get(r, c).unwrap_or(0.0));
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::from_col_major(rows, cols, data).map_err(lang)?), Value::Mat(Matrix::col_vector(idx))])
+            }
+            "accumarray" => {
+                let v = self.eval_args(args)?;
+                let subs = v.first().ok_or_else(|| LangError::new("accumarray needs subscripts", 0))?.to_numeric()?;
+                let vals = v.get(1).ok_or_else(|| LangError::new("accumarray needs values", 0))?.to_numeric()?;
+                // 2-column subs → matrix; single column → vector.
+                if subs.cols() == 2 {
+                    let maxr = subs.data().iter().step_by(subs.rows()).map(|&x| x as usize).max().unwrap_or(0);
+                    let maxc = subs.data().iter().skip(subs.rows()).map(|&x| x as usize).max().unwrap_or(0);
+                    let szr = v.get(2).and_then(|s| s.to_matrix().ok()).and_then(|m| m.data().first().copied()).unwrap_or(maxr as f64) as usize;
+                    let szc = v.get(2).and_then(|s| s.to_matrix().ok()).and_then(|m| m.data().get(1).copied()).unwrap_or(maxc as f64) as usize;
+                    check_elems(szr.saturating_mul(szc))?;
+                    let mut out = vec![0.0; szr.saturating_mul(szc)];
+                    for i in 0..subs.rows() {
+                        let r = subs.get(i, 0).unwrap_or(0.0) as usize;
+                        let c = subs.get(i, 1).unwrap_or(0.0) as usize;
+                        if r == 0 || r > szr || c == 0 || c > szc {
+                            return Err(LangError::new("accumarray: subscript out of range", 0));
+                        }
+                        if let Some(slot) = out.get_mut((c - 1) * szr + (r - 1)) {
+                            *slot += vals.get_linear(i).unwrap_or(0.0);
+                        }
+                    }
+                    return Ok(vec![Value::Mat(Matrix::from_col_major(szr, szc, out).map_err(lang)?)]);
+                }
+                let n = subs.numel();
+                let maxi = subs.data().iter().map(|&x| x as usize).max().unwrap_or(0);
+                let sz = v.get(2).map(|x| x.scalar()).transpose()?.unwrap_or(maxi as f64).max(0.0) as usize;
+                check_elems(sz)?;
+                let mut out = vec![0.0; sz];
+                for i in 0..n {
+                    let k = subs.get_linear(i).unwrap_or(0.0);
+                    if k.fract() != 0.0 || k < 1.0 || k > sz as f64 {
+                        return Err(LangError::new("accumarray: subscript out of range", 0));
+                    }
+                    if let Some(slot) = out.get_mut(k as usize - 1) {
+                        *slot += vals.get_linear(i).unwrap_or(0.0);
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::col_vector(out))])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `int2str`/`mat2str`/`strncmp`/`strncmpi`/`strtok`/`strmatch`/
+    /// `cellstr`/`blanks`/`deblank`/`str2mat`/`regexp`/`regexpi`/`regexprep`.
+    fn str_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        match name {
+            "int2str" => {
+                let m = v.first().ok_or_else(|| LangError::new("int2str needs a number", 0))?.to_numeric()?;
+                let parts: Vec<String> = m.data().iter().map(|&x| format!("{}", x.round() as i64)).collect();
+                Ok(vec![Value::Str(parts.join("  "))])
+            }
+            "mat2str" => {
+                let m = v.first().ok_or_else(|| LangError::new("mat2str needs a matrix", 0))?.to_numeric()?;
+                need_2d(&m, name)?;
+                let long = self.fmt_long;
+                if m.numel() == 0 {
+                    return Ok(vec![Value::Str("[]".to_string())]);
+                }
+                let mut rows = Vec::with_capacity(m.rows());
+                for r in 0..m.rows() {
+                    let row: Vec<String> = (0..m.cols()).map(|c| fmt_num(m.get(r, c).unwrap_or(0.0), long)).collect();
+                    rows.push(row.join(" "));
+                }
+                Ok(vec![Value::Str(format!("[{}]", rows.join(";")))])
+            }
+            "strncmp" | "strncmpi" => {
+                let n = v.get(2).map(|x| x.scalar()).transpose()?.ok_or_else(|| LangError::new(format!("{name} needs three arguments"), 0))?.max(0.0)
+                    as usize;
+                let ci = name == "strncmpi";
+                let prefix_eq = |a: &str, b: &str| -> bool {
+                    let (a, b): (String, String) = if ci { (a.to_lowercase(), b.to_lowercase()) } else { (a.to_string(), b.to_string()) };
+                    a.chars().zip(b.chars()).take(n).all(|(x, y)| x == y)
+                };
+                // Str/Str → scalar; Cell involved → elementwise logical.
+                match (v.first(), v.get(1)) {
+                    (Some(Value::Str(a)), Some(Value::Str(b))) => Ok(vec![Value::Num(if prefix_eq(a, b) { 1.0 } else { 0.0 })]),
+                    (Some(Value::Cell(c)), other) | (other, Some(Value::Cell(c))) => {
+                        let other_str = match other {
+                            Some(Value::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        let mut out = Vec::with_capacity(c.numel());
+                        for i in 0..c.numel() {
+                            let item = match c.get_linear(i) {
+                                Some(Value::Str(s)) => s.clone(),
+                                _ => return Err(LangError::new(format!("{name}: cell elements must be strings"), 0)),
+                            };
+                            let r = match &other_str {
+                                Some(o) => prefix_eq(&item, o),
+                                None => match other {
+                                    Some(Value::Cell(c2)) => match c2.get_linear(i) {
+                                        Some(Value::Str(o)) => prefix_eq(&item, o),
+                                        _ => false,
+                                    },
+                                    _ => false,
+                                },
+                            };
+                            out.push(if r { 1.0 } else { 0.0 });
+                        }
+                        let (r, c2) = c.shape();
+                        Ok(vec![Value::Mat(Matrix::from_col_major(r, c2, out).map_err(lang)?)])
+                    }
+                    _ => Ok(vec![Value::Num(0.0)]),
+                }
+            }
+            "strtok" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("strtok needs a string", 0)),
+                };
+                let delims: Vec<char> = match v.get(1) {
+                    Some(Value::Str(d)) => d.chars().collect(),
+                    _ => vec![' ', '\t', '\n', '\r'],
+                };
+                let chars: Vec<char> = s.chars().collect();
+                let mut i = 0;
+                while i < chars.len() && delims.contains(&chars[i]) {
+                    i += 1;
+                }
+                let start = i;
+                while i < chars.len() && !delims.contains(&chars[i]) {
+                    i += 1;
+                }
+                let tok: String = chars[start..i].iter().collect();
+                let rem: String = chars[i..].iter().collect();
+                Ok(vec![Value::Str(tok), Value::Str(rem)])
+            }
+            "strmatch" => {
+                let needle = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("strmatch needs a string", 0)),
+                };
+                let exact = v.iter().skip(2).any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("exact")));
+                let mut hits = Vec::new();
+                match v.get(1) {
+                    Some(Value::Cell(c)) => {
+                        for i in 0..c.numel() {
+                            if let Some(Value::Str(s)) = c.get_linear(i) {
+                                let hit = if exact { *s == needle } else { s.starts_with(needle.as_str()) };
+                                if hit {
+                                    hits.push((i + 1) as f64);
+                                }
+                            }
+                        }
+                    }
+                    Some(Value::Str(s)) => {
+                        let hit = if exact { *s == needle } else { s.starts_with(needle.as_str()) };
+                        if hit {
+                            hits.push(1.0);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(vec![mat_or_num(Matrix::col_vector(hits))])
+            }
+            "cellstr" => {
+                match v.first() {
+                    Some(Value::Cell(c)) => {
+                        for i in 0..c.numel() {
+                            if !matches!(c.get_linear(i), Some(Value::Str(_))) {
+                                return Err(LangError::new("cellstr: cell elements must be strings", 0));
+                            }
+                        }
+                        Ok(vec![Value::Cell(c.clone())])
+                    }
+                    Some(Value::Str(s)) => {
+                        // Newlines split a char array into rows — closest
+                        // thing to a multi-row char matrix we can hold.
+                        let items: Vec<Value> = s.split('\n').map(|r| Value::Str(r.trim_end_matches('\r').to_string())).collect();
+                        Ok(vec![Value::Cell(CellArray::col(items))])
+                    }
+                    _ => Err(LangError::new("cellstr needs a char array", 0)),
+                }
+            }
+            "blanks" => {
+                let n = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(0.0).max(0.0) as usize;
+                check_elems(n)?;
+                Ok(vec![Value::Str(" ".repeat(n))])
+            }
+            "deblank" => match v.first() {
+                Some(Value::Str(s)) => Ok(vec![Value::Str(s.trim_end().to_string())]),
+                Some(Value::Cell(c)) => {
+                    let mut items = Vec::with_capacity(c.numel());
+                    for i in 0..c.numel() {
+                        match c.get_linear(i) {
+                            Some(Value::Str(s)) => items.push(Value::Str(s.trim_end().to_string())),
+                            _ => return Err(LangError::new("deblank: cell elements must be strings", 0)),
+                        }
+                    }
+                    let (r, cc) = c.shape();
+                    Ok(vec![Value::Cell(CellArray::from_col_major(r, cc, items))])
+                }
+                _ => Err(LangError::new("deblank needs a string", 0)),
+            },
+            "str2mat" => {
+                // Legacy alias for stacked char rows — the closest
+                // representable type here is a cell column of strings.
+                let mut items = Vec::with_capacity(v.len());
+                for x in &v {
+                    match x {
+                        Value::Str(s) => items.push(Value::Str(s.clone())),
+                        _ => return Err(LangError::new("str2mat takes strings", 0)),
+                    }
+                }
+                match items.as_slice() {
+                    [Value::Str(s)] => Ok(vec![Value::Str(s.clone())]),
+                    _ => Ok(vec![Value::Cell(CellArray::col(items))]),
+                }
+            }
+            "regexp" | "regexpi" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("regexp needs a string", 0)),
+                };
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new("regexp needs a pattern", 0)),
+                };
+                let mut what = "start";
+                let mut once = false;
+                let mut ci = name == "regexpi";
+                for x in v.iter().skip(2) {
+                    match x {
+                        Value::Str(o) => match o.trim().to_ascii_lowercase().as_str() {
+                            "start" => what = "start",
+                            "end" | "matchextents" => what = "end",
+                            "match" => what = "match",
+                            "split" => what = "split",
+                            "tokens" => what = "tokens",
+                            "once" => once = true,
+                            "ignorecase" => ci = true,
+                            "matchcase" => ci = false,
+                            _ => return Err(LangError::new(format!("regexp: unsupported option '{o}'"), 0)),
+                        },
+                        _ => return Err(LangError::new("regexp options must be strings", 0)),
+                    }
+                }
+                let re = build_regex(&pat, ci)?;
+                let caps: Vec<regex::Captures> = if once { re.captures(&s).into_iter().collect() } else { re.captures_iter(&s).collect() };
+                // Byte offsets → 1-based char positions.
+                let boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len())).collect();
+                let byte_to_char = |b: usize| -> usize { boundaries.iter().position(|&x| x >= b).map(|p| p + 1).unwrap_or(boundaries.len()) };
+                match what {
+                    "start" | "end" => {
+                        let idxs: Vec<f64> = caps
+                            .iter()
+                            .filter_map(|c| c.get(0))
+                            .map(|m| if what == "start" { byte_to_char(m.start()) } else { byte_to_char(m.end()).saturating_sub(1) })
+                            .map(|i| i as f64)
+                            .collect();
+                        Ok(vec![mat_or_num(Matrix::row_vector(idxs))])
+                    }
+                    "split" => {
+                        let mut items = Vec::new();
+                        let mut last = 0usize;
+                        for c in &caps {
+                            if let Some(m) = c.get(0) {
+                                items.push(Value::Str(s.get(last..m.start()).unwrap_or("").to_string()));
+                                last = m.end();
+                            }
+                        }
+                        items.push(Value::Str(s.get(last..).unwrap_or("").to_string()));
+                        Ok(vec![Value::Cell(CellArray::col(items))])
+                    }
+                    "tokens" => {
+                        let mut items = Vec::new();
+                        for c in &caps {
+                            let toks: Vec<Value> =
+                                (1..c.len()).map(|g| Value::Str(c.get(g).map(|m| m.as_str().to_string()).unwrap_or_default())).collect();
+                            items.push(Value::Cell(CellArray::row(toks)));
+                        }
+                        Ok(vec![Value::Cell(CellArray::row(items))])
+                    }
+                    _ => {
+                        // 'match'
+                        let ms: Vec<Value> = caps.iter().filter_map(|c| c.get(0)).map(|m| Value::Str(m.as_str().to_string())).collect();
+                        if once {
+                            return Ok(vec![ms.into_iter().next().unwrap_or(Value::Str(String::new()))]);
+                        }
+                        Ok(vec![Value::Cell(CellArray::row(ms))])
+                    }
+                }
+            }
+            "regexprep" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("regexprep needs a string", 0)),
+                };
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new("regexprep needs a pattern", 0)),
+                };
+                let rep = match v.get(2) {
+                    Some(Value::Str(r)) => r.clone(),
+                    _ => return Err(LangError::new("regexprep needs a replacement", 0)),
+                };
+                let mut once = false;
+                let mut ci = false;
+                for x in v.iter().skip(3) {
+                    if let Value::Str(o) = x {
+                        match o.trim().to_ascii_lowercase().as_str() {
+                            "once" => once = true,
+                            "ignorecase" => ci = true,
+                            "matchcase" => ci = false,
+                            _ => {}
+                        }
+                    }
+                }
+                // MATLAB writes group refs `$1`; the regex crate wants `${1}`.
+                let mut rep2 = String::with_capacity(rep.len());
+                let mut it = rep.chars().peekable();
+                while let Some(c) = it.next() {
+                    if c == '$' && it.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        rep2.push_str("${");
+                        while it.peek().is_some_and(|c| c.is_ascii_digit()) {
+                            rep2.push(it.next().unwrap_or('0'));
+                        }
+                        rep2.push('}');
+                    } else {
+                        rep2.push(c);
+                    }
+                }
+                let re = build_regex(&pat, ci)?;
+                let out = if once { re.replacen(&s, 1, rep2.as_str()).into_owned() } else { re.replace_all(&s, rep2.as_str()).into_owned() };
+                Ok(vec![Value::Str(out)])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// Environment / system / path / misc one-liners: `version`, `computer`,
+    /// `ispc`/`isunix`/`ismac`, `getenv`/`setenv`, `system`, `fileparts`,
+    /// `copyfile`/`movefile`/`rmdir`/`isdir`/`isfile`/`tempdir`/`tempname`,
+    /// `evalc`/`evalin`/`assignin`, `mfilename`, `license`, `ver`, `drawnow`,
+    /// `beep`, `waitbar`, `input`, `ishandle`, `findobj`/`findall`,
+    /// `ishold`, `gca`, `help`/`doc`, `class`, `inline`, `optimset`/
+    /// `optimget`, `nargchk`.
+    fn sys_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        let sarg = |i: usize| -> Option<&str> {
+            match v.get(i) {
+                Some(Value::Str(s)) => Some(s.as_str()),
+                _ => None,
+            }
+        };
+        match name {
+            "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
+            "ver" => {
+                // struct with Name/Version/Release fields.
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("Name".to_string(), Value::Str("MatCraft".to_string()));
+                m.insert("Version".to_string(), Value::Str(env!("CARGO_PKG_VERSION").to_string()));
+                m.insert("Release".to_string(), Value::Str(String::new()));
+                Ok(vec![Value::Struct(StructArray::from_map(m))])
+            }
+            "computer" => Ok(vec![Value::Str(
+                if cfg!(target_os = "windows") {
+                    "PCWIN64"
+                } else if cfg!(target_os = "macos") {
+                    "MACI64"
+                } else {
+                    "GLNXA64"
+                }
+                .to_string(),
+            )]),
+            "ispc" => Ok(vec![Value::Num(if cfg!(target_os = "windows") { 1.0 } else { 0.0 })]),
+            "isunix" => Ok(vec![Value::Num(if cfg!(unix) { 1.0 } else { 0.0 })]),
+            "ismac" => Ok(vec![Value::Num(if cfg!(target_os = "macos") { 1.0 } else { 0.0 })]),
+            "getenv" => {
+                let n = sarg(0).ok_or_else(|| LangError::new("getenv needs a name", 0))?;
+                Ok(vec![Value::Str(std::env::var(n).unwrap_or_default())])
+            }
+            "setenv" => {
+                let n = sarg(0).ok_or_else(|| LangError::new("setenv needs a name", 0))?.to_string();
+                let val = sarg(1).unwrap_or("").to_string();
+                std::env::set_var(&n, &val);
+                Ok(vec![Value::Num(0.0)])
+            }
+            "system" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let cmd = sarg(0).ok_or_else(|| LangError::new("system needs a command string", 0))?;
+                    let shell = if cfg!(target_os = "windows") { ("cmd", "/c") } else { ("sh", "-c") };
+                    match std::process::Command::new(shell.0).args([shell.1, cmd]).output() {
+                        Ok(o) => {
+                            Ok(vec![Value::Num(o.status.code().unwrap_or(-1) as f64), Value::Str(String::from_utf8_lossy(&o.stdout).into_owned())])
+                        }
+                        Err(e) => Ok(vec![Value::Num(-1.0), Value::Str(e.to_string())]),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Err(LangError::new("system is not available on wasm", 0))
+                }
+            }
+            "fileparts" => {
+                let p = sarg(0).ok_or_else(|| LangError::new("fileparts needs a path", 0))?;
+                let sep = p.rfind(['/', '\\']);
+                let (dir, base) = match sep {
+                    Some(i) => (&p[..i], &p[i + 1..]),
+                    None => ("", p),
+                };
+                let (nm, ext) = match base.rfind('.') {
+                    Some(i) if i > 0 => (&base[..i], &base[i..]),
+                    _ => (base, ""),
+                };
+                Ok(vec![Value::Str(dir.to_string()), Value::Str(nm.to_string()), Value::Str(ext.to_string())])
+            }
+            "copyfile" | "movefile" => {
+                let src = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a source"), 0))?.to_string();
+                let dst = sarg(1).ok_or_else(|| LangError::new(format!("{name} needs a destination"), 0))?.to_string();
+                let dstp = if std::path::Path::new(&dst).is_dir() {
+                    std::path::Path::new(&dst).join(std::path::Path::new(&src).file_name().unwrap_or_default())
+                } else {
+                    std::path::PathBuf::from(&dst)
+                };
+                let r = if name == "copyfile" { std::fs::copy(&src, &dstp).map(|_| ()) } else { std::fs::rename(&src, &dstp).map(|_| ()) };
+                match r {
+                    Ok(()) => Ok(vec![Value::Num(1.0), Value::Str(String::new())]),
+                    Err(e) => Ok(vec![Value::Num(0.0), Value::Str(e.to_string())]),
+                }
+            }
+            "rmdir" => {
+                let d = sarg(0).ok_or_else(|| LangError::new("rmdir needs a directory", 0))?;
+                match std::fs::remove_dir_all(d) {
+                    Ok(()) => Ok(vec![Value::Num(1.0), Value::Str(String::new())]),
+                    Err(e) => Ok(vec![Value::Num(0.0), Value::Str(e.to_string())]),
+                }
+            }
+            "isdir" => Ok(vec![Value::Num(if sarg(0).map(|s| std::path::Path::new(s).is_dir()).unwrap_or(false) { 1.0 } else { 0.0 })]),
+            "isfile" => Ok(vec![Value::Num(if sarg(0).map(|s| std::path::Path::new(s).is_file()).unwrap_or(false) { 1.0 } else { 0.0 })]),
+            "tempdir" => Ok(vec![Value::Str(format!("{}/", std::env::temp_dir().display()))]),
+            "tempname" => {
+                let dir = sarg(0).map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+                Ok(vec![Value::Str(dir.join(format!("tp{:x}{:x}", std::process::id(), self.next_f64().to_bits())).display().to_string())])
+            }
+            "evalc" => {
+                let code = sarg(0).ok_or_else(|| LangError::new("evalc needs a string", 0))?.to_string();
+                // evalc captures the echo instead of printing it.
+                let out = self.run(&code)?;
+                Ok(vec![Value::Str(out)])
+            }
+            "evalin" => {
+                // One shared workspace — 'base' and 'caller' coincide.
+                let code = sarg(1).ok_or_else(|| LangError::new("evalin needs a workspace and an expression", 0))?.to_string();
+                let stmts = crate::parser::parse(&code)?;
+                match stmts.as_slice() {
+                    [Stmt::Expr(e, _)] => Ok(self.eval(e).map(Some)?.into_iter().collect()),
+                    _ => {
+                        let _ = self.run(&code)?;
+                        Ok(vec![])
+                    }
+                }
+            }
+            "assignin" => {
+                // One shared workspace — 'base'/'caller' both land in vars.
+                let n = sarg(1).ok_or_else(|| LangError::new("assignin needs a workspace, a name and a value", 0))?.to_string();
+                let val = v.get(2).cloned().ok_or_else(|| LangError::new("assignin needs a value", 0))?;
+                self.vars.insert(n, val);
+                Ok(vec![])
+            }
+            "mfilename" => {
+                let cur = self.file_stack.last().cloned().unwrap_or_default();
+                let stem = std::path::Path::new(&cur).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                Ok(vec![Value::Str(stem)])
+            }
+            "license" => {
+                // No license enforcement — 'test'/'checkout' report absent.
+                Ok(vec![Value::Num(0.0)])
+            }
+            "drawnow" | "beep" => Ok(vec![]),
+            "waitbar" => {
+                // Headless: accept (fraction, [handle,] message) and return a
+                // dummy handle so scripts keep running.
+                Ok(vec![Value::Num(1.0)])
+            }
+            "input" => {
+                use std::io::Write;
+                if let Some(p) = sarg(0) {
+                    print!("{p}");
+                    let _ = std::io::stdout().flush();
+                }
+                let as_str = matches!(v.get(1), Some(Value::Str(s)) if s.trim() == "s");
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => Ok(vec![if as_str { Value::Str(String::new()) } else { Value::Mat(Matrix::zeros(0, 0)) }]),
+                    Ok(_) => {
+                        let line = line.trim_end_matches(['\n', '\r']).to_string();
+                        if as_str {
+                            return Ok(vec![Value::Str(line)]);
+                        }
+                        // Evaluate the typed line as an expression.
+                        match crate::parser::parse(&line) {
+                            Ok(stmts) => match stmts.as_slice() {
+                                [Stmt::Expr(e, _)] => Ok(self.eval(e).map(Some)?.into_iter().collect()),
+                                _ => Err(LangError::new("input: expected an expression", 0)),
+                            },
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+            }
+            "ishandle" => {
+                let m = v.first().map(|x| x.to_numeric()).transpose()?.unwrap_or_else(|| Matrix::zeros(0, 0));
+                let out: Vec<f64> = m
+                    .data()
+                    .iter()
+                    .map(|&x| {
+                        let n = x as usize;
+                        if x.fract() == 0.0 && n >= 1 && n <= self.figs.len() {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                Ok(vec![mat_or_num(Matrix::from_col_major(m.rows(), m.cols(), out).map_err(lang)?)])
+            }
+            "findobj" | "findall" => {
+                // No graphics-object tree — the empty handle list.
+                Ok(vec![Value::Mat(Matrix::zeros(0, 0))])
+            }
+            "ishold" => Ok(vec![Value::Num(if self.figs.get(self.cur_fig.wrapping_sub(1)).map(|f| f.hold).unwrap_or(false) { 1.0 } else { 0.0 })]),
+            "gca" => {
+                let _ = self.figure_mut();
+                Ok(vec![Value::Num(self.cur_fig as f64)])
+            }
+            "help" | "doc" => {
+                match sarg(0) {
+                    Some(f) => {
+                        if self.is_builtin(f) {
+                            self.print_buf.push_str(&format!("  {f} is a builtin function.\n"));
+                        } else if self.is_function(f)? {
+                            self.print_buf.push_str(&format!("  {f} is a user function.\n"));
+                        } else {
+                            self.print_buf.push_str(&format!("  {f} not found.\n"));
+                        }
+                    }
+                    None => self.print_buf.push_str(&format!("  MatCraft — {} builtins; see docs/language.md\n", BUILTIN_NAMES.len())),
+                }
+                Ok(vec![])
+            }
+            "class" => {
+                let s = match v.first() {
+                    Some(Value::Num(_)) | Some(Value::Mat(_)) => "double",
+                    Some(Value::Cplx(_)) => "double",
+                    Some(Value::Sparse(_)) => "double",
+                    Some(Value::Str(_)) => "char",
+                    Some(Value::Cell(_)) => "cell",
+                    Some(Value::Struct(_)) => "struct",
+                    Some(Value::Func(_)) => "function_handle",
+                    None => "unknown",
+                };
+                Ok(vec![Value::Str(s.to_string())])
+            }
+            "inline" => {
+                let src = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("inline needs an expression string", 0)),
+                };
+                let mut params: Vec<String> = Vec::new();
+                for x in v.iter().skip(1) {
+                    match x {
+                        Value::Str(s) => params.push(s.clone()),
+                        _ => return Err(LangError::new("inline argument names must be strings", 0)),
+                    }
+                }
+                let t = src.trim();
+                if t.starts_with('@') {
+                    return Ok(vec![Value::Func(str_to_func(t)?)]);
+                }
+                let stmts = crate::parser::parse(t).map_err(|e| LangError::new(format!("inline: {}", e.message), 0))?;
+                let body = match stmts.as_slice() {
+                    [Stmt::Expr(e, _)] => e.clone(),
+                    _ => return Err(LangError::new("inline: expected a single expression", 0)),
+                };
+                if params.is_empty() {
+                    // MATLAB infers args from the expression: every name that
+                    // isn't a builtin, alphabetical.
+                    let mut found = std::collections::BTreeSet::new();
+                    expr_idents(&body, &mut found);
+                    for n in found {
+                        if !BUILTIN_NAMES.contains(&n.as_str()) && n != "i" && n != "j" {
+                            params.push(n);
+                        }
+                    }
+                    if params.is_empty() {
+                        params.push("x".to_string());
+                    }
+                }
+                Ok(vec![Value::Func(FuncHandle::Closure { params, body: Box::new(body), env: HashMap::new() })])
+            }
+            "optimset" => {
+                // optimset('name',val,…) or optimset(s,'name',val,…).
+                let mut iter = v.iter().peekable();
+                let mut s = match v.first() {
+                    Some(Value::Struct(s)) => {
+                        iter.next();
+                        s.clone()
+                    }
+                    _ => StructArray::new(),
+                };
+                while let (Some(Value::Str(k)), Some(val)) = (iter.next(), iter.next()) {
+                    if !s.has_field(k) {
+                        s.add_field(k);
+                    }
+                    s.set_field(0, k, val.clone())?;
+                }
+                Ok(vec![Value::Struct(s)])
+            }
+            "optimget" => {
+                let s = match v.first() {
+                    Some(Value::Struct(s)) => s.clone(),
+                    _ => return Err(LangError::new("optimget needs an options struct", 0)),
+                };
+                let key = sarg(1).ok_or_else(|| LangError::new("optimget needs an option name", 0))?;
+                // Case-insensitive unique-prefix match, like MATLAB.
+                let kl = key.to_ascii_lowercase();
+                let names = s.field_names();
+                let mut hit = names.iter().find(|n| n.to_ascii_lowercase() == kl);
+                if hit.is_none() {
+                    let pref: Vec<&String> = names.iter().filter(|n| n.to_ascii_lowercase().starts_with(&kl)).collect();
+                    if pref.len() == 1 {
+                        hit = pref.first().copied();
+                    }
+                }
+                match hit.and_then(|n| s.field_at(0, n)) {
+                    Some(x) => Ok(vec![x.clone()]),
+                    None => Ok(vec![v.get(2).cloned().unwrap_or(Value::Mat(Matrix::zeros(0, 0)))]),
+                }
+            }
+            "nargchk" => {
+                let lo = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(0.0);
+                let hi = v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0);
+                let n = v.get(2).map(|x| x.scalar()).transpose()?.unwrap_or(0.0);
+                let msg = if n < lo {
+                    "Not enough input arguments.".to_string()
+                } else if n > hi {
+                    "Too many input arguments.".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(vec![Value::Str(msg)])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `single`/`int8`/`int16`/`int32`/`int64`/`uint16`/`uint32`/`uint64` —
+    /// MATLAB cast semantics (round-to-nearest, saturate to range). Values
+    /// stay `f64` internally; `class` still reports `double`.
+    fn cast_call(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
+        let m = self.arg_matrix_or_str(args)?;
+        let (lo, hi): (f64, f64) = match name {
+            "int8" => (i8::MIN as f64, i8::MAX as f64),
+            "int16" => (i16::MIN as f64, i16::MAX as f64),
+            "int32" => (i32::MIN as f64, i32::MAX as f64),
+            "int64" => (-(2f64.powi(63)), 2f64.powi(63) - 1.0),
+            "uint16" => (0.0, u16::MAX as f64),
+            "uint32" => (0.0, u32::MAX as f64),
+            "uint64" => (0.0, 2f64.powi(64) - 1.0),
+            _ => (f64::NEG_INFINITY, f64::INFINITY),
+        };
+        let out = m.map(|x| {
+            if name == "single" {
+                x as f32 as f64
+            } else if x.is_nan() {
+                0.0
+            } else {
+                x.round().clamp(lo, hi)
+            }
+        });
+        Ok(Some(mat_or_num(out)))
+    }
+
+    /// Argument matrix where a `Str` promotes to char codes (for the
+    /// integer casts, which accept char input like `'a'` → 97).
+    fn arg_matrix_or_str(&mut self, args: &[Expr]) -> Result<Matrix, LangError> {
+        let v = self.eval_args(args)?;
+        v.first().ok_or_else(|| LangError::new("missing argument", 0))?.to_numeric()
+    }
+
+    /// `cov`/`prctile`/`quantile`/`hist`/`histc`.
+    fn stat_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        match name {
+            "cov" => {
+                let m = v.first().ok_or_else(|| LangError::new("cov needs data", 0))?.to_numeric()?;
+                need_2d(&m, name)?;
+                let div = if v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0) == 1.0 { "n" } else { "n-1" };
+                // cov(x, y): two vectors → 2×2.
+                if let Some(yv) = v.get(1).filter(|x| matches!(x, Value::Num(_) | Value::Mat(_))) {
+                    let y = yv.to_numeric()?;
+                    if m.numel() != y.numel() {
+                        return Err(LangError::new("cov: vectors must match", 0));
+                    }
+                    let n = m.numel();
+                    if n < 2 {
+                        return Ok(vec![Value::Mat(Matrix::from_col_major(2, 2, vec![0.0; 4]).map_err(lang)?)]);
+                    }
+                    let d = if div == "n" { n as f64 } else { (n - 1) as f64 };
+                    let mx = m.data().iter().sum::<f64>() / n as f64;
+                    let my = y.data().iter().sum::<f64>() / n as f64;
+                    let mut sxx = 0.0;
+                    let mut syy = 0.0;
+                    let mut sxy = 0.0;
+                    for i in 0..n {
+                        let dx = m.get_linear(i).unwrap_or(0.0) - mx;
+                        let dy = y.get_linear(i).unwrap_or(0.0) - my;
+                        sxx += dx * dx;
+                        syy += dy * dy;
+                        sxy += dx * dy;
+                    }
+                    return Ok(vec![Value::Mat(Matrix::from_col_major(2, 2, vec![sxx / d, sxy / d, sxy / d, syy / d]).map_err(lang)?)]);
+                }
+                let (n, p) = m.shape();
+                if n < 2 {
+                    let mut d = vec![0.0; p * p];
+                    for (i, slot) in d.iter_mut().enumerate() {
+                        if i % (p + 1) == 0 {
+                            *slot = f64::NAN;
+                        }
+                    }
+                    return Ok(vec![Value::Mat(Matrix::from_col_major(p, p, d).map_err(lang)?)]);
+                }
+                let dd = if div == "n" { n as f64 } else { (n - 1) as f64 };
+                let means: Vec<f64> = (0..p).map(|c| (0..n).map(|r| m.get(r, c).unwrap_or(0.0)).sum::<f64>() / n as f64).collect();
+                let mut c = vec![0.0; p * p];
+                for j in 0..p {
+                    for k in j..p {
+                        let mut s = 0.0;
+                        for r in 0..n {
+                            s += (m.get(r, j).unwrap_or(0.0) - means[j]) * (m.get(r, k).unwrap_or(0.0) - means[k]);
+                        }
+                        let val = s / dd;
+                        if let Some(slot) = c.get_mut(k * p + j) {
+                            *slot = val;
+                        }
+                        if let Some(slot) = c.get_mut(j * p + k) {
+                            *slot = val;
+                        }
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::from_col_major(p, p, c).map_err(lang)?)])
+            }
+            "prctile" | "quantile" => {
+                let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs data"), 0))?.to_numeric()?;
+                let qs = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs a percentage/quantile"), 0))?.to_numeric()?;
+                let mut xs: Vec<f64> = m.data().iter().copied().filter(|x| !x.is_nan()).collect();
+                xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = xs.len();
+                let out: Vec<f64> = qs
+                    .data()
+                    .iter()
+                    .map(|&q| {
+                        // Quantile fraction q ∈ [0,1] (prctile takes 0-100).
+                        let q = if name == "prctile" { q / 100.0 } else { q };
+                        if n == 0 {
+                            return f64::NAN;
+                        }
+                        // Linear interpolation (type-7): h = 1 + (n-1)·q.
+                        let h = (1.0 + (n - 1) as f64 * q).clamp(1.0, n as f64);
+                        let lo = h.floor() as usize;
+                        let frac = h - lo as f64;
+                        let a = xs.get(lo - 1).copied().unwrap_or(f64::NAN);
+                        let b = xs.get(lo.min(n - 1)).copied().unwrap_or(a);
+                        a + frac * (b - a)
+                    })
+                    .collect();
+                Ok(vec![mat_or_num(Matrix::from_col_major(qs.rows(), qs.cols(), out).map_err(lang)?)])
+            }
+            "hist" | "histc" => {
+                let m = v.first().ok_or_else(|| LangError::new(format!("{name} needs data"), 0))?.to_numeric()?;
+                let xs: &[f64] = m.data();
+                if name == "histc" {
+                    // edges arg required; last bin catches x == edges(end).
+                    let e = v.get(1).ok_or_else(|| LangError::new("histc needs edges", 0))?.to_numeric()?;
+                    let edges: Vec<f64> = e.data().to_vec();
+                    let nb = edges.len();
+                    let mut counts = vec![0.0; nb];
+                    let mut bins = Vec::with_capacity(xs.len());
+                    for &x in xs {
+                        let b = if x.is_nan() {
+                            0
+                        } else if edges.len() >= 2 && x == *edges.last().unwrap_or(&f64::NAN) {
+                            nb
+                        } else {
+                            match edges.partition_point(|&e| e <= x) {
+                                0 => 0,
+                                p if p >= nb => 0,
+                                p => p,
+                            }
+                        };
+                        bins.push(b as f64);
+                        if b >= 1 {
+                            if let Some(slot) = counts.get_mut(b - 1) {
+                                *slot += 1.0;
+                            }
+                        }
+                    }
+                    let cm = if e.cols() > 1 { Matrix::row_vector(counts) } else { Matrix::col_vector(counts) };
+                    return Ok(vec![Value::Mat(cm), Value::Mat(Matrix::col_vector(bins))]);
+                }
+                // hist(x, k) → k bins spanning [min,max]; hist(x, ctrs) →
+                // bins centred on the given centres.
+                let nb_or_ctrs = v.get(1).map(|x| x.to_numeric()).transpose()?.unwrap_or_else(|| Matrix::scalar(10.0));
+                let centres: Vec<f64> = if nb_or_ctrs.numel() == 1 {
+                    let nb = nb_or_ctrs.get_linear(0).unwrap_or(10.0).max(1.0) as usize;
+                    check_elems(nb)?;
+                    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                    for &x in xs {
+                        if !x.is_nan() {
+                            lo = lo.min(x);
+                            hi = hi.max(x);
+                        }
+                    }
+                    if !lo.is_finite() {
+                        lo = 0.0;
+                        hi = 1.0;
+                    }
+                    if lo == hi {
+                        lo -= 0.5;
+                        hi += 0.5;
+                    }
+                    let w = (hi - lo) / nb as f64;
+                    (0..nb).map(|i| lo + (i as f64 + 0.5) * w).collect()
+                } else {
+                    nb_or_ctrs.data().to_vec()
+                };
+                let nb = centres.len();
+                let mut counts = vec![0.0; nb];
+                let mut bins = Vec::with_capacity(xs.len());
+                for &x in xs {
+                    // Nearest-centre bin (edges at midpoints).
+                    let mut best = 0usize;
+                    let mut bd = f64::INFINITY;
+                    for (i, &c) in centres.iter().enumerate() {
+                        let d = (x - c).abs();
+                        if d < bd {
+                            bd = d;
+                            best = i;
+                        }
+                    }
+                    bins.push(if x.is_nan() { 0.0 } else { (best + 1) as f64 });
+                    if !x.is_nan() {
+                        if let Some(slot) = counts.get_mut(best) {
+                            *slot += 1.0;
+                        }
+                    }
+                }
+                Ok(vec![mat_or_num(Matrix::row_vector(counts)), mat_or_num(Matrix::row_vector(centres)), mat_or_num(Matrix::col_vector(bins))])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `fir1`/`fspecial`/`peaks`/`im2double` — small DSP/image generators.
+    fn dspimg_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        match name {
+            "fir1" => {
+                // fir1(n, wn[, 'low'|'high'|'bandpass'|'stop'|, window]):
+                // windowed-sinc FIR, cutoff(s) normalised to Nyquist = 1.
+                let n = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(-1.0);
+                if n < 0.0 || n.fract() != 0.0 || n > 1e6 {
+                    return Err(LangError::new("fir1 order must be a nonnegative integer", 0));
+                }
+                let n = n as usize;
+                let wm = v.get(1).ok_or_else(|| LangError::new("fir1 needs a cutoff", 0))?.to_numeric()?;
+                if !(wm.numel() == 1 || wm.numel() == 2) || wm.data().iter().any(|&w| !(w > 0.0 && w < 1.0)) {
+                    return Err(LangError::new("fir1 cutoffs must be scalars or pairs in (0, 1)", 0));
+                }
+                let wn: Vec<f64> = wm.data().to_vec();
+                let mut ftype = if wn.len() == 2 { "bandpass" } else { "low" };
+                let mut win: Option<Vec<f64>> = None;
+                for x in v.iter().skip(2) {
+                    match x {
+                        Value::Str(s) => {
+                            ftype = match s.trim().to_ascii_lowercase().as_str() {
+                                "low" => "low",
+                                "high" => "high",
+                                "bandpass" | "dc-0" => "bandpass",
+                                "stop" | "dc-1" => "stop",
+                                other => return Err(LangError::new(format!("fir1: unknown filter type '{other}'"), 0)),
+                            };
+                        }
+                        other => win = Some(other.to_numeric()?.data().to_vec()),
+                    }
+                }
+                let win = match win {
+                    Some(w) if w.len() == n + 1 => w,
+                    Some(_) => return Err(LangError::new("fir1: window must have n+1 elements", 0)),
+                    None => matcore::dsp::hamming(n + 1, false),
+                };
+                let mid = n as f64 / 2.0;
+                // Ideal lowpass impulse at cutoff fc: sin(π·fc·m)/(π·m).
+                let ideal = |fc: f64, i: usize| -> f64 {
+                    let x = i as f64 - mid;
+                    if x.abs() < 1e-12 {
+                        fc
+                    } else {
+                        (std::f64::consts::PI * fc * x).sin() / (std::f64::consts::PI * x)
+                    }
+                };
+                let mut taps = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let delta = if (i as f64 - mid).abs() < 1e-12 { 1.0 } else { 0.0 };
+                    let h = match ftype {
+                        "high" => delta - ideal(wn[0], i),
+                        "bandpass" => ideal(wn.get(1).copied().unwrap_or(wn[0]), i) - ideal(wn[0], i),
+                        "stop" => delta - (ideal(wn.get(1).copied().unwrap_or(wn[0]), i) - ideal(wn[0], i)),
+                        _ => ideal(wn[0], i),
+                    };
+                    taps.push(h * win.get(i).copied().unwrap_or(0.0));
+                }
+                Ok(vec![mat_or_num(Matrix::row_vector(taps))])
+            }
+            "fspecial" => {
+                let kind = match v.first() {
+                    Some(Value::Str(s)) => s.trim().to_ascii_lowercase(),
+                    _ => return Err(LangError::new("fspecial needs a filter type", 0)),
+                };
+                // `[m n]` size argument, `h` scalar → h×h.
+                let dims2 = |i: usize, d: (usize, usize)| -> Result<(usize, usize), LangError> {
+                    match v.get(i) {
+                        None => Ok(d),
+                        Some(x) => {
+                            let m = x.to_numeric()?;
+                            match m.numel() {
+                                1 => {
+                                    let s = m.get_linear(0).unwrap_or(3.0).max(1.0) as usize;
+                                    check_elems(s.saturating_mul(s))?;
+                                    Ok((s, s))
+                                }
+                                _ => {
+                                    let r = m.get_linear(0).unwrap_or(3.0).max(1.0) as usize;
+                                    let c = m.get_linear(1).unwrap_or(3.0).max(1.0) as usize;
+                                    check_elems(r.saturating_mul(c))?;
+                                    Ok((r, c))
+                                }
+                            }
+                        }
+                    }
+                };
+                let sc = |i: usize, d: f64| v.get(i).map(|x| x.scalar()).transpose().map(|o| o.unwrap_or(d));
+                let kernel = match kind.as_str() {
+                    "average" => {
+                        let (r, c) = dims2(1, (3, 3))?;
+                        Matrix::from_col_major(r, c, vec![1.0 / (r * c) as f64; r * c]).map_err(lang)?
+                    }
+                    "gaussian" => {
+                        let (r, c) = dims2(1, (3, 3))?;
+                        let sig = sc(2, 0.5)?.abs().max(1e-6);
+                        let mut data = Vec::with_capacity(r * c);
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                let dy = rr as f64 - (r as f64 - 1.0) / 2.0;
+                                let dx = cc as f64 - (c as f64 - 1.0) / 2.0;
+                                data.push((-(dx * dx + dy * dy) / (2.0 * sig * sig)).exp());
+                            }
+                        }
+                        let s: f64 = data.iter().sum();
+                        for x in &mut data {
+                            *x /= s;
+                        }
+                        Matrix::from_col_major(r, c, data).map_err(lang)?
+                    }
+                    "disk" => {
+                        let rad = sc(1, 5.0)?.abs().max(0.5);
+                        let d = (2.0 * rad).ceil() as usize + 1;
+                        check_elems(d.saturating_mul(d))?;
+                        let mut data = Vec::with_capacity(d * d);
+                        let mut sum = 0.0;
+                        for cc in 0..d {
+                            for rr in 0..d {
+                                let dy = rr as f64 - (d as f64 - 1.0) / 2.0;
+                                let dx = cc as f64 - (d as f64 - 1.0) / 2.0;
+                                let val = if (dx * dx + dy * dy).sqrt() <= rad { 1.0 } else { 0.0 };
+                                sum += val;
+                                data.push(val);
+                            }
+                        }
+                        if sum > 0.0 {
+                            for x in &mut data {
+                                *x /= sum;
+                            }
+                        }
+                        Matrix::from_col_major(d, d, data).map_err(lang)?
+                    }
+                    "laplacian" => {
+                        let a = sc(1, 0.2)?.clamp(0.0, 1.0);
+                        let corner = a / (a + 1.0);
+                        let side = (1.0 - a) / (a + 1.0);
+                        let center = -4.0 / (a + 1.0);
+                        // Row order [[c s c]; [s -4/(a+1) s]; [c s c]] → col-major.
+                        Matrix::from_col_major(3, 3, vec![corner, side, corner, side, center, side, corner, side, corner]).map_err(lang)?
+                    }
+                    "log" => {
+                        let (r, c) = dims2(1, (5, 5))?;
+                        let sig = sc(2, 0.5)?.abs().max(1e-6);
+                        let mut data = Vec::with_capacity(r * c);
+                        for cc in 0..c {
+                            for rr in 0..r {
+                                let dy = rr as f64 - (r as f64 - 1.0) / 2.0;
+                                let dx = cc as f64 - (c as f64 - 1.0) / 2.0;
+                                let r2 = dx * dx + dy * dy;
+                                data.push((r2 - 2.0 * sig * sig) / sig.powi(4) * (-r2 / (2.0 * sig * sig)).exp());
+                            }
+                        }
+                        Matrix::from_col_major(r, c, data).map_err(lang)?
+                    }
+                    "motion" => {
+                        // Line of `len` pixels at `theta` degrees; the
+                        // rasterisation is approximate (nearest-pixel).
+                        let len = sc(1, 9.0)?.abs().max(1.0);
+                        let theta = sc(2, 0.0)?.to_radians();
+                        let (dx, dy) = (theta.cos(), -theta.sin());
+                        let side = ((len * dx.abs()).ceil().max(len * dy.abs()).ceil() as usize).max(1);
+                        check_elems(side.saturating_mul(side))?;
+                        let n = len.ceil() as usize;
+                        let ctr = (side - 1) as f64 / 2.0;
+                        let mut data = vec![0.0; side * side];
+                        for k in 0..n {
+                            let t = if n == 1 { 0.0 } else { k as f64 / (n - 1) as f64 * (len - 1.0) - (len - 1.0) / 2.0 };
+                            let rr = (ctr + t * dy).round().max(0.0) as usize;
+                            let cc = (ctr + t * dx).round().max(0.0) as usize;
+                            if let Some(slot) = data.get_mut(cc * side + rr) {
+                                *slot += 1.0;
+                            }
+                        }
+                        let sum: f64 = data.iter().sum();
+                        if sum > 0.0 {
+                            for x in &mut data {
+                                *x /= sum;
+                            }
+                        }
+                        Matrix::from_col_major(side, side, data).map_err(lang)?
+                    }
+                    "prewitt" => Matrix::from_col_major(3, 3, vec![1.0, 0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, -1.0]).map_err(lang)?,
+                    "sobel" => Matrix::from_col_major(3, 3, vec![1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0]).map_err(lang)?,
+                    "unsharp" => {
+                        let a = sc(1, 0.2)?.clamp(0.0, 1.0);
+                        let k = 1.0 / (a + 1.0);
+                        let (cn, sd, ct) = (-a * k, (a - 1.0) * k, (a + 5.0) * k);
+                        Matrix::from_col_major(3, 3, vec![cn, sd, cn, sd, ct, sd, cn, sd, cn]).map_err(lang)?
+                    }
+                    _ => return Err(LangError::new(format!("fspecial: unknown filter type '{kind}'"), 0)),
+                };
+                Ok(vec![Value::Mat(kernel)])
+            }
+            "peaks" => {
+                let n = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(49.0).max(1.0) as usize;
+                check_elems(n.saturating_mul(n))?;
+                let (mut x, mut y, mut z) = (Matrix::zeros(n, n), Matrix::zeros(n, n), Matrix::zeros(n, n));
+                for c in 0..n {
+                    for r in 0..n {
+                        let xv = -3.0 + 6.0 * c as f64 / (n.saturating_sub(1)).max(1) as f64;
+                        let yv = -3.0 + 6.0 * r as f64 / (n.saturating_sub(1)).max(1) as f64;
+                        let zv = 3.0 * (1.0 - xv).powi(2) * (-(xv * xv) - (yv + 1.0) * (yv + 1.0)).exp()
+                            - 10.0 * (xv / 5.0 - xv.powi(3) - yv.powi(5)) * (-(xv * xv) - yv * yv).exp()
+                            - (1.0 / 3.0) * (-((xv + 1.0) * (xv + 1.0)) - yv * yv).exp();
+                        let _ = x.set(r, c, xv);
+                        let _ = y.set(r, c, yv);
+                        let _ = z.set(r, c, zv);
+                    }
+                }
+                Ok(vec![Value::Mat(x), Value::Mat(y), Value::Mat(z)])
+            }
+            "im2double" => {
+                let m = v.first().ok_or_else(|| LangError::new("im2double needs an image", 0))?.to_numeric()?;
+                // No integer storage classes here — infer the assumed class:
+                // data already in [0,1] (or non-integral) passes through as
+                // double; integral 0..255 → uint8 scale, 0..65535 → uint16.
+                let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                let mut all_int = true;
+                for &x in m.data() {
+                    if x.is_nan() {
+                        continue;
+                    }
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                    if x.fract() != 0.0 {
+                        all_int = false;
+                    }
+                }
+                let out = if !all_int || lo >= 0.0 && hi <= 1.0 {
+                    m
+                } else if lo >= 0.0 && hi <= 255.0 {
+                    m.map(|x| x / 255.0)
+                } else if lo >= 0.0 && hi <= 65535.0 {
+                    m.map(|x| x / 65535.0)
+                } else {
+                    m
+                };
+                Ok(vec![mat_or_num(out)])
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `imread`/`imwrite` — PNG only (8-bit gray or RGB). Pixels read back
+    /// as doubles 0–255; `imwrite` treats data ≤ 1 as the [0,1] range and
+    /// anything larger as already in 0–255.
+    fn image_io(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        match name {
+            "imread" => {
+                let fname = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("imread needs a filename", 0)),
+                };
+                let bytes = std::fs::read(&fname).map_err(|e| LangError::new(format!("imread: cannot read {fname}: {e}"), 0))?;
+                let (w, h, px, ch) = crate::imgpng::decode(&bytes)?;
+                check_elems(h.saturating_mul(w).saturating_mul(ch))?;
+                if ch == 1 {
+                    let mut data = Vec::with_capacity(w * h);
+                    for c in 0..w {
+                        for r in 0..h {
+                            data.push(px.get(r * w + c).copied().unwrap_or(0) as f64);
+                        }
+                    }
+                    Ok(Some(mat_or_num(Matrix::from_col_major(h, w, data).map_err(lang)?)))
+                } else {
+                    // MATLAB: M×N×3 with the channel as the third dim —
+                    // column-major over each page.
+                    let mut data = Vec::with_capacity(w * h * 3);
+                    for k in 0..3 {
+                        for c in 0..w {
+                            for r in 0..h {
+                                data.push(px.get((r * w + c) * 3 + k).copied().unwrap_or(0) as f64);
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Mat(Matrix::from_col_major_nd(&[h, w, 3], data).map_err(lang)?)))
+                }
+            }
+            "imwrite" => {
+                let m = v.first().ok_or_else(|| LangError::new("imwrite needs an image", 0))?.to_numeric()?;
+                let fname = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("imwrite needs a filename", 0)),
+                };
+                let dims = m.dims();
+                if dims.len() > 3 {
+                    return Err(LangError::new("imwrite needs a 2-D or MxNx3 image", 0));
+                }
+                let (h, w, ch) = (dims.first().copied().unwrap_or(0), dims.get(1).copied().unwrap_or(0), dims.get(2).copied().unwrap_or(1));
+                if ch != 1 && ch != 3 {
+                    return Err(LangError::new("imwrite: third dimension must be 1 or 3", 0));
+                }
+                let max = m.data().iter().copied().fold(0.0f64, f64::max);
+                let scale = if max <= 1.0 { 255.0 } else { 1.0 };
+                let mut px = Vec::with_capacity(w * h * ch);
+                for r in 0..h {
+                    for c in 0..w {
+                        for k in 0..ch {
+                            let x = m.get_nd(&[r, c, k]).unwrap_or(0.0);
+                            px.push((x * scale).round().clamp(0.0, 255.0) as u8);
+                        }
+                    }
+                }
+                let png = crate::imgpng::encode(w, h, &px, ch)?;
+                crate::write_file(std::path::Path::new(&fname), &png)
+                    .map_err(|e| LangError::new(format!("imwrite: cannot write {fname}: {e}"), 0))?;
+                Ok(None)
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `bitand`/`bitor`/`bitxor`/`bitshift`/`bitget`/`bitset`/`bitcmp` —
+    /// element-wise on nonnegative integer values below 2^64 (deviation:
+    /// MATLAB restricts doubles to < 2^53). `bitcmp`/`bitshift` assume the
+    /// smallest 8/16/32/64-bit type that holds the value unless a width is
+    /// given.
+    fn bits_call(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        let a = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?.to_numeric()?;
+        match name {
+            "bitcmp" => {
+                let nbits = v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0);
+                if nbits.fract() != 0.0 || nbits < 0.0 {
+                    return Err(LangError::new("bitcmp: bit count must be a nonnegative integer", 0));
+                }
+                let mut out = Vec::with_capacity(a.numel());
+                for &x in a.data() {
+                    let b = to_u64_bits(x, name)?;
+                    let nb = if nbits > 0.0 {
+                        (nbits as usize).min(64)
+                    } else if b <= u8::MAX as u64 {
+                        8
+                    } else if b <= u16::MAX as u64 {
+                        16
+                    } else if b <= u32::MAX as u64 {
+                        32
+                    } else {
+                        64
+                    };
+                    let mask = if nb >= 64 { u64::MAX } else { (1u64 << nb) - 1 };
+                    out.push((!b & mask) as f64);
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major_nd(a.dims(), out).map_err(lang)?)))
+            }
+            "bitshift" => {
+                let k = v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0);
+                if k.fract() != 0.0 {
+                    return Err(LangError::new("bitshift: shift count must be an integer", 0));
+                }
+                let nbits = v.get(2).map(|x| x.scalar()).transpose()?.unwrap_or(64.0).clamp(1.0, 64.0) as usize;
+                let mask = if nbits >= 64 { u64::MAX } else { (1u64 << nbits) - 1 };
+                let mut out = Vec::with_capacity(a.numel());
+                for &x in a.data() {
+                    let b = to_u64_bits(x, name)? & mask;
+                    let r = if k >= 0.0 { b.wrapping_shl(k as u32) & mask } else { b >> ((-k as i64).min(63) as u32) };
+                    out.push(r as f64);
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major_nd(a.dims(), out).map_err(lang)?)))
+            }
+            "bitget" | "bitset" => {
+                let pos = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs a bit index"), 0))?.to_numeric()?;
+                let (ea, ep, dims) = broadcast_pair(&a, &pos, name)?;
+                let ev: Option<Vec<f64>> = match v.get(2) {
+                    Some(x) => {
+                        let vm = x.to_numeric()?;
+                        if vm.numel() == 1 {
+                            Some(vec![vm.get_linear(0).unwrap_or(0.0); ea.len()])
+                        } else {
+                            let (vv, _, _) = broadcast_pair(&vm, &Matrix::zeros_nd(&dims), name)?;
+                            Some(vv)
+                        }
+                    }
+                    None => None,
+                };
+                if name == "bitset" && ev.is_none() {
+                    return Err(LangError::new("bitset needs a value", 0));
+                }
+                let mut out = Vec::with_capacity(ea.len());
+                for (i, &xv) in ea.iter().enumerate() {
+                    let x = to_u64_bits(xv, name)?;
+                    let b = to_u64_bits(ep.get(i).copied().unwrap_or(0.0), name)?;
+                    if !(1..=64).contains(&b) {
+                        return Err(LangError::new(format!("{name}: bit index out of range"), 0));
+                    }
+                    let sh = b - 1;
+                    let r = match name {
+                        "bitget" => (x >> sh) & 1,
+                        _ => {
+                            let bv = to_u64_bits(ev.as_ref().and_then(|e| e.get(i)).copied().unwrap_or(0.0), name)?;
+                            if bv == 0 {
+                                x & !(1u64 << sh)
+                            } else {
+                                x | (1u64 << sh)
+                            }
+                        }
+                    };
+                    out.push(r as f64);
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major_nd(&dims, out).map_err(lang)?)))
+            }
+            _ => {
+                // bitand / bitor / bitxor.
+                let b = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs two inputs"), 0))?.to_numeric()?;
+                let (ea, eb, dims) = broadcast_pair(&a, &b, name)?;
+                let mut out = Vec::with_capacity(ea.len());
+                for (i, &xv) in ea.iter().enumerate() {
+                    let x = to_u64_bits(xv, name)?;
+                    let y = to_u64_bits(eb.get(i).copied().unwrap_or(0.0), name)?;
+                    out.push(match name {
+                        "bitand" => x & y,
+                        "bitor" => x | y,
+                        _ => x ^ y,
+                    } as f64);
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major_nd(&dims, out).map_err(lang)?)))
+            }
+        }
+    }
+
+    /// `datenum`/`now`/`clock`/`etime`/`datestr` — serial date numbers
+    /// (days since the fixed epoch, 0000-01-01 → 1). `now`/`clock` report
+    /// UTC (no timezone facilities on this layer).
+    fn date_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        let frac = |h: i64, mi: i64, s: f64| (h * 3600 + mi * 60) as f64 + s;
+        match name {
+            "datenum" => {
+                if let Some(Value::Str(s)) = v.first() {
+                    let (y, mo, d, h, mi, sec) = parse_date_str(s).ok_or_else(|| LangError::new(format!("datenum: cannot parse '{s}'"), 0))?;
+                    return Ok(vec![Value::Num(serial_of(y, mo, d, frac(h, mi, sec) / 86400.0))]);
+                }
+                match v.len() {
+                    3 | 6 => {
+                        let scal = |i: usize| -> Result<f64, LangError> { v.get(i).map(|x| x.scalar()).transpose().map(|o| o.unwrap_or(0.0)) };
+                        let (y, mo, d) = (scal(0)? as i64, scal(1)? as i64, scal(2)? as i64);
+                        let f = if v.len() == 6 { frac(scal(3)? as i64, scal(4)? as i64, scal(5)?) } else { 0.0 };
+                        Ok(vec![Value::Num(serial_of(y, mo, d, f / 86400.0))])
+                    }
+                    _ => {
+                        // A datevec matrix: N×3 or N×6 → column of serials.
+                        let m =
+                            v.first().ok_or_else(|| LangError::new("datenum needs 3 or 6 numbers, a datevec matrix or a string", 0))?.to_numeric()?;
+                        need_2d(&m, name)?;
+                        let c = m.cols();
+                        if c != 3 && c != 6 {
+                            return Err(LangError::new("datenum: datevec rows must have 3 or 6 columns", 0));
+                        }
+                        let mut out = Vec::with_capacity(m.rows());
+                        for r in 0..m.rows() {
+                            let y = m.get(r, 0).unwrap_or(0.0) as i64;
+                            let mo = m.get(r, 1).unwrap_or(0.0) as i64;
+                            let d = m.get(r, 2).unwrap_or(0.0) as i64;
+                            let f = if c == 6 {
+                                frac(m.get(r, 3).unwrap_or(0.0) as i64, m.get(r, 4).unwrap_or(0.0) as i64, m.get(r, 5).unwrap_or(0.0))
+                            } else {
+                                0.0
+                            };
+                            out.push(serial_of(y, mo, d, f / 86400.0));
+                        }
+                        Ok(vec![mat_or_num(Matrix::col_vector(out))])
+                    }
+                }
+            }
+            "now" | "clock" => {
+                let s = now_serial()?;
+                if name == "now" {
+                    Ok(vec![Value::Num(s)])
+                } else {
+                    let (y, mo, d, h, mi, sec) = civil_of_serial(s);
+                    Ok(vec![Value::Mat(Matrix::row_vector(vec![y as f64, mo as f64, d as f64, h as f64, mi as f64, sec]))])
+                }
+            }
+            "etime" => {
+                let t2 = v.first().ok_or_else(|| LangError::new("etime needs two date vectors", 0))?.to_numeric()?;
+                let t1 = v.get(1).ok_or_else(|| LangError::new("etime needs two date vectors", 0))?.to_numeric()?;
+                if t2.numel() != 6 || t1.numel() != 6 {
+                    return Err(LangError::new("etime needs two 6-element date vectors", 0));
+                }
+                let s = |t: &Matrix| -> f64 {
+                    serial_of(
+                        t.get_linear(0).unwrap_or(0.0) as i64,
+                        t.get_linear(1).unwrap_or(0.0) as i64,
+                        t.get_linear(2).unwrap_or(0.0) as i64,
+                        frac(t.get_linear(3).unwrap_or(0.0) as i64, t.get_linear(4).unwrap_or(0.0) as i64, t.get_linear(5).unwrap_or(0.0)) / 86400.0,
+                    )
+                };
+                Ok(vec![Value::Num((s(&t2) - s(&t1)) * 86400.0)])
+            }
+            "datestr" => {
+                let fmt = v.get(1).map(|x| x.scalar()).transpose()?.unwrap_or(0.0) as i64;
+                // datestr accepts a string (re-formats it) or serials /
+                // N×6 datevecs.
+                let serials: Vec<f64> = match v.first() {
+                    Some(Value::Str(s)) => match parse_date_str(s) {
+                        Some((y, mo, d, h, mi, sec)) => vec![serial_of(y, mo, d, frac(h, mi, sec) / 86400.0)],
+                        None => return Err(LangError::new(format!("datestr: cannot parse '{s}'"), 0)),
+                    },
+                    Some(x) => {
+                        let m = x.to_numeric()?;
+                        if m.cols() == 6 {
+                            (0..m.rows())
+                                .map(|r| {
+                                    serial_of(
+                                        m.get(r, 0).unwrap_or(0.0) as i64,
+                                        m.get(r, 1).unwrap_or(0.0) as i64,
+                                        m.get(r, 2).unwrap_or(0.0) as i64,
+                                        frac(m.get(r, 3).unwrap_or(0.0) as i64, m.get(r, 4).unwrap_or(0.0) as i64, m.get(r, 5).unwrap_or(0.0))
+                                            / 86400.0,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            m.data().to_vec()
+                        }
+                    }
+                    None => return Err(LangError::new("datestr needs a date", 0)),
+                };
+                let strs: Vec<String> = serials.iter().map(|&s| datestr_fmt(s, fmt)).collect();
+                match strs.as_slice() {
+                    [one] => Ok(vec![Value::Str(one.clone())]),
+                    // MATLAB returns a stacked char matrix; the closest
+                    // representable shape is a cell column of strings.
+                    many => Ok(vec![Value::Cell(CellArray::col(many.iter().map(|s| Value::Str(s.clone())).collect()))]),
+                }
+            }
+            _ => Err(LangError::new(format!("{name}: not implemented"), 0)),
+        }
+    }
+
+    /// `csvwrite`/`dlmwrite`/`dlmread`/`readmatrix`/`writematrix` —
+    /// delimited text matrices. `dlmwrite` honours `'delimiter'`, `r, c`
+    /// offsets and `'-append'`; `dlmread`/`readmatrix` auto-detect the
+    /// delimiter when it isn't given.
+    fn delim_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        let sarg = |i: usize| -> Option<&str> {
+            match v.get(i) {
+                Some(Value::Str(s)) => Some(s.as_str()),
+                _ => None,
+            }
+        };
+        match name {
+            "dlmread" | "readmatrix" => {
+                let fname = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a filename"), 0))?.to_string();
+                let text = read_m_source(std::path::Path::new(&fname))?;
+                let mut delim: Option<Vec<char>> = None;
+                let mut offs: Vec<f64> = Vec::new();
+                for x in v.iter().skip(1) {
+                    match x {
+                        Value::Str(s) => delim = Some(s.chars().collect()),
+                        other => offs.extend(other.to_numeric()?.data().iter().copied()),
+                    }
+                }
+                let roff = offs.first().copied().unwrap_or(0.0).max(0.0) as usize;
+                let coff = offs.get(1).copied().unwrap_or(0.0).max(0.0) as usize;
+                let rows = parse_delim(&text, delim.as_deref());
+                let kept: Vec<&Vec<f64>> = rows.iter().skip(roff).filter(|r| r.len() > coff).collect();
+                let ncols = kept.iter().map(|r| r.len() - coff).max().unwrap_or(0);
+                check_elems(kept.len().saturating_mul(ncols))?;
+                let mut data = vec![0.0; kept.len() * ncols];
+                for (r, row) in kept.iter().enumerate() {
+                    for (c, &x) in row.iter().skip(coff).enumerate() {
+                        if let Some(slot) = data.get_mut(c * kept.len() + r) {
+                            *slot = x;
+                        }
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::from_col_major(kept.len(), ncols, data).map_err(lang)?)])
+            }
+            _ => {
+                // csvwrite(file, m[, r, c]) / dlmwrite(file, m[, delim][, r, c])
+                // / writematrix(m, file) — flag-style extras ignored.
+                let (fname, m) = if name == "writematrix" {
+                    let m = v.first().ok_or_else(|| LangError::new("writematrix needs a matrix", 0))?.to_numeric()?;
+                    let f = sarg(1).ok_or_else(|| LangError::new("writematrix needs a filename", 0))?.to_string();
+                    (f, m)
+                } else {
+                    let f = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a filename"), 0))?.to_string();
+                    let m = v.get(1).ok_or_else(|| LangError::new(format!("{name} needs a matrix"), 0))?.to_numeric()?;
+                    (f, m)
+                };
+                need_2d(&m, name)?;
+                let mut delim = ',';
+                let mut append = false;
+                let mut roff = 0usize;
+                let mut coff = 0usize;
+                let mut npos = 0usize;
+                for x in v.iter().skip(2) {
+                    match x {
+                        Value::Str(s) if s.starts_with('-') => {
+                            if s == "-append" {
+                                append = true;
+                            }
+                        }
+                        Value::Str(s) => {
+                            if let Some(c) = s.chars().next() {
+                                delim = c;
+                            }
+                        }
+                        other => {
+                            let mm = other.to_numeric()?;
+                            if mm.numel() >= 2 {
+                                roff = mm.get_linear(0).unwrap_or(0.0).max(0.0) as usize;
+                                coff = mm.get_linear(1).unwrap_or(0.0).max(0.0) as usize;
+                            } else {
+                                match npos {
+                                    0 => roff = mm.get_linear(0).unwrap_or(0.0).max(0.0) as usize,
+                                    _ => coff = mm.get_linear(0).unwrap_or(0.0).max(0.0) as usize,
+                                }
+                                npos += 1;
+                            }
+                        }
+                    }
+                }
+                if name == "csvwrite" {
+                    delim = ',';
+                }
+                let pad = vec![delim; coff].into_iter().collect::<String>();
+                let mut out = String::new();
+                for _ in 0..roff {
+                    out.push('\n');
+                }
+                for r in 0..m.rows() {
+                    out.push_str(&pad);
+                    for c in 0..m.cols() {
+                        if c > 0 {
+                            out.push(delim);
+                        }
+                        out.push_str(&fmt_g(m.get(r, c).unwrap_or(0.0), 5));
+                    }
+                    out.push('\n');
+                }
+                if append {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&fname)
+                        .map_err(|e| LangError::new(format!("{name}: cannot open {fname}: {e}"), 0))?;
+                    f.write_all(out.as_bytes()).map_err(|e| LangError::new(format!("{name}: {e}"), 0))?;
+                } else {
+                    crate::write_file(std::path::Path::new(&fname), out.as_bytes())
+                        .map_err(|e| LangError::new(format!("{name}: cannot write {fname}: {e}"), 0))?;
+                }
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// `repelem(v, n)` — repeat each element of `v`: scalar `n` tiles
+    /// uniformly, a same-length `n` gives per-element counts, and `[r c]`
+    /// on a matrix tiles each element into an `r×c` block. Strings and
+    /// cells repeat their elements the same way.
+    fn repelem_call(&mut self, args: &[Expr]) -> Result<Option<Value>, LangError> {
+        let v = self.eval_args(args)?;
+        let first = v.first().ok_or_else(|| LangError::new("repelem needs an array", 0))?;
+        let n = v.get(1).ok_or_else(|| LangError::new("repelem needs a repeat count", 0))?.to_numeric()?;
+        let counts = |len: usize| -> Result<Vec<usize>, LangError> {
+            if n.numel() == 1 {
+                let k = n.get_linear(0).unwrap_or(0.0);
+                if k < 0.0 || k.fract() != 0.0 {
+                    return Err(LangError::new("repelem: counts must be nonnegative integers", 0));
+                }
+                check_elems(len.saturating_mul(k as usize))?;
+                Ok(vec![k as usize; len])
+            } else if n.numel() == len {
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let k = n.get_linear(i).unwrap_or(0.0);
+                    if k < 0.0 || k.fract() != 0.0 {
+                        return Err(LangError::new("repelem: counts must be nonnegative integers", 0));
+                    }
+                    out.push(k as usize);
+                }
+                check_elems(out.iter().sum())?;
+                Ok(out)
+            } else {
+                Err(LangError::new("repelem: count must be scalar or match the input length", 0))
+            }
+        };
+        match first {
+            Value::Str(s) => {
+                let cs = counts(s.chars().count())?;
+                let mut out = String::new();
+                for (c, &k) in s.chars().zip(cs.iter()) {
+                    for _ in 0..k {
+                        out.push(c);
+                    }
+                }
+                Ok(Some(Value::Str(out)))
+            }
+            Value::Cell(c) => {
+                let cs = counts(c.numel())?;
+                let mut items = Vec::new();
+                for i in 0..c.numel() {
+                    for _ in 0..cs.get(i).copied().unwrap_or(0) {
+                        items.push(c.get_linear(i).cloned().unwrap_or(Value::Mat(Matrix::zeros(0, 0))));
+                    }
+                }
+                let (r, _) = c.shape();
+                Ok(Some(Value::Cell(if r <= 1 { CellArray::row(items) } else { CellArray::col(items) })))
+            }
+            other => {
+                let m = other.to_numeric()?;
+                let vector_form = m.rows() == 1 || m.cols() == 1 || m.numel() == 0;
+                if vector_form && (n.numel() == 1 || n.numel() == m.numel()) {
+                    let cs = counts(m.numel())?;
+                    let mut out = Vec::new();
+                    for (i, &k) in cs.iter().enumerate() {
+                        for _ in 0..k {
+                            out.push(m.get_linear(i).unwrap_or(0.0));
+                        }
+                    }
+                    return Ok(Some(mat_or_num(if m.cols() == 1 { Matrix::col_vector(out) } else { Matrix::row_vector(out) })));
+                }
+                // Matrix form: each element tiles an r×c block.
+                let r = n.get_linear(0).unwrap_or(0.0);
+                let c = if n.numel() >= 2 { n.get_linear(1).unwrap_or(0.0) } else { r };
+                if r < 0.0 || c < 0.0 || r.fract() != 0.0 || c.fract() != 0.0 {
+                    return Err(LangError::new("repelem: counts must be nonnegative integers", 0));
+                }
+                let (r, c) = (r as usize, c as usize);
+                check_elems(m.rows().saturating_mul(r).saturating_mul(m.cols()).saturating_mul(c))?;
+                let mut data = Vec::with_capacity(m.rows() * r * m.cols() * c);
+                for cc in 0..m.cols() {
+                    for _ in 0..c {
+                        for rr in 0..m.rows() {
+                            for _ in 0..r {
+                                data.push(m.get(rr, cc).unwrap_or(0.0));
+                            }
+                        }
+                    }
+                }
+                Ok(Some(mat_or_num(Matrix::from_col_major(m.rows() * r, m.cols() * c, data).map_err(lang)?)))
+            }
+        }
     }
 
     /// `fft`/`ifft`/`fft2`/`ifft2` — column-wise over matrices, whole-vector
@@ -6309,7 +8963,20 @@ impl Session {
     /// vector, 2 = per row → column vector).
     fn reduce(&mut self, name: &str, m: &Matrix, dim: usize) -> Result<Value, LangError> {
         let reduce_vec = |d: &[f64]| -> f64 {
-            match name {
+            // `nan<op>` variants reduce the slice with NaNs filtered out;
+            // an all-NaN slice yields NaN (matching `nanmean` etc).
+            let filtered;
+            let (base, d): (&str, &[f64]) = match name.strip_prefix("nan") {
+                Some(b) => {
+                    filtered = d.iter().copied().filter(|x| !x.is_nan()).collect::<Vec<f64>>();
+                    (b, filtered.as_slice())
+                }
+                None => (name, d),
+            };
+            if base != name && d.is_empty() {
+                return f64::NAN;
+            }
+            match base {
                 "sum" => d.iter().sum(),
                 "mean" => {
                     if d.is_empty() {
@@ -8456,10 +11123,161 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "NaN",
     "eps",
     "mkdir",
+    // --- corpus-coverage batch: file I/O, scanning, sets, indexing,
+    // strings, environment, casts, NaN-stats, stats, DSP/image, bitwise,
+    // degree trig, dates, delimited files.
+    "fopen",
+    "fclose",
+    "fread",
+    "fwrite",
+    "fseek",
+    "ftell",
+    "feof",
+    "frewind",
+    "ferror",
+    "fgetl",
+    "fgets",
+    "delete",
+    "fscanf",
+    "sscanf",
+    "textscan",
+    "strread",
+    "ismember",
+    "setdiff",
+    "union",
+    "intersect",
+    "setxor",
+    "sub2ind",
+    "ind2sub",
+    "ndgrid",
+    "permute",
+    "ipermute",
+    "shiftdim",
+    "bsxfun",
+    "flip",
+    "sortrows",
+    "accumarray",
+    "int2str",
+    "mat2str",
+    "strncmp",
+    "strncmpi",
+    "strtok",
+    "strmatch",
+    "cellstr",
+    "blanks",
+    "deblank",
+    "str2mat",
+    "regexp",
+    "regexpi",
+    "regexprep",
+    "version",
+    "computer",
+    "ispc",
+    "isunix",
+    "ismac",
+    "getenv",
+    "setenv",
+    "system",
+    "fileparts",
+    "copyfile",
+    "movefile",
+    "rmdir",
+    "isdir",
+    "isfile",
+    "tempdir",
+    "tempname",
+    "evalc",
+    "evalin",
+    "assignin",
+    "mfilename",
+    "license",
+    "ver",
+    "drawnow",
+    "beep",
+    "waitbar",
+    "input",
+    "ishandle",
+    "findobj",
+    "findall",
+    "ishold",
+    "gca",
+    "help",
+    "doc",
+    "class",
+    "inline",
+    "optimset",
+    "optimget",
+    "nargchk",
+    "single",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint16",
+    "uint32",
+    "uint64",
+    "nansum",
+    "nanmean",
+    "nanprod",
+    "nanmin",
+    "nanmax",
+    "nanstd",
+    "nanvar",
+    "nanmedian",
+    "cov",
+    "prctile",
+    "quantile",
+    "hist",
+    "histc",
+    "fir1",
+    "fspecial",
+    "peaks",
+    "im2double",
+    "imread",
+    "imwrite",
+    "bitand",
+    "bitor",
+    "bitxor",
+    "bitshift",
+    "bitget",
+    "bitset",
+    "bitcmp",
+    "sind",
+    "cosd",
+    "tand",
+    "asind",
+    "acosd",
+    "atand",
+    "atan2d",
+    "datenum",
+    "now",
+    "clock",
+    "etime",
+    "datestr",
+    "csvwrite",
+    "dlmwrite",
+    "dlmread",
+    "readmatrix",
+    "writematrix",
+    "repelem",
 ];
 
 fn lang(e: MatError) -> LangError {
     LangError::new(e.to_string(), 0)
+}
+
+/// Read an `.m` source file. UTF-8 first; on a decode failure fall back to
+/// a Latin-1 → UTF-8 conversion (every byte maps 1:1 to a char, so it's
+/// deterministic — no silent mojibake). `.m` files from older MATLAB
+/// installs are routinely Latin-1/Windows-1252 (accented comments, degree
+/// signs); this lets them load. Callers that read files themselves should
+/// use this instead of `fs::read_to_string`.
+pub fn read_m_source(path: &std::path::Path) -> Result<String, LangError> {
+    let bytes = std::fs::read(path).map_err(|e| LangError::new(format!("cannot read {}: {e}", path.display()), 0))?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    })
 }
 
 /// Collect a finished `# name <n> <kind> r c` block from a tagged-ASCII file
@@ -8536,6 +11354,810 @@ fn glob_match(pat: &str, name: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Bit-pattern key for set operations: normalises `-0.0` to `0.0` so the
+/// two zeros compare equal, like M-code.
+fn vkey(x: f64) -> u64 {
+    if x == 0.0 {
+        0
+    } else {
+        x.to_bits()
+    }
+}
+
+/// `bit*` operands must be nonnegative integers below 2^64.
+fn to_u64_bits(x: f64, name: &str) -> Result<u64, LangError> {
+    if !x.is_finite() || x.fract() != 0.0 || x < 0.0 || x >= 18446744073709551616.0 {
+        Err(LangError::new(format!("{name} needs nonnegative integer values below 2^64"), 0))
+    } else {
+        Ok(x as u64)
+    }
+}
+
+/// Normalise a `fread`/`fwrite` precision name: lowercased, with the `*`
+/// ("same class") prefix and the `=>outclass` decoration stripped — both
+/// only affect the output type, which stays `double` here anyway.
+fn prec_norm(prec: &str) -> String {
+    let p = prec.trim().to_ascii_lowercase();
+    let p = p.strip_prefix('*').unwrap_or(p.as_str());
+    p.split("=>").next().unwrap_or(p).trim().to_string()
+}
+
+/// Bytes per element for a `fread`/`fwrite` precision, `None` when the
+/// name isn't recognised.
+fn prec_bytes(prec: &str) -> Option<usize> {
+    match prec_norm(prec).as_str() {
+        "char" | "uchar" | "schar" | "int8" | "uint8" | "bit8" | "ubit8" => Some(1),
+        "int16" | "uint16" | "short" | "ushort" | "bit16" | "ubit16" => Some(2),
+        "int32" | "uint32" | "int" | "uint" | "single" | "float32" | "float" | "bit32" | "ubit32" => Some(4),
+        "int64" | "uint64" | "long" | "ulong" | "double" | "float64" | "bit64" | "ubit64" => Some(8),
+        _ => None,
+    }
+}
+
+/// Does this precision read/write text? `fread(..., 'char')` yields a
+/// char array instead of a double column.
+fn prec_is_char(prec: &str) -> bool {
+    matches!(prec_norm(prec).as_str(), "char" | "uchar" | "schar")
+}
+
+/// Precision name → (bytes, signed) for the integer classes.
+fn prec_int_shape(prec: &str) -> Option<(usize, bool)> {
+    match prec {
+        "char" | "uchar" | "uint8" | "bit8" | "ubit8" => Some((1, false)),
+        "schar" | "int8" => Some((1, true)),
+        "uint16" | "ushort" | "bit16" | "ubit16" => Some((2, false)),
+        "int16" | "short" => Some((2, true)),
+        "uint32" | "uint" | "bit32" | "ubit32" => Some((4, false)),
+        "int32" | "int" => Some((4, true)),
+        "uint64" | "ulong" | "bit64" | "ubit64" => Some((8, false)),
+        "int64" | "long" => Some((8, true)),
+        _ => None,
+    }
+}
+
+/// Append the `n`-byte little/big-endian form of `v` to `out`.
+fn push_int(out: &mut Vec<u8>, v: u64, n: usize, be: bool) {
+    let b = v.to_be_bytes();
+    if be {
+        out.extend_from_slice(&b[8 - n..]);
+    } else {
+        out.extend(b[8 - n..].iter().rev());
+    }
+}
+
+/// Encode doubles into the byte form `fwrite(A, prec)` emits. Integers
+/// are rounded then saturated to the class range; `char`/`uchar` take
+/// code points; `single`/`double` write IEEE floats.
+fn encode_prec(vals: &[f64], prec: &str, big_endian: bool) -> Result<Vec<u8>, LangError> {
+    let p = prec_norm(prec);
+    let mut out = Vec::with_capacity(vals.len().saturating_mul(prec_bytes(prec).unwrap_or(1)));
+    for &x in vals {
+        match p.as_str() {
+            "single" | "float32" | "float" => {
+                let b = (x as f32).to_be_bytes();
+                if big_endian {
+                    out.extend_from_slice(&b);
+                } else {
+                    out.extend(b.iter().rev());
+                }
+            }
+            "double" | "float64" => {
+                let b = x.to_be_bytes();
+                if big_endian {
+                    out.extend_from_slice(&b);
+                } else {
+                    out.extend(b.iter().rev());
+                }
+            }
+            _ => {
+                let (n, signed) = prec_int_shape(p.as_str()).ok_or_else(|| LangError::new(format!("fwrite: unknown precision '{prec}'"), 0))?;
+                let (lo, hi) =
+                    if signed { (-(2f64.powi(8 * n as i32 - 1)), 2f64.powi(8 * n as i32 - 1) - 1.0) } else { (0.0, 2f64.powi(8 * n as i32) - 1.0) };
+                // NaN saturates to 0 through `as`; in-range clamps first.
+                let v = if x.is_nan() { 0.0 } else { x.round().clamp(lo, hi) };
+                push_int(&mut out, if signed { v as i64 as u64 } else { v as u64 }, n, big_endian);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode `epb`-byte elements out of `buf`, skipping `skip` bytes after
+/// each element, until `want` values or the buffer runs dry. Returns the
+/// decoded values and the element count actually read.
+fn decode_prec(buf: &[u8], prec: &str, epb: usize, skip: usize, big_endian: bool, want: usize) -> (Vec<f64>, usize) {
+    let p = prec_norm(prec);
+    let mut vals = Vec::with_capacity(want.min(buf.len() / epb.max(1)));
+    let mut pos = 0usize;
+    while vals.len() < want && pos.saturating_add(epb) <= buf.len() {
+        let e = buf.get(pos..pos + epb).unwrap_or(&[]);
+        let x = match p.as_str() {
+            "single" | "float32" | "float" => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(e.get(..4).unwrap_or(&[]));
+                f32::from_le_bytes(if big_endian {
+                    b.reverse();
+                    b
+                } else {
+                    b
+                }) as f64
+            }
+            "double" | "float64" => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(e.get(..8).unwrap_or(&[]));
+                f64::from_le_bytes(if big_endian {
+                    b.reverse();
+                    b
+                } else {
+                    b
+                })
+            }
+            _ => match prec_int_shape(p.as_str()) {
+                Some((n, signed)) => {
+                    let e = e.get(..n).unwrap_or(&[]);
+                    let mut b = [0u8; 8];
+                    let u = if big_endian {
+                        b[8 - n..].copy_from_slice(e);
+                        u64::from_be_bytes(b)
+                    } else {
+                        b[..n].copy_from_slice(e);
+                        u64::from_le_bytes(b)
+                    };
+                    if signed && n < 8 {
+                        ((u << (64 - 8 * n)) as i64 >> (64 - 8 * n)) as f64
+                    } else {
+                        u as f64
+                    }
+                }
+                None => break,
+            },
+        };
+        vals.push(x);
+        pos = pos.saturating_add(epb).saturating_add(skip);
+    }
+    let nread = vals.len();
+    (vals, nread)
+}
+
+/// Build a regex for `regexp`/`regexpi`/`regexprep`. M-code's pattern
+/// syntax is close enough to the `regex` crate's default to pass
+/// straight through; the crate's unsupported constructs (look-around,
+/// back-references) surface as a pattern error.
+fn build_regex(pat: &str, ci: bool) -> Result<regex::Regex, LangError> {
+    regex::RegexBuilder::new(pat).case_insensitive(ci).build().map_err(|e| LangError::new(format!("invalid regular expression '{pat}': {e}"), 0))
+}
+
+/// Collect every identifier appearing in `e` — `inline` infers its
+/// argument list from these (the caller filters builtins). Anonymous
+/// functions shadow their own params.
+fn expr_idents(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+    match e {
+        Expr::Ident(n) => {
+            out.insert(n.clone());
+        }
+        Expr::BraceIndex(n, args) | Expr::CallOrIndex(n, args) => {
+            out.insert(n.clone());
+            for a in args {
+                expr_idents(a, out);
+            }
+        }
+        Expr::Range(a, s, b) => {
+            expr_idents(a, out);
+            if let Some(s) = s.as_deref() {
+                expr_idents(s, out);
+            }
+            expr_idents(b, out);
+        }
+        Expr::Matrix(rows) | Expr::CellMat(rows) => {
+            for r in rows {
+                for c in r {
+                    expr_idents(c, out);
+                }
+            }
+        }
+        Expr::Field(b, _) => expr_idents(b, out),
+        Expr::DynField(b, n) => {
+            expr_idents(b, out);
+            expr_idents(n, out);
+        }
+        Expr::Index(b, args) | Expr::BraceIdx(b, args) => {
+            expr_idents(b, out);
+            for a in args {
+                expr_idents(a, out);
+            }
+        }
+        Expr::Unary(_, x) | Expr::Transpose(x, _) => expr_idents(x, out),
+        Expr::Binary(_, a, b) => {
+            expr_idents(a, out);
+            expr_idents(b, out);
+        }
+        Expr::AnonFunc(params, body) => {
+            let mut inner = std::collections::BTreeSet::new();
+            expr_idents(body, &mut inner);
+            for p in params {
+                inner.remove(p);
+            }
+            out.extend(inner);
+        }
+        Expr::Num(_) | Expr::CNum(_) | Expr::Str(_) | Expr::Colon | Expr::End | Expr::FuncRef(_) => {}
+    }
+}
+
+/// One item of a `fscanf`-style format: a literal to match verbatim or a
+/// conversion spec.
+struct ScanSpec {
+    /// `%*` — consume the field but store nothing.
+    suppress: bool,
+    /// Field-width cap in chars; 0 = unlimited.
+    width: usize,
+    kind: ScanKind,
+}
+
+#[derive(Clone, Copy)]
+enum ScanKind {
+    /// Literal (non-`%`, non-whitespace) char that must match the input.
+    Lit(char),
+    /// `%d`/`%i`/`%u`/`%f`/`%e`/`%g` — a number.
+    Num,
+    /// `%s`/`%q` — a non-whitespace run.
+    Str,
+    /// `%c` — `width` raw chars (default 1), no whitespace skip.
+    Chr,
+}
+
+/// One output column of `textscan`/`strread`: numeric conversions fill a
+/// double column, `%s`/`%c`/`%q` fill a cell column of strings.
+enum ScanCol {
+    Nums(Vec<f64>),
+    Strs(Vec<String>),
+}
+
+/// Parse a `scanf` format: `%[*,width]conv` items plus literals. Format
+/// whitespace is implicit — every conversion already skips it (except
+/// `%c`, which is the M-code rule too).
+fn parse_scan_fmt(fmt: &str) -> Result<Vec<ScanSpec>, LangError> {
+    let mut out = Vec::new();
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c != '%' {
+            out.push(ScanSpec { suppress: true, width: 0, kind: ScanKind::Lit(c) });
+            continue;
+        }
+        if it.peek() == Some(&'%') {
+            it.next();
+            out.push(ScanSpec { suppress: true, width: 0, kind: ScanKind::Lit('%') });
+            continue;
+        }
+        let suppress = if it.peek() == Some(&'*') {
+            it.next();
+            true
+        } else {
+            false
+        };
+        let mut width = 0usize;
+        while let Some(&d) = it.peek() {
+            if !d.is_ascii_digit() {
+                break;
+            }
+            it.next();
+            width = width.saturating_mul(10).saturating_add(d as usize - '0' as usize);
+        }
+        let conv = it.next().ok_or_else(|| LangError::new("truncated format specifier", 0))?;
+        let kind = match conv {
+            'd' | 'i' | 'u' | 'f' | 'e' | 'E' | 'g' | 'G' => ScanKind::Num,
+            's' | 'q' => ScanKind::Str,
+            'c' => ScanKind::Chr,
+            _ => return Err(LangError::new(format!("unsupported format conversion '%{conv}'"), 0)),
+        };
+        out.push(ScanSpec { suppress, width, kind });
+    }
+    Ok(out)
+}
+
+/// Longest numeric prefix at `chars[start..]` (capped at `width` chars,
+/// 0 = no cap): optional sign, `inf`/`nan`, or digits with a `.` and an
+/// optional `e±d` exponent. Returns (value, chars consumed).
+fn scan_num(chars: &[char], start: usize, width: usize) -> Option<(f64, usize)> {
+    let end = if width == 0 { chars.len() } else { (start + width).min(chars.len()) };
+    let mut i = start;
+    if i < end && (chars[i] == '+' || chars[i] == '-') {
+        i += 1;
+    }
+    let rest: String = chars[i..end.min(i + 3)].iter().collect();
+    let low = rest.to_ascii_lowercase();
+    if low.starts_with("inf") {
+        let v = if chars.get(start) == Some(&'-') { f64::NEG_INFINITY } else { f64::INFINITY };
+        return Some((v, i + 3 - start));
+    }
+    if low.starts_with("nan") {
+        return Some((f64::NAN, i + 3 - start));
+    }
+    let mut digits = 0usize;
+    while i < end && chars[i].is_ascii_digit() {
+        i += 1;
+        digits += 1;
+    }
+    if i < end && chars[i] == '.' {
+        i += 1;
+        while i < end && chars[i].is_ascii_digit() {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    // Exponent: only consumed when digits follow `e[+-]`.
+    if i < end && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        if j < end && (chars[j] == '+' || chars[j] == '-') {
+            j += 1;
+        }
+        let d0 = j;
+        while j < end && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > d0 {
+            i = j;
+        }
+    }
+    let tok: String = chars[start..i].iter().collect();
+    tok.parse::<f64>().ok().map(|v| (v, i - start))
+}
+
+/// Sequential `fscanf`/`sscanf` scan: the spec list applies cyclically
+/// until a conversion fails, input runs out, or `max_elems` numbers are
+/// stored. When the format stores text (`%s`/`%c`), the second return is
+/// the accumulated matched text — numeric fields contribute their raw
+/// source text, the way M-code renders the mixed case.
+fn scan_seq(text: &str, specs: &[ScanSpec], max_elems: usize) -> (Vec<f64>, Option<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pos = 0usize;
+    let want_str = specs.iter().any(|s| !s.suppress && matches!(s.kind, ScanKind::Str | ScanKind::Chr));
+    let mut nums = Vec::new();
+    let mut strs = String::new();
+    'outer: loop {
+        let pass_start = pos;
+        for spec in specs {
+            match spec.kind {
+                ScanKind::Lit(c) => {
+                    if chars.get(pos) == Some(&c) {
+                        pos += 1;
+                    } else {
+                        break 'outer;
+                    }
+                }
+                ScanKind::Num => {
+                    while chars.get(pos).is_some_and(|c| c.is_whitespace()) {
+                        pos += 1;
+                    }
+                    match scan_num(&chars, pos, spec.width) {
+                        Some((v, used)) => {
+                            pos += used;
+                            if !spec.suppress {
+                                if want_str {
+                                    strs.extend(&chars[pos - used..pos]);
+                                } else {
+                                    nums.push(v);
+                                }
+                            }
+                        }
+                        None => break 'outer,
+                    }
+                }
+                ScanKind::Str => {
+                    while chars.get(pos).is_some_and(|c| c.is_whitespace()) {
+                        pos += 1;
+                    }
+                    let start = pos;
+                    let limit = if spec.width == 0 { usize::MAX } else { spec.width };
+                    while pos < chars.len() && pos - start < limit && !chars[pos].is_whitespace() {
+                        pos += 1;
+                    }
+                    if pos == start {
+                        break 'outer;
+                    }
+                    if !spec.suppress {
+                        strs.extend(&chars[start..pos]);
+                    }
+                }
+                ScanKind::Chr => {
+                    let n = spec.width.max(1);
+                    if pos + n > chars.len() {
+                        break 'outer;
+                    }
+                    if !spec.suppress {
+                        strs.extend(&chars[pos..pos + n]);
+                    }
+                    pos += n;
+                }
+            }
+            if nums.len() >= max_elems {
+                break 'outer;
+            }
+        }
+        if pos >= chars.len() || pos == pass_start {
+            break;
+        }
+    }
+    (nums, if want_str { Some(strs) } else { None })
+}
+
+/// `textscan`/`strread` core: sweep `specs` record-by-record over `src`,
+/// one output column per stored spec. `delim` = explicit delimiter
+/// chars; `None` = whitespace runs (coalesced). `max_n` bounds records.
+/// Fields that don't convert store NaN / "" — M-code's `textscan`
+/// behaviour — and a truncated final record pads the same way.
+fn textscan(src: &str, specs: &[ScanSpec], max_n: usize, delim: Option<&str>) -> Vec<ScanCol> {
+    let mut cols: Vec<ScanCol> = specs
+        .iter()
+        .filter(|s| !s.suppress)
+        .map(|s| match s.kind {
+            ScanKind::Str | ScanKind::Chr => ScanCol::Strs(Vec::new()),
+            _ => ScanCol::Nums(Vec::new()),
+        })
+        .collect();
+    if cols.is_empty() {
+        return cols;
+    }
+    let dch: Vec<char> = delim.map(|d| d.chars().collect()).unwrap_or_default();
+    let is_delim = |c: char| if dch.is_empty() { c.is_whitespace() } else { dch.contains(&c) };
+    let chars: Vec<char> = src.chars().collect();
+    let mut pos = 0usize;
+    let mut row = 0usize;
+    'rows: while row < max_n {
+        let mut ci = 0usize; // output column index (skips suppressed specs)
+        for spec in specs {
+            // Whitespace-delimited fields coalesce runs; explicit delims
+            // preserve empty fields.
+            if dch.is_empty() {
+                while pos < chars.len() && is_delim(chars[pos]) {
+                    pos += 1;
+                }
+            }
+            if pos >= chars.len() {
+                if ci == 0 {
+                    break 'rows; // clean EOF at a record boundary
+                }
+                // Truncated record: pad the rest, then stop.
+                for col in cols.iter_mut().skip(ci) {
+                    match col {
+                        ScanCol::Nums(ns) => ns.push(f64::NAN),
+                        ScanCol::Strs(ss) => ss.push(String::new()),
+                    }
+                }
+                break 'rows;
+            }
+            let start = pos;
+            let limit = if spec.width == 0 { usize::MAX } else { spec.width };
+            while pos < chars.len() && pos - start < limit && !is_delim(chars[pos]) {
+                pos += 1;
+            }
+            let field: String = chars[start..pos].iter().collect();
+            if !dch.is_empty() && pos < chars.len() && is_delim(chars[pos]) {
+                pos += 1; // consume the delimiter
+            }
+            if spec.suppress {
+                continue;
+            }
+            match (cols.get_mut(ci), spec.kind) {
+                (Some(ScanCol::Nums(ns)), ScanKind::Num) => ns.push(field.trim().parse::<f64>().unwrap_or(f64::NAN)),
+                (Some(ScanCol::Strs(ss)), ScanKind::Str) => ss.push(field),
+                (Some(ScanCol::Strs(ss)), ScanKind::Chr) => ss.push(field.chars().next().map(|c| c.to_string()).unwrap_or_default()),
+                _ => {}
+            }
+            ci += 1;
+        }
+        row += 1;
+    }
+    cols
+}
+
+/// `permute(A, order)`/`shiftdim` core: `order` is a 1-based
+/// permutation; out-dim `j` is in-dim `order[j]`.
+fn permute_mat(m: &Matrix, order: &[usize]) -> Result<Matrix, LangError> {
+    let k = order.len();
+    if k == 0 || !order.iter().all(|&o| o >= 1 && o <= k) || (1..=k).any(|d| !order.contains(&d)) {
+        return Err(LangError::new("permute: ORDER must be a permutation of the dimensions", 0));
+    }
+    if k < m.ndims() {
+        return Err(LangError::new("permute: ORDER must list every dimension", 0));
+    }
+    let out_dims: Vec<usize> = order.iter().map(|&o| m.dims().get(o - 1).copied().unwrap_or(1)).collect();
+    let n: usize = out_dims.iter().product();
+    check_elems(n)?;
+    let mut data = Vec::with_capacity(n);
+    for lin in 0..n {
+        let mut rem = lin;
+        let mut in_subs = vec![0usize; k];
+        for (j, &d) in out_dims.iter().enumerate() {
+            in_subs[order[j] - 1] = rem % d;
+            rem /= d;
+        }
+        data.push(m.get_nd(&in_subs).unwrap_or(0.0));
+    }
+    Matrix::from_col_major_nd(&out_dims, data).map_err(lang)
+}
+
+/// Broadcast-expand `m` to `dims` (caller has already checked
+/// compatibility) — returns column-major data of `product(dims)`
+/// elements. Singleton dims of `m` index 0 in that dimension.
+fn expand_to(m: &Matrix, dims: &[usize]) -> Vec<f64> {
+    let n: usize = dims.iter().product();
+    let mut out = Vec::with_capacity(n);
+    let mut subs = vec![0usize; dims.len()];
+    for lin in 0..n {
+        let mut rem = lin;
+        for (j, &d) in dims.iter().enumerate() {
+            let s = rem % d;
+            rem /= d;
+            subs[j] = if m.dims().get(j).copied().unwrap_or(1) == 1 { 0 } else { s };
+        }
+        out.push(m.get_nd(&subs).unwrap_or(0.0));
+    }
+    out
+}
+
+/// `(data_a, data_b, dims)` from [`broadcast_pair`].
+type Broadcast = (Vec<f64>, Vec<f64>, Vec<usize>);
+
+/// Broadcast two matrices to common dims (per-dim max; mismatched
+/// non-singleton dims error). Returns `(data_a, data_b, dims)`.
+fn broadcast_pair(a: &Matrix, b: &Matrix, name: &str) -> Result<Broadcast, LangError> {
+    let nd = a.ndims().max(b.ndims());
+    let mut dims = Vec::with_capacity(nd);
+    for i in 0..nd {
+        let da = a.dims().get(i).copied().unwrap_or(1);
+        let db = b.dims().get(i).copied().unwrap_or(1);
+        if da != db && da != 1 && db != 1 {
+            return Err(LangError::new(format!("{name}: dimensions do not agree"), 0));
+        }
+        dims.push(da.max(db));
+    }
+    let dims = if dims.len() >= 2 { dims } else { vec![1, 1] };
+    check_elems(dims.iter().product())?;
+    Ok((expand_to(a, &dims), expand_to(b, &dims), dims))
+}
+
+/// The elementwise ops `bsxfun` recognises by name — `plus`, `times`,
+/// `eq`, … Anything else (a handle, or an unlisted name) falls back to
+/// per-element calls.
+fn bsxfun_op(fun: &Value) -> Option<fn(f64, f64) -> f64> {
+    let n = match fun {
+        Value::Str(s) => s.as_str(),
+        Value::Func(FuncHandle::Named(n)) => n.as_str(),
+        _ => return None,
+    };
+    Some(match n {
+        "plus" => |a, b| a + b,
+        "minus" => |a, b| a - b,
+        "times" => |a, b| a * b,
+        "rdivide" => |a, b| a / b,
+        "ldivide" => |a, b| b / a,
+        "power" => |a, b| a.powf(b),
+        "max" => |a: f64, b: f64| a.max(b),
+        "min" => |a: f64, b: f64| a.min(b),
+        "rem" => |a, b| a - b * (a / b).trunc(),
+        "mod" => |a, b| a - b * (a / b).floor(),
+        "atan2" => |a, b| a.atan2(b),
+        "hypot" => |a, b| a.hypot(b),
+        "eq" => |a, b| if a == b { 1.0 } else { 0.0 },
+        "ne" => |a, b| if a != b { 1.0 } else { 0.0 },
+        "lt" => |a, b| if a < b { 1.0 } else { 0.0 },
+        "le" => |a, b| if a <= b { 1.0 } else { 0.0 },
+        "gt" => |a, b| if a > b { 1.0 } else { 0.0 },
+        "ge" => |a, b| if a >= b { 1.0 } else { 0.0 },
+        "and" => |a, b| if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 },
+        "or" => |a, b| if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 },
+        "xor" => |a, b| if (a != 0.0) != (b != 0.0) { 1.0 } else { 0.0 },
+        _ => return None,
+    })
+}
+
+/// Days from 1970-01-01 for a proleptic-Gregorian civil date
+/// (Hinnant's algorithm). Month/day overflow (`datenum(2000,13,1)`)
+/// normalises by construction.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y + (m - 1).div_euclid(12);
+    let m = (m - 1).rem_euclid(12) + 1;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9).rem_euclid(12);
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: days-since-epoch → (y, m, d).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// M-code serial date number for a civil date: days since the fixed
+/// epoch (0000-01-01 → 1), plus `day_fracs` of a day.
+fn serial_of(y: i64, mo: i64, d: i64, day_fracs: f64) -> f64 {
+    days_from_civil(y, mo, d) as f64 + 719_529.0 + day_fracs
+}
+
+/// Break a serial date number into (y, m, d, h, min, sec).
+fn civil_of_serial(s: f64) -> (i64, i64, i64, i64, i64, f64) {
+    let days = s.floor() as i64 - 719_529;
+    let (y, m, d) = civil_from_days(days);
+    let frac = s - s.floor();
+    let secs = (frac * 86_400.0).round();
+    let h = (secs as i64).div_euclid(3600).min(23);
+    let mi = (secs as i64).div_euclid(60).rem_euclid(60);
+    let sec = secs - (h * 3600 + mi * 60) as f64;
+    (y, m, d, h, mi, sec)
+}
+
+/// Serial date number right now (UTC). No clock exists on wasm.
+fn now_serial() -> Result<f64, LangError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        #[allow(clippy::disallowed_methods)]
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        Ok(secs / 86_400.0 + 719_529.0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err(LangError::new("now/clock are not available on wasm", 0))
+    }
+}
+
+const MONTH3: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Parse the common date-string shapes `datenum`/`datestr` accept:
+/// `dd-mmm-yyyy`, `yyyy-mm-dd`, `mm/dd/yyyy` (2-digit years pivot at 50),
+/// each with an optional `HH:MM:SS` tail.
+fn parse_date_str(s: &str) -> Option<(i64, i64, i64, i64, i64, f64)> {
+    let s = s.trim();
+    let (date, time) = match s.find(' ') {
+        Some(i) => (s[..i].trim(), s[i + 1..].trim()),
+        None => (s, ""),
+    };
+    let (y, mo, d);
+    if date.contains('-') {
+        let p: Vec<&str> = date.split('-').collect();
+        if p.len() != 3 {
+            return None;
+        }
+        if p.get(1)?.chars().next()?.is_alphabetic() {
+            d = p.first()?.parse().ok()?;
+            let ml = p.get(1)?.to_ascii_lowercase();
+            mo = (MONTH3.iter().position(|m| m.to_ascii_lowercase().starts_with(&ml) || ml.starts_with(&m.to_ascii_lowercase()))? + 1) as i64;
+            y = p.get(2)?.parse().ok()?;
+        } else {
+            y = p.first()?.parse().ok()?;
+            mo = p.get(1)?.parse().ok()?;
+            d = p.get(2)?.parse().ok()?;
+        }
+    } else if date.contains('/') {
+        let p: Vec<&str> = date.split('/').collect();
+        if p.len() != 3 {
+            return None;
+        }
+        mo = p.first()?.parse().ok()?;
+        d = p.get(1)?.parse().ok()?;
+        let mut yy: i64 = p.get(2)?.parse().ok()?;
+        if yy < 100 {
+            yy += if yy >= 50 { 1900 } else { 2000 };
+        }
+        y = yy;
+    } else {
+        return None;
+    }
+    let (mut h, mut mi, mut sec) = (0i64, 0i64, 0.0f64);
+    if !time.is_empty() {
+        let p: Vec<&str> = time.split(':').collect();
+        h = p.first()?.parse().ok()?;
+        mi = p.get(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+        sec = p.get(2).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    }
+    Some((y, mo, d, h, mi, sec))
+}
+
+/// `datestr` formats: 0 is the default (`dd-mmm-yyyy HH:MM:SS`).
+fn datestr_fmt(s: f64, fmt: i64) -> String {
+    let (y, mo, d, h, mi, sec) = civil_of_serial(s);
+    let mo_s = MONTH3.get((mo - 1).clamp(0, 11) as usize).copied().unwrap_or("Jan");
+    let ss = sec.floor() as i64;
+    let ampm = |w_secs: bool| {
+        let (hh, ap) = if h >= 12 { (if h > 12 { h - 12 } else { 12 }, "PM") } else { (if h == 0 { 12 } else { h }, "AM") };
+        if w_secs {
+            format!("{hh:02}:{mi:02}:{ss:02} {ap}")
+        } else {
+            format!("{hh:02}:{mi:02} {ap}")
+        }
+    };
+    match fmt {
+        1 => format!("{d:02}-{mo_s}-{y:04}"),
+        2 => format!("{mo:02}/{d:02}/{:02}", y.rem_euclid(100)),
+        13 => format!("{h:02}:{mi:02}:{ss:02}"),
+        14 => ampm(true),
+        15 => format!("{h:02}:{mi:02}"),
+        16 => ampm(false),
+        21 => format!("{mo_s}.{d:02},{y:04} {h:02}:{mi:02}:{ss:02}"),
+        23 => format!("{mo:02}/{d:02}/{y:04}"),
+        26 => format!("{y:04}/{mo:02}/{d:02}"),
+        31 => format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{ss:02}"),
+        _ => format!("{d:02}-{mo_s}-{y:04} {h:02}:{mi:02}:{ss:02}"),
+    }
+}
+
+/// Split delimited text into rows of f64 fields. `delim` = `None`
+/// auto-detects: comma if the first data line has one, else tab, else a
+/// whitespace run. Non-numeric fields become NaN.
+fn parse_delim(text: &str, delim: Option<&[char]>) -> Vec<Vec<f64>> {
+    let dch: Vec<char> = match delim {
+        Some(d) => d.to_vec(),
+        None => {
+            let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            if first.contains(',') {
+                vec![',']
+            } else if first.contains('\t') {
+                vec!['\t']
+            } else {
+                Vec::new()
+            }
+        }
+    };
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<f64> = if dch.is_empty() {
+            line.split_whitespace().map(|f| f.parse::<f64>().unwrap_or(f64::NAN)).collect()
+        } else {
+            line.split(|c| dch.contains(&c)).map(|f| f.trim().parse::<f64>().unwrap_or(f64::NAN)).collect()
+        };
+        rows.push(fields);
+    }
+    rows
+}
+
+/// `%.Ng`-style number formatting for delimited-file writes
+/// (`dlmwrite`'s default is 5 significant digits).
+fn fmt_g(x: f64, prec: usize) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Inf".into() } else { "-Inf".into() };
+    }
+    if x == 0.0 {
+        return "0".into();
+    }
+    let prec = prec.max(1);
+    let e = x.abs().log10().floor() as i32;
+    if e < -4 || e >= prec as i32 {
+        format!("{:.*e}", prec - 1, x)
+    } else {
+        let decimals = (prec as i32 - 1 - e).max(0) as usize;
+        let s = format!("{:.*}", decimals, x);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        if s.is_empty() {
+            "0".into()
+        } else {
+            s.to_string()
+        }
+    }
 }
 
 /// Short class description used by `whos` and `workspace.list`.
