@@ -42,7 +42,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("structs", "struct isstruct fieldnames isfield rmfield orderfields getfield setfield deal"),
     ("sparse", "sparse full issparse nnz nzmax nonzeros speye spalloc spones"),
     ("linear algebra", "det inv norm dot cross eig svd qr lu chol rref pinv rank cond trace null orth"),
-    ("reductions", "sum mean prod min max std var median any all cov prctile quantile nanmax nanmean nanmedian nanmin nanprod nanstd nansum nanvar"),
+    ("reductions", "sum mean prod min max std var median any all cov prctile quantile wmean nanmax nanmean nanmedian nanmin nanprod nanstd nansum nanvar"),
     ("running/sorting", "cumsum cumprod diff sort sortrows unique find hist histc"),
     ("sets", "union intersect setdiff setxor ismember"),
     ("bits", "bitand bitor bitxor bitcmp bitget bitset bitshift"),
@@ -60,11 +60,11 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("file io", "fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets delete copyfile movefile rmdir"),
     ("dates", "now clock datenum datestr etime"),
     ("system", "version computer ispc isunix ismac getenv setenv system ver license beep"),
-    ("graphics objects", "drawnow waitbar gca ishandle findobj findall ishold"),
+    ("graphics objects", "get set drawnow waitbar gca ishandle findobj findall ishold"),
     ("image io", "imread imwrite im2double fspecial"),
-    ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc"),
-    ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile fileparts isdir isfile tempdir tempname csvread mkdir"),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image pie contour plot3 surf mesh saveas exportgraphics print"),
+    ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc global persistent import argv"),
+    ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image pie contour plot3 surf mesh vline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.

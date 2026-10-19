@@ -58,6 +58,8 @@ pub enum Tok {
     AmpAmp,
     /// `||` short-circuit or.
     PipePipe,
+    /// `!` — shell escape at statement start (`!dir`, `!del f.txt`).
+    Bang,
     Eof,
 }
 
@@ -181,14 +183,26 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
             }
             '\'' => {
                 // `'` after an operand is transpose — unless a space
-                // separates it from a command-syntax position: `save 'f.m'`
-                // (ident at statement start) or a second quoted argument
+                // separates it from a command-syntax position: `save 'f.m'`,
+                // `cmd arg 'x'` (any word of a statement that began with a
+                // bare identifier), or a second quoted argument
                 // `save 'a' 'b'` opens a string instead.
-                let stmt_start_ident = matches!(toks.last().map(|l| &l.tok), Some(Tok::Ident(_)))
-                    && toks.get(toks.len().wrapping_sub(2)).map(|l| matches!(l.tok, Tok::Newline | Tok::Semicolon | Tok::Comma)).unwrap_or(true);
+                // Command-argument position: scan back over the run of
+                // word-like tokens (ident/str/num); if its head is an
+                // identifier at a statement start, this `'` is a quoted
+                // argument, not a transpose.
+                let command_arg = {
+                    let mut j = toks.len();
+                    while j > 0 && matches!(toks[j - 1].tok, Tok::Ident(_) | Tok::Str(_) | Tok::Num(_)) {
+                        j -= 1;
+                    }
+                    j < toks.len()
+                        && matches!(toks[j].tok, Tok::Ident(_))
+                        && (j == 0 || matches!(toks[j - 1].tok, Tok::Newline | Tok::Semicolon | Tok::Comma))
+                };
                 let open_string = !prev_ends_operand
                     || (pending_ws && matches!(toks.last().map(|l| &l.tok), Some(Tok::Str(_))))
-                    || (pending_ws && stmt_start_ident)
+                    || (pending_ws && command_arg)
                     || (pending_ws && literal_depth > 0);
                 if !open_string {
                     i += 1;
@@ -217,6 +231,41 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                         }
                     }
                     push!(Tok::Str(s));
+                }
+            }
+            '"' => {
+                // `"…"` — the R2016b+ string form. Always a quote (never an
+                // operator); `""` inside is an escaped quote. MatCraft
+                // yields a char vector rather than a `string` object —
+                // a documented deviation.
+                i += 1;
+                let mut s = String::new();
+                loop {
+                    match chars.get(i) {
+                        Some('"') if chars.get(i + 1) == Some(&'"') => {
+                            s.push('"');
+                            i += 2;
+                        }
+                        Some('"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(&ch) => {
+                            s.push(ch);
+                            i += 1;
+                        }
+                        None => {
+                            return Err(LangError::new("unterminated string", line));
+                        }
+                    }
+                }
+                push!(Tok::Str(s));
+            }
+            '#' if i == 0 && chars.get(1) == Some(&'!') => {
+                // `#!…` shebang line (Octave-style script headers): a
+                // comment through end of line when it opens the file.
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
                 }
             }
             '+' => {
@@ -340,6 +389,10 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
             '@' => {
                 i += 1;
                 push!(Tok::At);
+            }
+            '!' => {
+                i += 1;
+                push!(Tok::Bang);
             }
             _ => {
                 return Err(LangError::new(format!("unexpected character '{c}'"), line));

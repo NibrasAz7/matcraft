@@ -13,11 +13,27 @@
 //!   primary     := num | str | ident ['(' args ')'] | '(' expr ')'
 //!                | '[' rows ']' | ':' | 'end'
 
-use crate::ast::{BinOp, Expr, PathStep, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::lexer::{Lexed, Tok};
 use crate::LangError;
 
 const MAX_DEPTH: usize = 256;
+
+/// Octave-dialect block closers. Each is accepted wherever `end` closes a
+/// block, and a stray one at statement level parses as a no-op.
+const END_VARIANTS: &[&str] = &[
+    "endfunction",
+    "endif",
+    "endfor",
+    "endwhile",
+    "endswitch",
+    "end_try_catch",
+    "endproperties",
+    "endmethods",
+    "endevents",
+    "endenumeration",
+    "endclassdef",
+];
 
 pub fn parse(source: &str) -> Result<Vec<Stmt>, LangError> {
     Ok(parse_lines(source)?.into_iter().map(|(_, s)| s).collect())
@@ -85,6 +101,27 @@ impl Parser {
         Err(LangError::new(msg, self.line()))
     }
 
+    /// Consume every token through the end of the line and return the raw
+    /// text — for `!cmd` shell escapes. Whitespace between tokens is kept
+    /// as single spaces; `;`/`,` are literal text here, not separators.
+    fn line_text(&mut self) -> String {
+        let mut out = String::new();
+        loop {
+            match self.peek() {
+                Tok::Newline | Tok::Eof => break,
+                t => {
+                    let t = t.clone();
+                    if !out.is_empty() && self.ws_before(self.pos) {
+                        out.push(' ');
+                    }
+                    self.next();
+                    out.push_str(&tok_text(&t).unwrap_or_default());
+                }
+            }
+        }
+        out
+    }
+
     fn expect(&mut self, t: &Tok) -> Result<(), LangError> {
         if self.peek() == t {
             self.next();
@@ -129,8 +166,20 @@ impl Parser {
         if self.at_ident("if") {
             return self.parse_if(depth);
         }
-        if self.at_ident("for") {
+        if self.at_ident("for") || self.at_ident("parfor") {
+            // `parfor` parses as `for` — a sequential interpreter runs the
+            // same iterations, just without the parallel workers.
             return self.parse_for(depth);
+        }
+        if self.peek() == &Tok::Bang {
+            // `!cmd …` — shell escape: the rest of the line is the command
+            // string, equivalent to `system('cmd …')` with the echo
+            // suppressed.
+            self.next();
+            let cmd = self.line_text();
+            let _ = self.stmt_end()?;
+            // Shell output is the visible result; there is no `ans`.
+            return Ok(Stmt::Expr(Expr::CallOrIndex("system".into(), vec![Expr::Str(cmd)]), true));
         }
         if self.at_ident("while") {
             return self.parse_while(depth);
@@ -143,6 +192,16 @@ impl Parser {
                 self.next();
                 let _ = self.stmt_end()?;
                 return Ok(stmt);
+            }
+        }
+        // A stray Octave-dialect closer (`endfunction`, `endif`, …) where a
+        // statement was expected — inside a block it's consumed as `end`
+        // before we get here; at top level it parses as a no-op.
+        if let Tok::Ident(k) = self.peek() {
+            if END_VARIANTS.contains(&k.as_str()) {
+                self.next();
+                let _ = self.stmt_end()?;
+                return Ok(Stmt::Noop);
             }
         }
         if self.at_ident("function") {
@@ -178,8 +237,9 @@ impl Parser {
         if let Tok::Ident(name) = self.peek().clone() {
             // `cd ..` / `cd ../x`: a whitespace-separated `..`/`./`/`..\` is a
             // command argument, not field access (glued `x.y` has no ws_before).
-            let dot_path =
-                matches!(self.peek2(), Tok::Dot) && self.ws_before(self.pos + 1) && matches!(self.peek3(), Tok::Dot | Tok::Slash | Tok::Backslash);
+            let dot_path = matches!(self.peek2(), Tok::Dot)
+                && self.ws_before(self.pos + 1)
+                && matches!(self.peek3(), Tok::Dot | Tok::Slash | Tok::Backslash | Tok::DotSlash);
             if matches!(self.peek2(), Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) || dot_path {
                 self.next();
                 let mut args = Vec::new();
@@ -208,34 +268,41 @@ impl Parser {
                             self.next();
                             ".".to_string()
                         }
+                        // A bracketed word (`im subplot [1 2 3]` passes the
+                        // literal text `[1`, `2`, `3]`).
+                        Tok::LBracket | Tok::LParen => {
+                            let t = self.next();
+                            tok_text(&t).unwrap_or_default()
+                        }
                         _ => break,
                     };
                     // Absorb glued continuations (no whitespace between
-                    // tokens): `save b5.txt -ascii`, `load a-b.txt`.
+                    // tokens): `save b5.txt -ascii`, `load a-b.txt`,
+                    // `ft_warning once FieldTrip:fileio:id`, `cd ../..`.
                     while !self.ws_before(self.pos) {
-                        let piece = match self.peek() {
-                            Tok::Dot => ".",
-                            Tok::Minus => "-",
-                            Tok::Plus => "+",
-                            Tok::Star => "*",
-                            Tok::Slash => "/",
-                            Tok::Backslash => "\\",
+                        match self.peek() {
                             Tok::Ident(s) | Tok::Str(s) => {
                                 let s = s.clone();
                                 self.next();
                                 word.push_str(&s);
-                                continue;
                             }
                             Tok::Num(v) => {
                                 let v = *v;
                                 self.next();
                                 word.push_str(&crate::interp::fmt_num(v, false).to_string());
-                                continue;
                             }
-                            _ => break,
-                        };
-                        self.next();
-                        word.push_str(piece);
+                            Tok::Comma | Tok::Semicolon | Tok::Newline | Tok::Eof => break,
+                            t => {
+                                let t = t.clone();
+                                match tok_text(&t) {
+                                    Some(p) => {
+                                        self.next();
+                                        word.push_str(&p);
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
                     }
                     args.push(Expr::Str(word));
                 }
@@ -260,16 +327,22 @@ impl Parser {
                     Some((name, path)) => Ok(Stmt::FieldAssign { name, path, value, suppress }),
                     None => self.err("left side of '=' must be a variable or indexed variable"),
                 },
-                // `[a, b] = f(x)` — a bracketed list of plain names.
-                Expr::Matrix(rows) if rows.len() == 1 && rows[0].iter().all(|c| matches!(c, Expr::Ident(_))) => {
-                    let names = rows[0]
+                // `[a, b] = f(x)` — a bracketed list of targets. Each slot
+                // is a plain name or an lvalue path (`s.f`, `v(i)`,
+                // `c{1}.g`) — M-code assigns through those directly.
+                Expr::Matrix(rows) if rows.len() == 1 && rows[0].iter().all(|c| matches!(c, Expr::Ident(_)) || field_lhs(c.clone()).is_some()) => {
+                    let targets = rows[0]
                         .iter()
                         .map(|c| match c {
-                            Expr::Ident(n) => n.clone(),
-                            _ => String::new(),
+                            Expr::Ident(n) => MultiTarget::Name(n.clone()),
+                            e => match field_lhs(e.clone()) {
+                                Some((n, path)) if !path.is_empty() => MultiTarget::Path(n, path),
+                                Some((n, _)) => MultiTarget::Name(n),
+                                None => MultiTarget::Name(String::new()),
+                            },
                         })
                         .collect();
-                    Ok(Stmt::AssignMany { names, value, suppress })
+                    Ok(Stmt::AssignMany { targets, value, suppress })
                 }
                 _ => self.err("left side of '=' must be a variable or indexed variable"),
             };
@@ -278,13 +351,19 @@ impl Parser {
         Ok(Stmt::Expr(lhs, suppress))
     }
 
+    /// Does `k` terminate a block expecting one of `keywords`? `end` and
+    /// the Octave-dialect `end<kind>` variants are interchangeable.
+    fn closes_block(k: &str, keywords: &[&str]) -> bool {
+        keywords.contains(&k) || (keywords.contains(&"end") && END_VARIANTS.contains(&k))
+    }
+
     /// Parse a statement block until one of `keywords` (not consumed).
     fn block(&mut self, keywords: &[&str], depth: usize) -> Result<Vec<Stmt>, LangError> {
         let mut out = Vec::new();
         loop {
             self.skip_separators();
             match self.peek() {
-                Tok::Ident(k) if keywords.contains(&k.as_str()) => return Ok(out),
+                Tok::Ident(k) if Self::closes_block(k, keywords) => return Ok(out),
                 Tok::Eof => return self.err(format!("missing 'end' (expected one of {keywords:?})")),
                 _ => out.push(self.statement(depth + 1)?),
             }
@@ -292,11 +371,12 @@ impl Parser {
     }
 
     fn close_block(&mut self) -> Result<(), LangError> {
-        if self.at_ident("end") {
-            self.next();
-            Ok(())
-        } else {
-            self.err("expected 'end'")
+        match self.peek() {
+            Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
+                self.next();
+                Ok(())
+            }
+            _ => self.err("expected 'end'"),
         }
     }
 
@@ -436,7 +516,7 @@ impl Parser {
         loop {
             self.skip_separators();
             match self.peek() {
-                Tok::Ident(k) if keywords.contains(&k.as_str()) => return Ok(out),
+                Tok::Ident(k) if Self::closes_block(k, keywords) => return Ok(out),
                 Tok::Eof => return Ok(out),
                 _ => out.push(self.statement(depth + 1)?),
             }
@@ -573,9 +653,29 @@ impl Parser {
             _ => return Ok(base),
         };
         self.next();
-        // Right-associative and binds looser than unary minus on the right.
-        let exp = self.unary(depth)?;
+        let exp = self.power_rhs(depth)?;
         Ok(Expr::Binary(op, Box::new(base), Box::new(exp)))
+    }
+
+    /// Exponent of `^`/`.^`: a leading sign binds inside (`x^-2` =
+    /// `x^(-2)`), postfix ops apply (`x.^s.d`, `(x.^2)'`), and the tail is
+    /// right-associative (`a^b^c` = `a^(b^c)`).
+    fn power_rhs(&mut self, depth: usize) -> Result<Expr, LangError> {
+        match self.peek() {
+            Tok::Minus => {
+                self.next();
+                Ok(Expr::Unary(UnOp::Neg, Box::new(self.power_rhs(depth + 1)?)))
+            }
+            Tok::Plus => {
+                self.next();
+                Ok(Expr::Unary(UnOp::Pos, Box::new(self.power_rhs(depth + 1)?)))
+            }
+            Tok::Tilde => {
+                self.next();
+                Ok(Expr::Unary(UnOp::Not, Box::new(self.power_rhs(depth + 1)?)))
+            }
+            _ => self.power(depth + 1),
+        }
     }
 
     /// `(a, b, …)` or `{a, b, …}` argument/index list — the open token has
@@ -800,6 +900,53 @@ impl Parser {
 /// `[Brace(1), Paren(2)]` rooted at `c`.
 type FieldLhs = (String, Vec<PathStep>);
 
+/// Surface text for a token — used when raw source is needed back for a
+/// command-syntax word or a `!` shell-escape line. `None` for tokens that
+/// have no sensible spelling in that context.
+fn tok_text(t: &Tok) -> Option<String> {
+    Some(match t {
+        Tok::Num(v) => crate::interp::fmt_num(*v, false).to_string(),
+        Tok::CNum(v) => format!("{}i", crate::interp::fmt_num(*v, false)),
+        Tok::Ident(s) | Tok::Str(s) => s.clone(),
+        Tok::Plus => "+".into(),
+        Tok::Minus => "-".into(),
+        Tok::Star => "*".into(),
+        Tok::Slash => "/".into(),
+        Tok::Backslash => "\\".into(),
+        Tok::Caret => "^".into(),
+        Tok::DotStar => ".*".into(),
+        Tok::DotSlash => "./".into(),
+        Tok::DotCaret => ".^".into(),
+        Tok::Dot => ".".into(),
+        Tok::DotApos => ".'".into(),
+        Tok::Apostrophe => "'".into(),
+        Tok::Tilde => "~".into(),
+        Tok::LParen => "(".into(),
+        Tok::RParen => ")".into(),
+        Tok::LBracket => "[".into(),
+        Tok::RBracket => "]".into(),
+        Tok::LBrace => "{".into(),
+        Tok::RBrace => "}".into(),
+        Tok::Comma => ",".into(),
+        Tok::Semicolon => ";".into(),
+        Tok::Colon => ":".into(),
+        Tok::Eq => "=".into(),
+        Tok::EqEq => "==".into(),
+        Tok::Neq => "~=".into(),
+        Tok::Lt => "<".into(),
+        Tok::Le => "<=".into(),
+        Tok::Gt => ">".into(),
+        Tok::Ge => ">=".into(),
+        Tok::Amp => "&".into(),
+        Tok::Pipe => "|".into(),
+        Tok::At => "@".into(),
+        Tok::AmpAmp => "&&".into(),
+        Tok::PipePipe => "||".into(),
+        Tok::Bang => "!".into(),
+        Tok::Newline | Tok::Eof => return None,
+    })
+}
+
 fn field_lhs(e: Expr) -> Option<FieldLhs> {
     // Walk the expr outward→inward collecting steps, then reverse so the
     // list reads left-to-right as written.
@@ -1012,6 +1159,73 @@ mod tests {
         match &parse("f(1).g = 9").unwrap()[0] {
             Stmt::FieldAssign { path, .. } => {
                 assert!(matches!(path[0], PathStep::Paren(_)) && matches!(path[1], PathStep::Name(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parfor_parses_as_for() {
+        match &parse("parfor i = 1:3\nx = i\nend").unwrap()[0] {
+            Stmt::For { var, .. } => assert_eq!(var, "i"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bang_shell_escape() {
+        match &parse("!del tmp*.smf").unwrap()[0] {
+            Stmt::Expr(Expr::CallOrIndex(name, args), _) => {
+                assert_eq!(name, "system");
+                assert_eq!(args[0], Expr::Str("del tmp*.smf".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn power_rhs_field_and_right_assoc() {
+        // `x.^s.d` reads the field as the exponent.
+        assert!(parse("y = x.^s.d").is_ok());
+        // `a^b^c` is right-associative: a^(b^c).
+        match &parse("y = a^b^c").unwrap()[0] {
+            Stmt::Assign { value: Expr::Binary(BinOp::Pow, _, e2), .. } => {
+                assert!(matches!(**e2, Expr::Binary(BinOp::Pow, _, _)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // `(-1).^(0:5)'` — transpose inside the exponent.
+        assert!(parse("sw = (-1).^(0:5)';").is_ok());
+        // `x^-2` puts the sign inside the exponent.
+        match &parse("y = x^-2").unwrap()[0] {
+            Stmt::Assign { value: Expr::Binary(BinOp::Pow, _, e2), .. } => {
+                assert!(matches!(**e2, Expr::Unary(UnOp::Neg, _)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_args_wide_words() {
+        // `:`/`[`/`]`/`=`/`/` glue into command words: error identifiers
+        // and MATLAB-ish arg lists pass through as literal strings.
+        match &parse("ft_warning once FieldTrip:fileio:UnknownResolution").unwrap()[0] {
+            Stmt::Expr(Expr::CallOrIndex(_, args), _) => {
+                assert_eq!(args[1], Expr::Str("FieldTrip:fileio:UnknownResolution".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &parse("im subplot [1 2 3]").unwrap()[0] {
+            Stmt::Expr(Expr::CallOrIndex(_, args), _) => {
+                assert_eq!(args[1], Expr::Str("[1".into()));
+                assert_eq!(args[3], Expr::Str("3]".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // `cd ../..` — a parent-of-parent path arg.
+        match &parse("cd ../..").unwrap()[0] {
+            Stmt::Expr(Expr::CallOrIndex(_, args), _) => {
+                assert_eq!(args[0], Expr::Str("../..".into()));
             }
             other => panic!("unexpected {other:?}"),
         }

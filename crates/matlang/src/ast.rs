@@ -122,9 +122,11 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     /// `[a, b] = f(x)` — multiple left-hand targets bound from a
-    /// multi-output function call.
+    /// multi-output function call. Targets are not limited to plain
+    /// names: `[s.f, v(i)] = f(x)` assigns through field/subscript
+    /// paths like M-code.
     AssignMany {
-        names: Vec<String>,
+        targets: Vec<MultiTarget>,
         value: Expr,
         suppress: bool,
     },
@@ -146,6 +148,20 @@ pub enum Stmt {
         catch_var: Option<String>,
         catch_body: Vec<Stmt>,
     },
+    /// A stray block-closer keyword used as a statement — Octave-dialect
+    /// `endfunction`/`endif`/… appearing where M-code would not need it.
+    /// Parses and executes as nothing.
+    Noop,
+}
+
+/// One slot of a `[a, b] = f(…)` multi-output target list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultiTarget {
+    /// `a` — a plain variable name (`~` ignores the slot).
+    Name(String),
+    /// `s.f`, `v(i)`, `c{1}.g` — root name plus field/subscript steps,
+    /// assigned through the same path machinery as `s.f = v`.
+    Path(String, Vec<PathStep>),
 }
 
 /// One step of an assignment path: `.name`, `.(expr)` (evaluated to a

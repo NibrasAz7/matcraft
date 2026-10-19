@@ -4,7 +4,7 @@
 //! in the workspace, otherwise to a builtin function — the same rule M-code
 //! uses. Matrices grow on out-of-range assignment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 // `CNum` arithmetic uses the operator traits — method syntax needs them
 // in scope (`z.mul(w)`, `z.neg()`).
@@ -12,7 +12,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use matcore::{CMatrix, CNum, MatError, Matrix};
 
-use crate::ast::{BinOp, Expr, PathStep, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::LangError;
 
 /// Hard caps so hostile or buggy scripts terminate.
@@ -787,6 +787,25 @@ pub struct Session {
     next_fid: std::rc::Rc<std::cell::Cell<u32>>,
     /// `.m` files currently executing, innermost last — backs `mfilename`.
     file_stack: Vec<String>,
+    /// `global` workspace — names shared between the base workspace and
+    /// any function that declares them.
+    globals: HashMap<String, Value>,
+    /// Names the *current* frame declared `global` — swapped out with
+    /// `vars` on each function call.
+    frame_globals: HashSet<String>,
+    /// `persistent` storage: function key (`file::name`) → var → value.
+    /// Survives across calls to the same function.
+    persistents: HashMap<String, HashMap<String, Value>>,
+    /// Names the current frame declared `persistent`.
+    frame_persist: HashSet<String>,
+    /// Key into `persistents` for the function now executing (`None` at
+    /// base/script scope).
+    cur_func_key: Option<String>,
+    /// `import pkg.*`/`import pkg.Name` specs recorded this session.
+    imports: Vec<String>,
+    /// Root-object defaults written via `set(0,'Default...',v)` — read back
+    /// through `get(0,'Default...')`.
+    defaults: HashMap<String, Value>,
 }
 
 impl Session {
@@ -814,6 +833,13 @@ impl Session {
             files: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             next_fid: std::rc::Rc::new(std::cell::Cell::new(3)),
             file_stack: Vec::new(),
+            globals: HashMap::new(),
+            frame_globals: HashSet::new(),
+            persistents: HashMap::new(),
+            frame_persist: HashSet::new(),
+            cur_func_key: None,
+            imports: Vec::new(),
+            defaults: HashMap::new(),
         }
     }
 
@@ -860,6 +886,76 @@ impl Session {
                 self.vars.remove(n);
             }
         }
+    }
+
+    /// Read a variable by name: locals first, then names declared
+    /// `global`/`persistent` in the current frame (which live in their
+    /// shared stores, not `vars`).
+    fn var_get(&self, name: &str) -> Option<&Value> {
+        if let Some(v) = self.vars.get(name) {
+            return Some(v);
+        }
+        if self.frame_globals.contains(name) {
+            return self.globals.get(name);
+        }
+        if self.frame_persist.contains(name) {
+            if let Some(k) = &self.cur_func_key {
+                return self.persistents.get(k).and_then(|m| m.get(name));
+            }
+        }
+        None
+    }
+
+    /// Write a variable — names declared `global`/`persistent` in the
+    /// current frame go to their shared store, everything else to `vars`.
+    fn put_var(&mut self, name: &str, v: Value) {
+        if self.frame_globals.contains(name) {
+            self.globals.insert(name.to_string(), v);
+        } else if self.frame_persist.contains(name) && self.cur_func_key.is_some() {
+            let key = self.cur_func_key.clone().unwrap_or_default();
+            self.persistents.entry(key).or_default().insert(name.to_string(), v);
+        } else {
+            self.vars.insert(name.to_string(), v);
+        }
+    }
+
+    /// Detach the current binding of `name` from whichever store holds it.
+    fn take_var(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.vars.remove(name) {
+            return Some(v);
+        }
+        if self.frame_globals.contains(name) {
+            return self.globals.remove(name);
+        }
+        if self.frame_persist.contains(name) {
+            if let Some(k) = self.cur_func_key.clone() {
+                return self.persistents.get_mut(&k).and_then(|m| m.remove(name));
+            }
+        }
+        None
+    }
+
+    /// `true` when `name` is declared `global`/`persistent` in this frame.
+    fn declared(&self, name: &str) -> bool {
+        self.frame_globals.contains(name) || self.frame_persist.contains(name)
+    }
+
+    /// Run `f` with `name`'s binding staged in `vars` so the local-only
+    /// write paths (`indexed_assign`, `path_set`) see and update it; the
+    /// result then drains back to its declared store — even when `f`
+    /// errors. Undeclared names just run `f`.
+    fn with_declared<R>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !self.declared(name) {
+            return f(self);
+        }
+        if let Some(v) = self.take_var(name) {
+            self.vars.insert(name.to_string(), v);
+        }
+        let r = f(self);
+        if let Some(v) = self.vars.remove(name) {
+            self.put_var(name, v);
+        }
+        r
     }
 
     /// Directories on the function-file search path.
@@ -1200,10 +1296,10 @@ impl Session {
                 let v = self.eval(value)?;
                 match index {
                     None => {
-                        self.vars.insert(name.clone(), v.clone());
+                        self.put_var(name, v.clone());
                     }
                     Some(ix) => {
-                        self.indexed_assign(name, ix, v.clone(), *braces)?;
+                        self.with_declared(name, |s| s.indexed_assign(name, ix, v.clone(), *braces))?;
                     }
                 }
                 if !suppress {
@@ -1231,23 +1327,23 @@ impl Session {
                 }
                 // Detach the root so `path_set` can call back into `self`
                 // (index expressions may evaluate user code).
-                let root = self.vars.remove(name);
+                let root = self.take_var(name);
                 let cur = root.clone().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                 match self.path_set(cur, &resolved, v, name) {
                     Ok(new) => {
-                        self.vars.insert(name.clone(), new);
+                        self.put_var(name, new);
                     }
                     Err(e) => {
                         // Restore the old binding on failure.
                         if let Some(orig) = root {
-                            self.vars.insert(name.clone(), orig);
+                            self.put_var(name, orig);
                         }
                         return Err(e);
                     }
                 }
                 if !suppress {
                     let long = self.fmt_long;
-                    if let Some(v) = self.vars.get(name) {
+                    if let Some(v) = self.var_get(name) {
                         out.push_str(&format!("{name} =\n\n{}\n\n", fmt_value(v, long)));
                     }
                 }
@@ -1256,7 +1352,7 @@ impl Session {
                 // A bare comma-separated list echoes each element through
                 // `ans` in turn, like M-code (`c{1:2}` prints ans twice).
                 for v in self.eval_multi(e)? {
-                    self.vars.insert("ans".into(), v.clone());
+                    self.put_var("ans", v.clone());
                     if !suppress {
                         let long = self.fmt_long;
                         out.push_str(&format!("ans =\n\n{}\n\n", fmt_value(&v, long)));
@@ -1282,7 +1378,7 @@ impl Session {
                             let mut m = std::collections::BTreeMap::new();
                             m.insert("identifier".into(), Value::Str(e.id.clone()));
                             m.insert("message".into(), Value::Str(e.message.clone()));
-                            self.vars.insert(var.clone(), Value::Struct(StructArray::from_map(m)));
+                            self.put_var(var, Value::Struct(StructArray::from_map(m)));
                         }
                         let flow = self.exec_block(catch_body, out)?;
                         if flow != Flow::Normal {
@@ -1312,7 +1408,7 @@ impl Session {
                         for r in 0..ca.rows {
                             items.push(ca.get(r, c).cloned().unwrap_or_else(CellArray::empty));
                         }
-                        self.vars.insert(var.clone(), Value::Cell(CellArray { rows: ca.rows, cols: 1, items }));
+                        self.put_var(var, Value::Cell(CellArray { rows: ca.rows, cols: 1, items }));
                         match self.exec_block(body, out)? {
                             Flow::Normal => {}
                             Flow::Break => break,
@@ -1333,7 +1429,7 @@ impl Session {
                             colv.push(cm.get(r, c).unwrap_or(CNum::real(0.0)));
                         }
                         let colm = CMatrix::from_col_major(cm.rows(), 1, colv).map_err(lang)?;
-                        self.vars.insert(var.clone(), cmat_or_value(colm));
+                        self.put_var(var, cmat_or_value(colm));
                         match self.exec_block(body, out)? {
                             Flow::Normal => {}
                             Flow::Break => break,
@@ -1361,7 +1457,7 @@ impl Session {
                     for r in 0..m.rows() {
                         colv.push(m.get_linear(c.saturating_mul(m.rows()).saturating_add(r)).unwrap_or(0.0));
                     }
-                    self.vars.insert(var.clone(), Value::Mat(Matrix::col_vector(colv)));
+                    self.put_var(var, Value::Mat(Matrix::col_vector(colv)));
                     match self.exec_block(body, out)? {
                         Flow::Normal => {}
                         Flow::Break => break,
@@ -1405,8 +1501,8 @@ impl Session {
             Stmt::Return => return Ok(Flow::Return),
             // Already registered by `hoist_functions`; executing the node
             // is a no-op.
-            Stmt::Function { .. } => {}
-            Stmt::AssignMany { names, value, suppress } => {
+            Stmt::Function { .. } | Stmt::Noop => {}
+            Stmt::AssignMany { targets, value, suppress } => {
                 let call = match value {
                     Expr::CallOrIndex(n, a) => Some((n, a)),
                     _ => None,
@@ -1415,90 +1511,109 @@ impl Session {
                     // `[a, b] = c{1:2}` — a comma-separated list on the right
                     // fills the targets one-to-one.
                     let outs = self.eval_multi(value)?;
-                    if outs.len() != names.len() {
+                    if outs.len() != targets.len() {
                         return Err(LangError::new(
-                            format!("expected {} outputs from the expression, but it produced {}", names.len(), outs.len()),
+                            format!("expected {} outputs from the expression, but it produced {}", targets.len(), outs.len()),
                             0,
                         ));
                     }
-                    for (n, v) in names.iter().zip(outs) {
-                        // `~` consumes an output slot but binds nothing.
-                        if n != "~" {
-                            self.vars.insert(n.clone(), v);
-                        }
-                    }
-                    if !suppress {
-                        for n in names {
-                            if let Some(v) = self.vars.get(n) {
-                                let long = self.fmt_long;
-                                out.push_str(&format!("{n} =\n\n{}\n\n", fmt_value(v, long)));
-                            }
-                        }
-                    }
+                    self.bind_targets(targets, outs, "the expression", *suppress, out)?;
                     return Ok(Flow::Normal);
                 };
                 // `[a,b] = f(x)` where `f` is a function handle variable.
-                if let Some(Value::Func(h)) = self.vars.get(fname).cloned() {
+                if let Some(Value::Func(h)) = self.var_get(fname).cloned() {
                     let argv = self.eval_args(fargs)?;
-                    let outs = self.call_handle(&h, argv, names.len())?;
-                    for (i, n) in names.iter().enumerate() {
-                        let v = outs.get(i).cloned().ok_or_else(|| LangError::new(format!("function '{fname}' returned too few outputs"), 0))?;
-                        if n != "~" {
-                            self.vars.insert(n.clone(), v);
-                        }
-                    }
-                    if !suppress {
-                        for n in names {
-                            if let Some(v) = self.vars.get(n) {
-                                let long = self.fmt_long;
-                                out.push_str(&format!("{n} =\n\n{}\n\n", fmt_value(v, long)));
-                            }
-                        }
-                    }
+                    let outs = self.call_handle(&h, argv, targets.len())?;
+                    self.bind_targets(targets, outs, fname, *suppress, out)?;
                     return Ok(Flow::Normal);
                 }
                 if !self.is_function(fname)? {
                     // Multi-output builtins: [M,I]=max(A), [V,D]=eig(A), …
-                    match self.builtin_multi(fname, fargs, names.len())? {
+                    match self.builtin_multi(fname, fargs, targets.len())? {
                         Some(outs) => {
-                            for (i, n) in names.iter().enumerate() {
-                                let v =
-                                    outs.get(i).cloned().ok_or_else(|| LangError::new(format!("function '{fname}' returned too few outputs"), 0))?;
-                                if n != "~" {
-                                    self.vars.insert(n.clone(), v);
-                                }
-                            }
-                            if !suppress {
-                                for n in names {
-                                    if let Some(v) = self.vars.get(n) {
-                                        let long = self.fmt_long;
-                                        out.push_str(&format!("{n} =\n\n{}\n\n", fmt_value(v, long)));
-                                    }
-                                }
-                            }
+                            self.bind_targets(targets, outs, fname, *suppress, out)?;
                             return Ok(Flow::Normal);
                         }
                         None => return Err(LangError::new(format!("'{fname}' is not a function"), 0)),
                     }
                 }
-                let outs = self.call_function(fname, fargs, names.len())?;
-                for (i, n) in names.iter().enumerate() {
-                    let v = outs.get(i).cloned().ok_or_else(|| LangError::new(format!("function '{fname}' returned too few outputs"), 0))?;
-                    if n != "~" {
-                        self.vars.insert(n.clone(), v);
-                    }
-                }
-                if !suppress {
-                    for n in names {
-                        if let Some(v) = self.vars.get(n) {
-                            let long = self.fmt_long;
-                            out.push_str(&format!("{n} =\n\n{}\n\n", fmt_value(v, long)));
-                        }
-                    }
-                }
+                let outs = self.call_function(fname, fargs, targets.len())?;
+                self.bind_targets(targets, outs, fname, *suppress, out)?;
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// Bind the results of a `[t1, t2, …] = f(…)` call (or a `c{1:2}`
+    /// list) to the parsed targets, echoing each variable unless
+    /// suppressed. `fname` only fills the "too few outputs" error.
+    fn bind_targets(&mut self, targets: &[MultiTarget], outs: Vec<Value>, fname: &str, suppress: bool, out: &mut String) -> Result<(), LangError> {
+        for (i, t) in targets.iter().enumerate() {
+            let v = outs.get(i).cloned().ok_or_else(|| LangError::new(format!("function '{fname}' returned too few outputs"), 0))?;
+            self.assign_target(t, v)?;
+        }
+        if !suppress {
+            let long = self.fmt_long;
+            for t in targets {
+                // M-code echoes the whole updated variable, so a path
+                // target prints its root (`s` for `[s.f, v(i)] = …`).
+                let root = match t {
+                    MultiTarget::Name(n) | MultiTarget::Path(n, _) => n,
+                };
+                if root == "~" {
+                    continue;
+                }
+                if let Some(v) = self.var_get(root) {
+                    out.push_str(&format!("{root} =\n\n{}\n\n", fmt_value(v, long)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind one `[t1, t2] = f(…)` output slot: a plain name (`~` skips
+    /// the slot), or an lvalue path applied via `path_set` like
+    /// `s.f = v` / `v(i) = x`.
+    fn assign_target(&mut self, target: &MultiTarget, v: Value) -> Result<(), LangError> {
+        let (root, path) = match target {
+            MultiTarget::Name(n) => {
+                if n != "~" {
+                    self.put_var(n, v);
+                }
+                return Ok(());
+            }
+            MultiTarget::Path(n, p) => (n, p),
+        };
+        // `.(expr)` steps resolve against the pre-assignment root, like
+        // `s.(s.k) = v` in `FieldAssign`.
+        let mut resolved = Vec::with_capacity(path.len());
+        for step in path {
+            match step {
+                PathStep::Dyn(e) => {
+                    let name = match self.eval(e)? {
+                        Value::Str(s) if valid_field_name(&s) => s,
+                        Value::Str(s) => return Err(LangError::new(format!("invalid field name '{s}'"), 0)),
+                        _ => return Err(LangError::new("dynamic field name must be a char", 0)),
+                    };
+                    resolved.push(PathStep::Name(name));
+                }
+                other => resolved.push(other.clone()),
+            }
+        }
+        let old = self.take_var(root);
+        let cur = old.clone().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        match self.path_set(cur, &resolved, v, root) {
+            Ok(new) => {
+                self.put_var(root, new);
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(orig) = old {
+                    self.put_var(root, orig);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn eval(&mut self, e: &Expr) -> Result<Value, LangError> {
@@ -1510,7 +1625,7 @@ impl Session {
             Expr::Num(v) => Ok(Some(Value::Num(*v))),
             Expr::CNum(v) => Ok(Some(Value::Cplx(CMatrix::scalar(CNum::new(0.0, *v))))),
             Expr::Str(s) => Ok(Some(Value::Str(s.clone()))),
-            Expr::Ident(name) => match self.vars.get(name) {
+            Expr::Ident(name) => match self.var_get(name) {
                 // Workspace bindings shadow constants — `pi = 3` is legal.
                 Some(v) => Ok(Some(v.clone())),
                 None => match self.constant(name) {
@@ -1738,7 +1853,7 @@ impl Session {
                 Ok(Some(Value::Cell(ca)))
             }
             Expr::BraceIndex(name, args) => {
-                let ca = match self.vars.get(name) {
+                let ca = match self.var_get(name) {
                     Some(Value::Cell(c)) => c.clone(),
                     Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
                     None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
@@ -1879,17 +1994,15 @@ impl Session {
                 self.binary(*op, va, vb).map(Some)
             }
             Expr::CallOrIndex(name, args) => {
-                if self.vars.contains_key(name) {
-                    let target = self.vars.get(name).cloned();
+                if let Some(target) = self.var_get(name).cloned() {
                     match target {
                         // `f(args)` on a function handle calls it — handles
                         // cannot be subscripted.
-                        Some(Value::Func(h)) => {
+                        Value::Func(h) => {
                             let argv = self.eval_args(args)?;
                             Ok(self.call_handle(&h, argv, 1)?.into_iter().next())
                         }
-                        Some(t) => self.index_into(&t, args).map(Some),
-                        None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
+                        t => self.index_into(&t, args).map(Some),
                     }
                 } else if self.is_function(name)? {
                     let outs = self.call_function(name, args, 1)?;
@@ -2078,7 +2191,7 @@ impl Session {
     fn eval_multi(&mut self, e: &Expr) -> Result<Vec<Value>, LangError> {
         match e {
             Expr::BraceIndex(name, args) => {
-                let ca = match self.vars.get(name) {
+                let ca = match self.var_get(name) {
                     Some(Value::Cell(c)) => c.clone(),
                     Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
                     None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
@@ -3831,18 +3944,321 @@ impl Session {
             "clear" => {
                 if args.is_empty() {
                     self.vars.clear();
+                    self.globals.clear();
+                    self.persistents.clear();
                 } else {
                     for a in args {
                         // Command syntax passes names as Str args.
                         match a {
                             Expr::Ident(n) | Expr::Str(n) => {
                                 self.vars.remove(n);
+                                // `clear x` also drops a declared global /
+                                // persistent binding and its linkage, like
+                                // M-code.
+                                if self.frame_globals.remove(n) {
+                                    self.globals.remove(n);
+                                }
+                                if self.frame_persist.remove(n) {
+                                    if let Some(k) = &self.cur_func_key {
+                                        if let Some(m) = self.persistents.get_mut(k) {
+                                            m.remove(n);
+                                        }
+                                    }
+                                }
                             }
                             _ => {}
                         }
                     }
                 }
                 Ok(None)
+            }
+            "global" | "persistent" => {
+                // Declaration statements reached via command syntax
+                // (`global x` → `global('x')`) or quoted calls. `global`
+                // links the names to the shared `globals` store in this
+                // frame; `persistent` links them to the per-function store
+                // that survives between calls.
+                if name == "persistent" && self.cur_func_key.is_none() {
+                    return Err(LangError::new("'persistent' is only valid inside a function", 0));
+                }
+                for a in args {
+                    let n = match a {
+                        Expr::Str(s) | Expr::Ident(s) => s.clone(),
+                        other => match self.eval(other)? {
+                            Value::Str(s) => s,
+                            _ => return Err(LangError::new(format!("{name} arguments must be variable names"), 0)),
+                        },
+                    };
+                    let local = self.vars.remove(&n);
+                    if name == "global" {
+                        self.frame_globals.insert(n.clone());
+                        self.globals.entry(n).or_insert(local.unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+                    } else {
+                        self.frame_persist.insert(n.clone());
+                        let key = self.cur_func_key.clone().unwrap_or_default();
+                        self.persistents.entry(key).or_default().entry(n).or_insert(local.unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+                    }
+                }
+                Ok(None)
+            }
+            "import" => {
+                // `import pkg.*`/`import pkg.Name` records the spec; bare
+                // `import` echoes the list. There is no package namespace
+                // to resolve — bookkeeping only, so `import casadi.*`
+                // scripts at least parse and run to their real dependency.
+                if args.is_empty() {
+                    let list = self.imports.clone();
+                    for s in &list {
+                        self.print_buf.push_str(&format!("{s}\n"));
+                    }
+                } else {
+                    for a in args {
+                        let spec = match a {
+                            Expr::Str(s) | Expr::Ident(s) => s.clone(),
+                            other => match self.eval(other)? {
+                                Value::Str(s) => s,
+                                _ => return Err(LangError::new("import arguments must be package names", 0)),
+                            },
+                        };
+                        if !self.imports.contains(&spec) {
+                            self.imports.push(spec);
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "filesep" => Ok(Some(Value::Str(std::path::MAIN_SEPARATOR.to_string()))),
+            "get" => {
+                // `get(h, 'prop')` / `get(h)` — handle 0 is the root object
+                // (a fixed virtual screen: headless, there is no real
+                // display), a positive integer is a figure number.
+                let v = self.eval_args(args)?;
+                let h = v.first().ok_or_else(|| LangError::new("get needs a handle", 0))?.scalar()?;
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => Some(s.to_lowercase()),
+                    Some(_) => return Err(LangError::new("get: property name must be a string", 0)),
+                    None => None,
+                };
+                let screen = || Matrix::row_vector(vec![1.0, 1.0, 1920.0, 1080.0]);
+                if h == 0.0 {
+                    return match prop.as_deref() {
+                        Some("screensize") => Ok(Some(Value::Mat(screen()))),
+                        Some("screendepth") => Ok(Some(Value::Num(24.0))),
+                        Some("children") => Ok(Some(Value::Mat(Matrix::row_vector((1..=self.figs.len()).map(|n| n as f64).collect())))),
+                        Some(other) if other.starts_with("default") => match self.defaults.get(other) {
+                            Some(v) => Ok(Some(v.clone())),
+                            None => Err(LangError::new(format!("get: root default '{other}' is not set"), 0)),
+                        },
+                        Some(other) => Err(LangError::new(format!("get: unknown root property '{other}'"), 0)),
+                        None => {
+                            let mut m = std::collections::BTreeMap::new();
+                            m.insert("screensize".into(), Value::Mat(screen()));
+                            m.insert("screendepth".into(), Value::Num(24.0));
+                            m.insert("children".into(), Value::Mat(Matrix::row_vector((1..=self.figs.len()).map(|n| n as f64).collect())));
+                            for (k, v) in &self.defaults {
+                                m.insert(k.clone(), v.clone());
+                            }
+                            Ok(Some(Value::Struct(StructArray::from_map(m))))
+                        }
+                    };
+                }
+                let n = h.max(0.0) as usize;
+                let fig = self.figs.get(n.wrapping_sub(1)).ok_or_else(|| LangError::new(format!("get: no figure {n}"), 0))?;
+                let lim = |l: Option<(f64, f64)>| match l {
+                    Some((a, b)) => Value::Mat(Matrix::row_vector(vec![a, b])),
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                };
+                let fig_prop = |p: &str, fig: &matplot::Figure| -> Result<Value, LangError> {
+                    Ok(match p {
+                        "xlim" => lim(fig.xlim),
+                        "ylim" => lim(fig.ylim),
+                        "zlim" => lim(fig.zlim),
+                        "title" => Value::Str(fig.title.clone().unwrap_or_default()),
+                        "xlabel" => Value::Str(fig.xlabel.clone().unwrap_or_default()),
+                        "ylabel" => Value::Str(fig.ylabel.clone().unwrap_or_default()),
+                        "zlabel" => Value::Str(fig.zlabel.clone().unwrap_or_default()),
+                        "grid" => Value::Str(if fig.grid { "on".into() } else { "off".into() }),
+                        "children" => Value::Mat(Matrix::zeros(0, 0)),
+                        other => return Err(LangError::new(format!("get: unknown figure property '{other}'"), 0)),
+                    })
+                };
+                match prop.as_deref() {
+                    Some(p) => Ok(Some(fig_prop(p, fig)?)),
+                    None => {
+                        let mut m = std::collections::BTreeMap::new();
+                        for p in ["xlim", "ylim", "zlim", "title", "xlabel", "ylabel", "zlabel", "grid", "children"] {
+                            m.insert(p.to_string(), fig_prop(p, fig)?);
+                        }
+                        Ok(Some(Value::Struct(StructArray::from_map(m))))
+                    }
+                }
+            }
+            "set" => {
+                // `set(h,'prop',v,...)` — h=0 stores root `Default*` props,
+                // a figure number writes the props `get` reports.
+                let v = self.eval_args(args)?;
+                let h = v.first().ok_or_else(|| LangError::new("set needs a handle", 0))?.scalar()?;
+                if v.len() < 3 || v.len() % 2 == 0 {
+                    return Err(LangError::new("set: property/value pairs expected", 0));
+                }
+                if h == 0.0 {
+                    let mut i = 1;
+                    while i + 1 < v.len() {
+                        let name = match &v[i] {
+                            Value::Str(s) => s.to_lowercase(),
+                            _ => return Err(LangError::new("set: property name must be a string", 0)),
+                        };
+                        if !name.starts_with("default") {
+                            return Err(LangError::new(format!("set: root property '{name}' is read-only"), 0));
+                        }
+                        if let Some(val) = v.get(i + 1) {
+                            self.defaults.insert(name, val.clone());
+                        }
+                        i += 2;
+                    }
+                    return Ok(None);
+                }
+                let n = h.max(0.0) as usize;
+                let fig = self.figs.get_mut(n.wrapping_sub(1)).ok_or_else(|| LangError::new(format!("set: no figure {n}"), 0))?;
+                let mut i = 1;
+                while i + 1 < v.len() {
+                    let name = match &v[i] {
+                        Value::Str(s) => s.to_lowercase(),
+                        _ => return Err(LangError::new("set: property name must be a string", 0)),
+                    };
+                    let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
+                    match name.as_str() {
+                        "xlim" | "ylim" | "zlim" => {
+                            let lim = match val {
+                                Value::Mat(_) | Value::Num(_) => {
+                                    let m = val.to_matrix()?;
+                                    match (m.data().first(), m.data().get(1)) {
+                                        (Some(&a), Some(&b)) => Some((a, b)),
+                                        (None, _) => None,
+                                        _ => return Err(LangError::new(format!("set: '{name}' needs a two-element vector"), 0)),
+                                    }
+                                }
+                                _ => return Err(LangError::new(format!("set: '{name}' needs a two-element vector"), 0)),
+                            };
+                            match name.as_str() {
+                                "xlim" => fig.xlim = lim,
+                                "ylim" => fig.ylim = lim,
+                                _ => fig.zlim = lim,
+                            }
+                        }
+                        "title" | "xlabel" | "ylabel" | "zlabel" => {
+                            let s = match val {
+                                Value::Str(s) => s.clone(),
+                                _ => return Err(LangError::new(format!("set: '{name}' needs a string"), 0)),
+                            };
+                            match name.as_str() {
+                                "title" => fig.title = Some(s),
+                                "xlabel" => fig.xlabel = Some(s),
+                                "ylabel" => fig.ylabel = Some(s),
+                                _ => fig.zlabel = Some(s),
+                            }
+                        }
+                        "grid" => {
+                            fig.grid = match val {
+                                Value::Str(s) => s.trim().eq_ignore_ascii_case("on"),
+                                other => other.scalar()? != 0.0,
+                            };
+                        }
+                        other => return Err(LangError::new(format!("set: unknown figure property '{other}'"), 0)),
+                    }
+                    i += 2;
+                }
+                Ok(None)
+            }
+            "argv" => {
+                // Octave's argv() — command-line args as a cellstr. MatCraft
+                // scripts get no args, so the honest value is an empty cell.
+                Ok(Some(Value::Cell(CellArray::new(0, 0))))
+            }
+            "wmean" => {
+                // wmean(A, w [, 'all'] [, 'dim', d] [, 'omitnan'|'includenan'])
+                // — weighted mean `sum(A.*W)/sum(W)` along a dimension.
+                let v = self.eval_args(args)?;
+                let a = v.first().ok_or_else(|| LangError::new("wmean needs data", 0))?.to_matrix()?;
+                need_2d(&a, "wmean")?;
+                let w = v.get(1).ok_or_else(|| LangError::new("wmean needs weights", 0))?.to_matrix()?;
+                need_2d(&w, "wmean")?;
+                let mut dim: Option<usize> = None; // 0 = 'all'
+                let mut omitnan = false;
+                let mut i = 2;
+                while i < v.len() {
+                    match &v[i] {
+                        Value::Str(s) => match s.trim() {
+                            "all" => dim = Some(0),
+                            "dim" => {
+                                i += 1;
+                                let d = v.get(i).ok_or_else(|| LangError::new("wmean: 'dim' needs a value", 0))?.scalar()?;
+                                dim = Some(d.max(1.0) as usize);
+                            }
+                            "omitnan" => omitnan = true,
+                            "includenan" => {}
+                            other => return Err(LangError::new(format!("wmean: unknown flag '{other}'"), 0)),
+                        },
+                        other => {
+                            let d = other.scalar()?;
+                            dim = Some(d.max(1.0) as usize);
+                        }
+                    }
+                    i += 1;
+                }
+                let wmean_slice = |xs: &[f64], ws: &[f64]| -> f64 {
+                    let (mut sw, mut swx) = (0.0, 0.0);
+                    for (x, w) in xs.iter().zip(ws) {
+                        if omitnan && (x.is_nan() || w.is_nan()) {
+                            continue;
+                        }
+                        sw += w;
+                        swx += x * w;
+                    }
+                    swx / sw
+                };
+                // Slice weights: same-size W indexes like A, a vector W
+                // broadcasts along the reduced dim, scalar W everywhere.
+                let wvec = w.data();
+                let wslice = |k: usize, extent: usize, stride: usize| -> Result<Vec<f64>, LangError> {
+                    if wvec.len() == a.numel() {
+                        Ok((0..extent).map(|j| wvec.get(k.saturating_add(j.saturating_mul(stride))).copied().unwrap_or(0.0)).collect())
+                    } else if wvec.len() == extent {
+                        Ok(wvec.to_vec())
+                    } else if wvec.len() == 1 {
+                        Ok(vec![wvec.first().copied().unwrap_or(0.0); extent])
+                    } else {
+                        Err(LangError::new("wmean: weights must be the size of A or match the reduced dimension", 0))
+                    }
+                };
+                let dim = dim.unwrap_or_else(|| if a.rows() == 1 || a.cols() == 1 { 0 } else { 1 });
+                let (rows, cols) = (a.rows(), a.cols());
+                let ad = a.data();
+                match dim {
+                    0 => {
+                        let ws = wslice(0, ad.len(), 1)?;
+                        Ok(Some(Value::Num(wmean_slice(ad, &ws))))
+                    }
+                    1 => {
+                        let mut outv = Vec::with_capacity(cols);
+                        for c in 0..cols {
+                            let xs: Vec<f64> = (0..rows).map(|r| ad.get(c.saturating_mul(rows).saturating_add(r)).copied().unwrap_or(0.0)).collect();
+                            let ws = wslice(c.saturating_mul(rows), rows, 1)?;
+                            outv.push(wmean_slice(&xs, &ws));
+                        }
+                        Ok(Some(mat_or_num(Matrix::row_vector(outv))))
+                    }
+                    2 => {
+                        let mut outv = Vec::with_capacity(rows);
+                        for r in 0..rows {
+                            let xs: Vec<f64> = (0..cols).map(|c| ad.get(c.saturating_mul(rows).saturating_add(r)).copied().unwrap_or(0.0)).collect();
+                            let ws = wslice(r, cols, rows)?;
+                            outv.push(wmean_slice(&xs, &ws));
+                        }
+                        Ok(Some(mat_or_num(Matrix::col_vector(outv))))
+                    }
+                    _ => Err(LangError::new("wmean: dim must be 1, 2 or 'all'", 0)),
+                }
             }
             // --- function handles -----------------------------------------
             "feval" => {
@@ -5308,6 +5724,46 @@ impl Session {
                 self.figure_mut().push_err(SeriesKind::ErrorBar, x.data().to_vec(), y.data().to_vec(), Some(e.data().to_vec()), spec);
                 Ok(None)
             }
+            "vline" => {
+                // vline(x [, spec]) — a vertical line at each x, spanning
+                // the current y limits (auto when unset). Always appends,
+                // like hold on; name/value pairs beyond the spec are
+                // accepted but ignored. Returns the line count.
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("vline needs x positions", 0))?.to_matrix()?;
+                let spec = v
+                    .iter()
+                    .skip(1)
+                    .find_map(|val| match val {
+                        Value::Str(s) => Some(matplot::LineSpec::parse(s)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let (y0, y1) = {
+                    let fig = self.figure_mut();
+                    match fig.ylim {
+                        Some(l) => l,
+                        None => {
+                            let (_, _, a, b) = matplot::view_limits(fig);
+                            if a.is_finite() && b.is_finite() {
+                                (a, b)
+                            } else {
+                                (0.0, 1.0)
+                            }
+                        }
+                    }
+                };
+                let fig = self.figure_mut();
+                let mut n = 0.0;
+                for x in m.data() {
+                    if !x.is_finite() {
+                        continue;
+                    }
+                    fig.push(SeriesKind::Line, vec![*x, *x], vec![y0, y1], spec.clone());
+                    n += 1.0;
+                }
+                Ok(Some(Value::Num(n)))
+            }
             "histogram" => {
                 let v = self.eval_args(args)?;
                 let m = v.first().ok_or_else(|| LangError::new("histogram needs data", 0))?.to_matrix()?;
@@ -5885,8 +6341,13 @@ impl Session {
     }
 
     fn call_function_argv_inner(&mut self, name: &str, def: &FuncDef, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
-        // Fresh local scope: caller workspace is fully swapped out.
+        // Fresh local scope: caller workspace is fully swapped out, and
+        // `global`/`persistent` declarations reset — M-code scopes them
+        // per function (each function re-declares the names it shares).
         let saved_vars = std::mem::take(&mut self.vars);
+        let saved_globals = std::mem::take(&mut self.frame_globals);
+        let saved_persist = std::mem::take(&mut self.frame_persist);
+        let saved_key = self.cur_func_key.replace(format!("{}::{}", def.file, name));
         let saved_ctx = self.call_ctx.replace((argv.len(), nargout));
         let vararg = def.params.last().map(|p| p == "varargin").unwrap_or(false);
         let fixed = if vararg { def.params.len().saturating_sub(1) } else { def.params.len() };
@@ -5951,6 +6412,9 @@ impl Session {
         fbuf.push_str(&self.print_buf);
         self.print_buf = fbuf;
         self.vars = saved_vars;
+        self.frame_globals = saved_globals;
+        self.frame_persist = saved_persist;
+        self.cur_func_key = saved_key;
         self.call_ctx = saved_ctx;
         result
     }
@@ -11260,6 +11724,16 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "readmatrix",
     "writematrix",
     "repelem",
+    // --- corpus tail: scope declarations, package import, misc builtins.
+    "global",
+    "persistent",
+    "import",
+    "filesep",
+    "get",
+    "set",
+    "argv",
+    "vline",
+    "wmean",
 ];
 
 fn lang(e: MatError) -> LangError {
@@ -15146,5 +15620,143 @@ legend('sig'); grid on; saveas('{f}')"
         // sum over a non-existent dim is a no-op.
         s.run("nop = sum(x,9);").unwrap();
         assert_eq!(get_mat(&s, "nop").dims(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn multiassign_path_targets() {
+        let mut s = Session::new();
+        // `[s.f, v(i)] = f(…)` assigns through field/subscript paths.
+        s.run("v = zeros(1,3); [s.f, v(2)] = deal(5, 9);").unwrap();
+        match s.get("s") {
+            Some(Value::Struct(sa)) => assert_eq!(sa.field_at(0, "f"), Some(&Value::Num(5.0))),
+            other => panic!("expected struct, got {other:?}"),
+        }
+        assert_eq!(get_mat(&s, "v").get(0, 1), Some(9.0));
+        // Multi-output call into paths too.
+        s.run("[t.maxv, v(1)] = max([3 8 2]);").unwrap();
+        match s.get("t") {
+            Some(Value::Struct(sa)) => assert_eq!(sa.field_at(0, "maxv"), Some(&Value::Num(8.0))),
+            other => panic!("expected struct, got {other:?}"),
+        }
+        assert_eq!(get_mat(&s, "v").get(0, 0), Some(2.0));
+    }
+
+    #[test]
+    fn command_syntax_mixed_args() {
+        // A quoted arg after bare-word args: `cpu etoc 'fbp time'` —
+        // the `'` in command-arg position opens a string, not transpose.
+        let mut s = Session::new();
+        s.run("function rec(varargin); global LAST; LAST = varargin{2}; end").unwrap();
+        s.run("rec word 'quoted arg'").unwrap();
+        assert_eq!(s.globals.get("LAST"), Some(&Value::Str("quoted arg".into())));
+    }
+
+    #[test]
+    fn import_parses_and_records() {
+        let mut s = Session::new();
+        s.run("import casadi.*\nimport a.b.c").unwrap();
+        assert!(s.imports.contains(&"casadi.*".to_string()));
+        assert!(s.imports.contains(&"a.b.c".to_string()));
+    }
+
+    #[test]
+    fn double_quoted_strings() {
+        let mut s = Session::new();
+        s.run("x = \"hello\"; y = \"a\"\"b\";").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Str("hello".into())));
+        assert_eq!(s.get("y"), Some(&Value::Str("a\"b".into())));
+    }
+
+    #[test]
+    fn shebang_first_line() {
+        let mut s = Session::new();
+        s.run("#! /usr/bin/octave -qf\nx = 42;").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(42.0)));
+        // `#` elsewhere is still a syntax error.
+        assert!(s.run("x = 1\n# nope").is_err());
+    }
+
+    #[test]
+    fn end_variants_close_blocks() {
+        let mut s = Session::new();
+        // Octave-dialect closers: `endif`/`endfor`/`endfunction` act as `end`.
+        s.run("x = 0; if x == 0, x = 1; endif\nfor i = 1:3, x = x + 1; endfor").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(4.0)));
+        // A stray `endfunction` is a no-op statement.
+        s.run("endfunction").unwrap();
+    }
+
+    #[test]
+    fn global_shares_across_calls() {
+        let mut s = Session::new();
+        s.run("global G\nG = 7\nfunction y = bump()\nglobal G\nG = G + 1\ny = G\nend\nr = bump();\n").unwrap();
+        assert_eq!(s.get("r"), Some(&Value::Num(8.0)));
+        // The base-workspace binding sees the function's write too.
+        s.run("r2 = G;").unwrap();
+        assert_eq!(s.get("r2"), Some(&Value::Num(8.0)));
+    }
+
+    #[test]
+    fn persistent_survives_calls() {
+        let mut s = Session::new();
+        s.run("function y = count()\npersistent n\nif isempty(n), n = 0; end\nn = n + 1\ny = n\nend\n").unwrap();
+        s.run("a = count(); b = count();").unwrap();
+        assert_eq!(s.get("b"), Some(&Value::Num(2.0)));
+        // `persistent` at script scope errors like M-code.
+        assert!(s.run("persistent z").is_err());
+    }
+
+    #[test]
+    fn wmean_weighted_mean() {
+        let mut s = Session::new();
+        s.run("a = wmean([1 2 3 4],[1 1 2 2]);").unwrap();
+        match s.get("a") {
+            Some(Value::Num(x)) => assert!((x - 17.0 / 6.0).abs() < 1e-12),
+            other => panic!("expected num, got {other:?}"),
+        }
+        s.run("b = wmean([1 2;3 4],[1 1;2 2],2);").unwrap();
+        assert_eq!(get_mat(&s, "b").get(1, 0), Some(3.5));
+        s.run("c = wmean([1 2;3 4],[1 1;2 2]);").unwrap();
+        let c = get_mat(&s, "c");
+        assert!((c.get(0, 0).unwrap_or(0.0) - 7.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vline_appends_series() {
+        let mut s = Session::new();
+        s.run("plot([0 10],[0 1]); vline(5,'r--');").unwrap();
+        assert_eq!(s.figs[0].series.len(), 2);
+    }
+
+    #[test]
+    fn get_root_and_figure() {
+        let mut s = Session::new();
+        s.run("ss = get(0,'ScreenSize'); figure; plot(1:3); xl = get(gcf,'xlim');").unwrap();
+        assert_eq!(get_mat(&s, "ss").data(), &[1.0, 1.0, 1920.0, 1080.0]);
+        assert!(s.get("xl").is_some());
+    }
+
+    #[test]
+    fn set_root_defaults_and_figure() {
+        let mut s = Session::new();
+        // `set(0,'Default...',v)` stores a root default `get` reads back.
+        s.run("set(0,'DefaultAxesFontName','Times'); fn = get(0,'DefaultAxesFontName');").unwrap();
+        assert_eq!(s.get("fn"), Some(&Value::Str("Times".into())));
+        // Figure props write the same fields `get` reports.
+        s.run("figure; plot(1:3); set(gcf,'ylim',[0 9],'title','t1','grid','on');").unwrap();
+        assert_eq!(s.figs[0].ylim, Some((0.0, 9.0)));
+        assert_eq!(s.figs[0].title.as_deref(), Some("t1"));
+        assert!(s.figs[0].grid);
+        s.run("g = get(gcf,'grid');").unwrap();
+        assert_eq!(s.get("g"), Some(&Value::Str("on".into())));
+        // A non-default root prop is read-only.
+        assert!(s.run("set(0,'ScreenSize',[0 0 1 1])").is_err());
+    }
+
+    #[test]
+    fn argv_empty_cell() {
+        let mut s = Session::new();
+        s.run("a = argv(); n = numel(a);").unwrap();
+        assert_eq!(s.get("n"), Some(&Value::Num(0.0)));
     }
 }

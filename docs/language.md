@@ -14,6 +14,8 @@ by observing MathWorks software.
   to its code-point doubles: `'a'+1`, `'a'=='a'`, `x'` on a char (a numeric
   column), `x(i)='a'` writing 97 into a double, `[1 'a']`. All-char rows in
   a literal stay char: `['a' 'b']` → `'ab'`, `[72 'i']` → `'Hi'`.
+  `"double-quoted"` strings lex too (`""` escapes a quote) but produce the
+  same `char` value — there is no `string` class yet.
 - `cell` array — `{1, 'two', [3 4]}`; any value per element, matrices and
   nested cells included.
 - `struct` — struct **array** with named fields; `s.f = v` creates/extends it,
@@ -34,15 +36,34 @@ by observing MathWorks software.
 - `x = expr` assigns; `A(i,j) = v` / `A(i) = v` assigns through indexing and
   grows the target with zeros (1-based, column-major linear indexing).
 - `if cond ... elseif cond ... else ... end`
-- `for v = expr ... end` — `v` takes each **column** of `expr`.
+- `for v = expr ... end` — `v` takes each **column** of `expr`. `parfor`
+  is accepted and runs sequentially (no parallel workers).
+- `!cmd …` — shell escape, equivalent to `system('cmd …')` (native only),
+  with no `ans` produced.
 - `while cond ... end` (hard iteration cap: 1,000,000).
 - `switch expr ... case v ... otherwise ... end` — string and scalar matching.
 - `try ... catch ... end` / `try ... catch e ... end` — `e.message` and
   `e.identifier` carry the error text and ID.
 - `break`, `continue`, `return` — work inside loops and at script level.
+- `global a b` shares the names between workspaces — each function that
+  uses them re-declares `global` and then reads/writes the shared store.
+  `persistent a b` inside a `function` keeps its value between calls
+  (per file+function); at script scope `persistent` errors like M-code.
+- `import pkg.*` / `import pkg.Name` records the spec (bare `import`
+  echoes the list) — there is no package namespace to resolve, so this is
+  bookkeeping only.
 - Command syntax: `name arg arg` = `name('arg','arg')` — `format long`,
   `clear x`, `disp hello`, `save f.txt -ascii` all work. Each whitespace-
-  separated *word* is one arg, so `f.txt` and `-ascii` are literal strings.
+  separated *word* is one arg, so `f.txt` and `-ascii` are literal strings,
+  a `'quoted'` word anywhere in the arg list is a literal string too
+  (`cpu etoc 'elapsed time'`), and glued punctuation stays inside the word
+  (`ft_warning once FieldTrip:fileio:id`, `im subplot [1 2 3]`,
+  `cd ../..`).
+- Octave-dialect `end`-variants (`endfunction`, `endif`, `endfor`,
+  `endwhile`, `endswitch`, `end_try_catch`, `endproperties`, `endmethods`,
+  `endevents`, `endenumeration`, `endclassdef`) close blocks like `end`,
+  and a stray one at statement level is a no-op. A `#!` line at the very
+  start of a file is treated as a comment (shebang scripts).
 
 ## Expressions
 
@@ -108,7 +129,9 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   names are local, and nothing leaks to the caller's workspace.
 - `[a, b] = f(x)` binds multiple outputs; `y = f(x)` or `f(x)` takes the
   first. `~` ignores a slot: `[a, ~, c] = f(x)`, `function [a, ~] = g(…)`,
-  `function r = g(~, b)`.
+  `function r = g(~, b)`. Targets are not limited to plain names —
+  `[s.f, v(i)] = f(x)` assigns through field/subscript paths, like
+  `[regular.B1_H, regular.B1_I] = max(...)`.
 - `narginchk(min, max)` / `nargoutchk(min, max)` validate call arity.
 - `error('msg')` / `error('my:id', 'msg')` throw; `warning` prints.
 - Script-local functions are **hoisted** — defined at the end of a script,
@@ -134,7 +157,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); N-D arrays reduce along `dim` over the whole array (`sum(ones(2,3,4),3)` → 2×3×1) and default to the first non-singleton dim; two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
 | Running | `cumsum cumprod diff sort unique find` (`find` multi-output; `cumsum`/`cumprod`/`diff` are 2-D-only) |
-| Statistics | `nansum nanmean nanprod nanmin nanmax nanstd nanvar nanmedian cov prctile quantile hist histc` — `nan*` skips `NaN`s; `cov(X)`, `cov(x,y)`, `cov(X,1)`; `prctile(x,p)`/`quantile(x,q)` interpolate per column; `hist(x,n|edges)` (2nd output = centres), `histc(x,edges)` per column |
+| Statistics | `nansum nanmean nanprod nanmin nanmax nanstd nanvar nanmedian cov prctile quantile hist histc wmean` — `nan*` skips `NaN`s; `cov(X)`, `cov(x,y)`, `cov(X,1)`; `prctile(x,p)`/`quantile(x,q)` interpolate per column; `hist(x,n|edges)` (2nd output = centres), `histc(x,edges)` per column; `wmean(A,W)` is the weighted mean `sum(A.*W)/sum(W)` along the first non-singleton dim (`'all'`, `'dim',d`, `'omitnan'`/`'includenan'`) |
 | Sets | `ismember setdiff union intersect setxor` (`[tf,loc] = ismember(A,B)`; `'rows'`/`'legacy'` unsupported) and `sortrows` (`sortrows(M)`, `sortrows(M,cols)`, `[M,I]`), `accumarray(subs,vals)` |
 | Indexing / N-D | `sub2ind ind2sub ndgrid permute ipermute shiftdim flip bsxfun` — `permute`/`ipermute` reorder dims, `shiftdim` shifts them, `flip(A,dim)` reverses along a dim, `bsxfun(f,A,B)` applies a builtin op or handle with singleton-dim expansion |
 | Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` + degree trig `sind cosd tand asind acosd atand atan2d` |
@@ -150,10 +173,10 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
-| Workspace | `who whos clear disp display format save load type assert rng normrnd` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`) |
-| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile csvread exist which eval evalc run error warning clc home tic toc pause` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it) |
+| Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
+| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*` is bookkeeping only) |
 | System | `version ver computer ispc isunix ismac getenv setenv system fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license optimset optimget` — `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0 |
-| UI | `input waitbar drawnow beep ishandle findobj findall ishold gca` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number |
+| UI | `input waitbar drawnow beep ishandle findobj findall ishold gca get set argv` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number; `get(0,'ScreenSize')`/`'ScreenDepth'`/`'Children'` report a fixed virtual screen, `get(fig,'prop')`/`get(fig)` reads figure limits/labels/grid; `set(0,'Default*',v)` stores root defaults `get` reads back, `set(fig,'prop',v,…)` writes the same props; `argv()` returns an empty cellstr (scripts take no args) |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
 | Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`), `nargchk(lo,hi,n)` (legacy message-string form) |
@@ -163,7 +186,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Delimited | `csvwrite dlmwrite dlmread readmatrix writematrix` — `dlmread(f[,delim][,r,c])`/`readmatrix` auto-detect the delimiter; `dlmwrite(f,m[,delim][,r,c],'-append')` pads offsets; `writematrix(m,f)` |
 | Dates | `datenum now clock etime datestr` — serial day numbers with epoch 0000-01-01; `datenum(y,m,d[,h,mi,s])`, a date-string, or an N×3/N×6 datevec matrix; `datestr(x[,fmt])` for fmt 0/1/2/13/14/15/16/21/23/26/31 |
 | Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed) |
-| Plotting | `plot scatter stem bar area stairs errorbar histogram` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column |
+| Plotting | `plot scatter stem bar area stairs errorbar histogram vline` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column; `vline(x[,spec])` appends vertical lines spanning the current y limits |
 | Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
 | Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style; `image` is an alias), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
@@ -226,8 +249,10 @@ Notes:
   `isreal(complex(3,0))` is `1` (MATLAB keeps the class). Relational
   ops on complex compare real parts.
 - Plotting is headless: SVG/PNG/PDF export but no interactive figure
-  window yet; no `contourf`/`contour3`, no `set`/`get` on graphics
-  properties, no `camlight`/`lighting`.
+  window yet; no `contourf`/`contour3`; `get` covers only root
+  (`ScreenSize`/`ScreenDepth`/`Children`) and basic figure properties —
+  `set` covers only root `Default*` storage and the figure props `get`
+  reports — no `camlight`/`lighting`.
 - Functions get a fresh scope but not yet `nargin`-style default *outputs*
   (unassigned output args error). Function handles exist (`@name`,
   `@(a,b) expr`, `inline`, `str2func`/`func2str`/`functions`,
