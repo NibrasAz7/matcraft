@@ -19,18 +19,26 @@ x =
 ## Status
 
 **Alpha** — Studio + engine + language/numerics + DSP + broad plotting are
-in. ~280 builtins, complex and sparse matrices, struct/cell arrays, `.mat`
-v5 I/O, 2D and 3D figures with SVG/PNG/PDF export, a MATLAB-style desktop
-Studio (ribbon toolstrip, docked panes, command window, workspace, editor,
-figure tabs), CLI + MCP + a JSON-lines control channel.
+in. ~440 builtins, `classdef` OOP (value + handle classes), N-D arrays,
+complex and sparse matrices, struct/cell arrays, `.mat` v5 I/O, 2D and 3D
+figures with SVG/PNG/PDF export, a MATLAB-style desktop Studio (ribbon
+toolstrip, docked panes, command window, workspace, editor, figure tabs,
+breakpoint debugger), CLI + MCP + a JSON-lines control channel, a WASM
+Studio shell, and a `craft-ai` panel (BYO endpoint or local models).
 
-**Compatibility, measured honestly:** in a sweep of 638 real-world `.m`
-files from 32 pre-2022 GitHub repos across 8 domains, ~87% parse cleanly —
-scripts fail first on missing toolbox builtins, then on `@` handles. See
-[`docs/wild-corpus.md`](docs/wild-corpus.md) and [`docs/gaps.md`](docs/gaps.md).
-Not yet: `@` anonymous functions/handles, `classdef` OOP, N-D indexing,
-image I/O, most toolbox functions, Simulink-style modeling (planned as the
-SimCraft sibling). See [`ROADMAP.md`](ROADMAP.md).
+**Compatibility, measured honestly:** in a sweep of 788 real-world `.m`
+files from 32 pre-2022 GitHub repos across 8 domains, **632/645 function
+files (98%) parse cleanly** — the only two parse failures in the corpus
+are prose files saved with a `.m` extension, and all sources decode
+(latin-1 fallback). Scripts fail mostly on repo-local helper functions
+and external toolboxes — see [`docs/wild-corpus.md`](docs/wild-corpus.md)
+and [`docs/gaps.md`](docs/gaps.md). Landed since the first sweep: `@`
+anonymous functions/handles, `classdef` OOP, N-D indexing, `global`/
+`persistent`, `import`, PNG image I/O, file I/O, regex, latin-1 sources.
+Not yet: most toolbox functions, object arrays/`subsref`, deferred
+classdef attribute enforcement, and Simulink-style modeling (the SimCraft
+sibling — `sim.run`/`model.*` commands already bridge it). See
+[`ROADMAP.md`](ROADMAP.md).
 
 ## What runs today
 

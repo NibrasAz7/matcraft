@@ -6,7 +6,7 @@
 
 | Dimension | Now | Target |
 | --- | --- | --- |
-| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, ~220 builtins | full M-code |
+| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, ~440 builtins | full M-code |
 | Execution | tree-walk interpreter | bytecode VM → Cranelift JIT |
 | Linear algebra | pure-Rust LU/QR/Cholesky/eig/SVD/pinv/cond/rank/rref/null/orth | faer-rs backend + complex eigensolver |
 | Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
@@ -195,3 +195,17 @@
   AGENTS) — the Simulink-class sibling interconnected via `sim`,
   `set_param`/`get_param`, workspace-exchange blocks and M-code
   callbacks.
+- Language saturation waves (2026-10): the corpus findings above all
+  landed. `@` handles + closures (`f623a3e`), `run` + `dbstop`/`dbcont`
+  debugger core (`46483c2`), WASM Studio shell (`05b0175`), live
+  breakpoint UI (`c35af3d`), N-D arrays + indexing (`fbaa859`),
+  craft-libs adoption — atomic saves, settings store, quit prompt
+  (`baeacc5`), macOS/Linux packaging + release workflow (`ec64cb2`),
+  craft-ai panel + `ai.*` commands (`bbf9522`), ~140 corpus-driven
+  builtins — file I/O, regex, stats, image I/O (pure-Rust PNG),
+  system/env, dates, sets/bits/casts (`6007c27`), latin-1 `.m` decoding
+  on every source path (`1d78428`), `global`/`persistent`/`import` +
+  destructuring LHS + grammar gaps (`4cf61f6`), and `classdef` OOP with
+  value/handle classes and `@dir` dispatch (`50e8e90`). Corpus re-run:
+  parse-fail 93 → 2 (both non-code doc files), 632/645 function files
+  parse (98%), 39/143 scripts run clean.

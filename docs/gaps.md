@@ -19,10 +19,10 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | --- | --- | --- |
 | ~~G6~~ | ~~No `ui-egui` crate / `matcraft` Studio app~~ | **Done 2026-10-14:** command window, workspace inspector, editor, figure dock (resvg rasterizer); thin UI over `engine`. |
 | ~~G7~~ | ~~No control channel~~ | **Done:** `--control PORT` → JSON-lines TCP server in `apps/matcraft` (`engine.execute`, `engine.list`, `ui.state`, `ui.render`, `ui.screenshot`, `ping`); bounded lines, connection cap, verified by TCP smoke tests + dispatch tests. |
-| G8 | No `apps/matcraft-web` | WASM build; never break wasm (`cargo xtask wasm`). `ui-egui` keeps net-free dispatch so it stays wasm-compatible. |
-| ~~G9~~ | ~~No `packaging/`~~ | **Done 2026-10-14:** `packaging/windows/` (WiX `.wxs` + `package.ps1` + `sign.ps1`), `winresource` icon via `build.rs`; MSI + portable zip built, installed to `C:\Program Files\MatCraft`, verified. macOS/Linux packaging still open. |
+| ~~G8~~ | ~~No `apps/matcraft-web`~~ | **Done:** WASM Studio shell via `eframe::WebRunner` + Trunk (`05b0175`); `cargo xtask wasm` gates wasm32 in CI. Remaining: publish/host it. |
+| ~~G9~~ | ~~No `packaging/`~~ | **Done:** Windows WiX MSI + portable zip (`packaging/windows/`, verified installed); macOS `.app`/`.dmg` + Linux tarball/`.deb` + `release.yml` three-OS matrix (`ec64cb2`). Remaining: real-device macOS/Linux QA, signing/notarization secrets. |
 | ~~G10~~ | ~~Not in the skill catalog~~ | **Done:** `artcraft-cli` SKILL.md row + gotchas, `references/commands/matcraft_commands.txt`, `_learn/matcraft_commands.txt`; `14-MatCraft-ForecastAnalysis` demo in the playground. |
-| G35 | No debugger hooks for Studio breakpoints | The editor gutter toggles per-editor `BTreeSet<usize>` marks, but `dbstop`/`dbclear`/`dbstatus`/`dbcont`/`dbstep` don't exist in `matlang`/`engine` — marks are visual only and have no effect until the interpreter gains a debug hook (pause-at-line in `interp` + `debug.*` engine commands). |
+| ~~G35~~ | ~~No debugger hooks for Studio breakpoints~~ | **Done:** `dbstop`/`dbclear`/`dbstatus`/`dbcont`/`dbstep`/`dbquit` + `run` with real pause continuations (`46483c2`); Studio wires gutter clicks → `dbstop`, amber stopped-line highlight, Continue/Step/Quit, `K>>` prompt (`c35af3d`). Limitation: breakpoints match top-level statements — can't suspend mid-`for`-body yet (needs per-statement lines in the AST). |
 
 ## P2 — language completeness
 
@@ -37,10 +37,10 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | ~~G17~~ | ~~`~` ignore-output, comma-separated lists~~ | **Done:** `~` on `[a, ~, b] = f()` LHS and in function output/param lists; comma-separated lists — `c{1:3}` expands in call args (`f(c{:})`, `varargin`), `[s.f]`/`{c{:}}` literals, `[a,b] = c{1:2}` multi-assign, `A(c{:})` index positions. `end` in function files still open. |
 | ~~G17b~~ | ~~No char→double promotion~~ | **Done:** `Value::to_numeric` — chars promote to code-point doubles in arithmetic, comparisons, `'` transpose, `x(i)` numeric writes, `[…]` literals; `['a' 'b']`/`[72 'i']` stay char; `''` is `0×0`. Remaining: char arrays are still row-only (no 2-D char matrix → `char` on multi-element cellstr unsupported). |
 | ~~G17c~~ | ~~Cell-blind shape builtins~~ | **Done:** `reshape`/`repmat`/`fliplr`/`flipud`/`cat`/`horzcat`/`vertcat` on cells, `num2cell(A,dim)` + char, `char(cellstr)` (scalar), `c(:,1)=[]`/`c(1,:)=[]` row/col delete, `A(i)=[]` matrix deletion (bounds-checked, vectors keep orientation). |
-| G31 | No `@` handles / anonymous functions | **#1 corpus blocker** (91 of ~128 parse failures in `docs/wild-corpus.md`): `f = @(x) x.^2`, `@sin`, `fminsearch(@(x)…)`, `cellfun(@…, c)`. Needs `Value::Func` (handle) + closure capture of the defining scope. |
+| ~~G31~~ | ~~No `@` handles / anonymous functions~~ | **Done (`f623a3e`):** `@name` handles, `@(x) expr` closures capturing the defining workspace, `feval`/`func2str`/`str2func`/`functions`, `arrayfun`/`cellfun` with handles, `inline`. |
 | ~~G32~~ | ~~No `classdef` / OOP~~ | **Done:** `classdef X < super`, `properties`/`methods`/`enumeration`/`events` sections with attribute lists, bodiless signatures, `Name(args)` ctors, `obj.prop` get/set, `obj.m(…)` + `m(obj,…)` dispatch, `obj@Super`/`name@Super` calls, value semantics + `handle` shared state, `@dir` method files (class-private), `isa`/`class`/`isobject`/`methods`/`properties`, operator overloads (`plus`/`eq`/`horzcat`/`transpose`/…), `Class.enum` values. Deferred: object arrays, `events` listeners, attribute enforcement (`Access`/`Constant`/`Dependent`/`Abstract`/`Sealed`), packages, `metaclass`, enumeration objects, `.mat` objects, `subsref`/`subsasgn`. |
 | ~~G33~~ | ~~Corpus cheap wins~~ | **Done** (2025 sweep): `for(i=…)` paren headers, `cd ..`/`cd ../x` bare-dot command args, `deg2rad` `rad2deg` `sinc` `randperm` `normrnd` `assert` `rng` `fullfile` `genpath` `csvread` `mkdir` `eps()`/`Inf(n,m)`/`NaN(n)` constructors, `axis`/`box`, `db2pow`/`pow2db`, `uint8`, `rectpuls`/`tripuls`, `addpath` splits `;`-lists. |
-| G34 | Image I/O | `imread`/`imwrite`/`imshow`/`im2double` — 22 corpus hits; needs N-D arrays (G22) for HxWx3 and an image codec (PNG at least). |
+| ~~G34~~ | ~~Image I/O~~ | **Done (`6007c27`):** `imread`/`imwrite`/`im2double`/`fspecial` — PNG codec in pure Rust (`imgpng.rs`), M×N / M×N×3 doubles. Remaining: `imshow` (needs the matplot image path), other formats (JPEG). |
 
 ## P3 — numerics depth
 
@@ -50,7 +50,7 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | G19 | No `faer` backend | Phase 5 swap; `matcore` API is stable so the backend is pluggable. Not vendored in this environment — pure Rust stands. |
 | ~~G20~~ | ~~Elementwise/stdlib gaps~~ | **Done:** `cumsum`/`cumprod`/`diff`, `sort`(+`'descend'`/dim), `unique`, `polyval`/`polyfit`/`roots`/`poly`/`conv`/`deconv`, `interp1`, `trapz`, `std`/`var`/`median`, `repmat`, `kron`, `diag`, `triu`/`tril`, `fliplr`/`flipud`, `circshift`, `rot90`, `hypot`, `nthroot`, `nextpow2`, `pow2`. |
 | ~~G21~~ | ~~No complex numbers~~ | **Done:** `Value::Cplx(CMatrix)` — `i`/`j` constants + `2i` glued literals, `real`/`imag`/`conj`/`abs`/`angle`/`complex`/`isreal`, `'` ctranspose vs `.'`, domain promotion (`sqrt(-4)`→`2i`), auto-demote when imag=0, complex eig/det/inv/norm/trace/reductions/sort/find, complex `.mat` v5 (FLAG_COMPLEX pr/pi) + tagged-ASCII round-trips. |
-| G22 | ~~Sparse~~ / N-D | **Sparse done:** `Value::Sparse(SparseMat)` — `sparse`/`full`/`nnz`/`speye`/`spalloc`/`spones`/`issparse`/`nonzeros`, sparse-aware indexing/assign/growth/delete, `+` `-` `*` `.*` `./` transpose, `[S T]` concat, `find` column-major, mxSPARSE `.mat` v5. Remaining: N-D strided views are architecture-level work. |
+| ~~G22~~ | ~~Sparse~~ / ~~N-D~~ | **Sparse done:** `Value::Sparse(SparseMat)` — `sparse`/`full`/`nnz`/`speye`/`spalloc`/`spones`/`issparse`/`nonzeros`, sparse-aware indexing/assign/growth/delete, `+` `-` `*` `.*` `./` transpose, `[S T]` concat, `find` column-major, mxSPARSE `.mat` v5. **N-D done (`fbaa859`):** `dims: Vec<usize>` storage, `zeros(2,3,4)`, `x(i,j,k)` merged-tail + linear indexing, `ndims`/`cat(dim)`/`reshape`/`squeeze`, page display, mxDOUBLE N-D `.mat` round-trip. 2-D-only ops reject N-D operands cleanly. |
 
 ## P4 — plotting breadth
 
@@ -66,6 +66,6 @@ progress log and delete the row here. Order is current priority, not difficulty.
 | # | Gap | Notes |
 | --- | --- | --- |
 | ~~G27~~ | ~~DSP toolbox~~ | **Done:** `matcore::dsp` — mixed-radix FFT (`fft`/`ifft`/`fft2`/`ifft2`, prime lengths via naive DFT), `fftshift`/`ifftshift`, `dftmtx`, `filter` (DF-IIT, `zi`/`zf`), `xcorr` (maxlag + biased/unbiased/coeff), `freqz` (n-point/`'whole'`/w-vector/`f,fs`), `unwrap`, windows (`hamming`/`hann`/`blackman`/`bartlett`/`rectwin`/`triang`/`kaiser`/`gausswin`). `conv` predates this row. |
-| G28 | Data I/O | `readmatrix`/`writematrix`, CSV, `.mat` v5 (pairs with G13). Tagged-ASCII `save`/`load` and numeric-table `load` landed (G13). |
+| ~~G28~~ | ~~Data I/O~~ | **Done:** `readmatrix`/`writematrix`/`dlmread`/`dlmwrite`/`csvread`/`csvwrite`, `textscan`/`strread`/`fscanf`/`sscanf`, `fopen`/`fread`/`fwrite`/`fseek`/`fgetl`…, `.mat` v5 incl. cell/struct/N-D/complex/sparse. Remaining: `*.xlsx`, netCDF/HDF5 (documented rejects). |
 | G29 | Optimization | Landed: `fzero` (safeguarded secant), `fminsearch` (scalar Nelder–Mead), `integral`/`quad` (adaptive Simpson). Remains: `lsqcurvefit`, multi-param `fminsearch`. |
 | G30 | Control/systems | `tf`, `step`, `bode`, `lsim` — after complex numbers. |
