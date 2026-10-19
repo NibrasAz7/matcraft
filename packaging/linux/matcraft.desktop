@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MatCraft
+GenericName=Numerical computing environment
+Comment=Rust-native numerical computing environment with an M-code language
+Exec=matcraft %F
+Icon=matcraft
+Terminal=false
+Categories=Science;Math;Development;
+MimeType=text/x-matlab;
+Keywords=numerical;computing;matrix;script;plot;
+StartupWMClass=matcraft

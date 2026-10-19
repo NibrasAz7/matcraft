@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shared-mime-info package: registers .m files so file managers offer
+     "Open with MatCraft" — the Linux equivalent of the MSI's OpenWithProgids
+     registration. Refreshed by the .deb's postinst via update-mime-database. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-matlab">
+    <comment>M-code script</comment>
+    <glob pattern="*.m"/>
+  </mime-type>
+</mime-info>

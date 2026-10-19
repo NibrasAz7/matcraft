@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for MatCraft.app. package.sh substitutes __VERSION__
+  with the workspace version ([workspace.package] in the root Cargo.toml)
+  when staging the bundle. Bundle layout it describes:
+
+    MatCraft.app/Contents/
+      Info.plist
+      MacOS/matcraft        GUI app (the bundle executable)
+      MacOS/matcraft-cli    CLI / REPL / MCP server, alongside like the MSI
+      Resources/matcraft.icns
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>MatCraft</string>
+	<key>CFBundleExecutable</key>
+	<string>matcraft</string>
+	<key>CFBundleIconFile</key>
+	<string>matcraft.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.artcraft.matcraft</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MatCraft</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 ArtCraft Team and the MatCraft contributors. MIT OR Apache-2.0.</string>
+	<!-- "Open with MatCraft" for .m files (Alternate rank: offered, not made
+	     the default) — the macOS equivalent of the MSI's OpenWithProgids. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>m</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>M-code script</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.data</string>
+				<string>public.script</string>
+			</array>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+		</dict>
+	</array>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- wgpu/Metal: let the system pick the low-power GPU on dual-GPU Macs. -->
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>

@@ -1,0 +1,80 @@
+# Release packaging: on every v* tag (or manual dispatch) build and package on
+# each OS's native runner with its own script — packaging/{windows,linux,macos}
+# — and attach everything under dist/release/ to the GitHub release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The package scripts read [workspace.package] version by default; on a
+      # tag push the tag is the version of record (v1.2.3 -> 1.2.3).
+      - name: Set MATCRAFT_VERSION from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: echo "MATCRAFT_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # eframe/wgpu builds need no system libraries (x11rb + dlopen), but a few
+      # build scripts probe with pkg-config if present; the dev packages make
+      # that deterministic and cost seconds.
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev
+
+      - name: WiX v5 (Windows installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/package.ps1 -Arch x64
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: packaging/linux/package.sh
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/package.sh
+
+      # Always keep the artifacts on the workflow run; on tags also attach
+      # them to the GitHub release (created if missing).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matcraft-${{ runner.os }}
+          path: dist/release/*
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/release/*
+          fail_on_unmatched_files: true
