@@ -44,12 +44,15 @@ pub fn parse(source: &str) -> Result<Vec<Stmt>, LangError> {
 /// messages can link back into the editor.
 pub fn parse_lines(source: &str) -> Result<Vec<(usize, Stmt)>, LangError> {
     let toks = crate::lexer::lex(source)?;
-    let mut p = Parser { toks, pos: 0, elem_break: false };
+    let mut p = Parser { toks, pos: 0, elem_break: false, pending: Vec::new() };
     let mut out = Vec::new();
     p.skip_separators();
     while p.peek() != &Tok::Eof {
         let line = p.line();
         out.push((line, p.statement(0)?));
+        // File-scope functions hoisted out of an unterminated body join
+        // the top-level stream right after their nominal parent.
+        out.append(&mut p.pending);
         p.skip_separators();
     }
     Ok(out)
@@ -58,6 +61,9 @@ pub fn parse_lines(source: &str) -> Result<Vec<(usize, Stmt)>, LangError> {
 struct Parser {
     toks: Vec<Lexed>,
     pos: usize,
+    /// Sibling `function`s hoisted out of an unterminated function body;
+    /// `parse_lines` splices them into the top-level statement stream.
+    pending: Vec<(usize, Stmt)>,
     /// True while parsing an element directly inside a `[a b; c d]` row.
     /// Lets `add()` honour M-code's whitespace rule: `a -b` breaks the
     /// element (the `-` starts a unary-signed element), while `a - b` and
@@ -205,7 +211,13 @@ impl Parser {
             }
         }
         if self.at_ident("function") {
-            return self.parse_function(depth, &[]);
+            let mut fns = self.parse_function(depth, &[], true)?;
+            let first = if fns.is_empty() { Stmt::Noop } else { fns.remove(0) };
+            // Hoisted siblings are top-level statements: queue them for
+            // `parse_lines` (the only consumer that sees file scope).
+            let l = self.line();
+            self.pending.extend(fns.into_iter().map(|s| (l, s)));
+            return Ok(first);
         }
         if self.at_ident("classdef") {
             return self.parse_classdef(depth);
@@ -467,7 +479,16 @@ impl Parser {
     /// `extra_stops` adds keywords that also end the body (`methods` blocks
     /// stop a function at the next `properties`/`methods`/… section, not
     /// just `end`/`function`).
-    fn parse_function(&mut self, depth: usize, extra_stops: &[&str]) -> Result<Stmt, LangError> {
+    ///
+    /// `nested` selects how a `function` keyword inside the body reads:
+    /// `true` — it is provisionally a *nested* function; if the body then
+    /// ends at `end` it stays nested, but an unterminated body (EOF,
+    /// `function`, an extra stop) means it was a file-local *sibling* and
+    /// it (plus everything after it) is hoisted out after this function.
+    /// `false` — the keyword simply ends the body unconsumed (classdef
+    /// `methods` blocks, where the next `function` is the next method).
+    /// Returns `[the function, …hoisted siblings]`.
+    fn parse_function(&mut self, depth: usize, extra_stops: &[&str], nested: bool) -> Result<Vec<Stmt>, LangError> {
         self.next(); // 'function'
         let mut outputs = Vec::new();
         if self.peek() == &Tok::LBracket {
@@ -508,27 +529,40 @@ impl Parser {
             }
         }
         self.skip_inline_separators();
-        // `end` optional: the body also terminates at 'function' or EOF.
-        let mut stops: Vec<&str> = vec!["end", "function"];
+        // `end` optional: the body also terminates at EOF or an extra stop.
+        let mut stops: Vec<&str> = vec!["end"];
         stops.extend_from_slice(extra_stops);
-        let body = self.block_or_eof(&stops, depth)?;
-        if self.at_ident("end") {
-            self.next();
-        }
-        Ok(Stmt::Function { name, params, outputs, body })
-    }
-
-    /// Like `block`, but EOF also terminates (for top-level function bodies).
-    fn block_or_eof(&mut self, keywords: &[&str], depth: usize) -> Result<Vec<Stmt>, LangError> {
-        let mut out = Vec::new();
+        let mut body = Vec::new();
+        let mut terminated = false;
         loop {
             self.skip_separators();
             match self.peek() {
-                Tok::Ident(k) if Self::closes_block(k, keywords) => return Ok(out),
-                Tok::Eof => return Ok(out),
-                _ => out.push(self.statement(depth + 1)?),
+                Tok::Ident(k) if Self::closes_block(k, &stops) => {
+                    self.next();
+                    terminated = true;
+                    break;
+                }
+                Tok::Eof => break,
+                Tok::Ident(k) if k == "function" => {
+                    if !nested {
+                        break; // unterminated body ends at the next function
+                    }
+                    body.append(&mut self.parse_function(depth + 1, extra_stops, true)?);
+                }
+                _ => body.push(self.statement(depth + 1)?),
             }
         }
+        if !terminated {
+            // Unterminated body: a `function` inside was a file-local
+            // sibling, not a nested function — everything from the first
+            // one on (its own body absorbed the rest) is hoisted out.
+            if let Some(i) = body.iter().position(|s| matches!(s, Stmt::Function { .. })) {
+                let mut sibs = body.split_off(i);
+                sibs.insert(0, Stmt::Function { name, params, outputs, body });
+                return Ok(sibs);
+            }
+        }
+        Ok(vec![Stmt::Function { name, params, outputs, body }])
     }
 
     /// `classdef Name < super (& super)* ... end` — a class definition of
@@ -662,11 +696,18 @@ impl Parser {
                 }
                 Tok::Eof => return self.err("missing 'end' for 'methods'"),
                 Tok::Ident(k) if k == "function" => {
-                    let f = self.parse_function(depth, SECTION_STOPS)?;
-                    let Stmt::Function { name, params, outputs, body } = f else {
+                    // Inside `methods` a `function` keyword is the next
+                    // method, never a nested function (`nested = false`).
+                    let mut fns = self.parse_function(depth, SECTION_STOPS, false)?;
+                    if fns.is_empty() {
                         return self.err("internal: expected a function definition");
-                    };
-                    out.push(ClassMethod { name, params, outputs, body, is_static });
+                    }
+                    for f in fns.drain(..) {
+                        let Stmt::Function { name, params, outputs, body } = f else {
+                            return self.err("internal: expected a function definition");
+                        };
+                        out.push(ClassMethod { name, params, outputs, body, is_static });
+                    }
                 }
                 _ => out.push(self.method_signature(is_static)?),
             }

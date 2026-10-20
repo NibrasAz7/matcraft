@@ -22,18 +22,24 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **39** |
-| parse-ok (fdef) / parse-fail | **632 / 1** | — |
+| clean run | — | **41** |
+| parse-ok (fdef) / parse-fail | **644 / 1** | — |
 | parse-fail (script) | — | 1 |
-| unknown builtin/function | 2 | 75 |
-| runtime error | 10 | 28 |
+| unknown builtin/function | 0 | 92 |
+| runtime error | 0 | 8 |
+| timeout | 0 | 1 |
 | non-UTF-8 source | 0 | 0 |
 | **total** | 645 | 143 |
 
-- **Parser coverage: 632/645 function files (98%)** parse cleanly; the one
-  remaining function fail is a bare non-code line in a doc-style file
-  (an FEX help dump). The single script parse-fail is likewise a prose
-  doc file (`methods_of_inpaint_nans.m`).
+- **Parser coverage: 644/645 function files (99.8%)** parse cleanly. The
+  latest parse wave — a `function` following an *unterminated* body is a
+  file-local **sibling**, not a nested function (a `pending` queue splices
+  it back into the top-level stream; `end`-terminated inner functions stay
+  nested and register like file-local ones) — moved 12 function files out
+  of the error buckets into parse-ok. The one remaining function fail is a
+  bare non-code line in a doc-style file (an FEX help dump); the single
+  script parse-fail is likewise a prose doc file
+  (`methods_of_inpaint_nans.m`).
 - **`classdef` OOP — the last major language feature — landed.** All
   17 classdef/property-block files that failed parsing now run:
   `classdef X < super`, `properties`/`methods`/`enumeration`/`events`
@@ -74,6 +80,32 @@
   `filesep`, `get` (root `ScreenSize` + basic figure properties) and
   `set` (root `Default*` props + the same figure props), Octave's
   `argv`, plus the `global`/`persistent`/`import` declarations.
+- **Latest runtime-error sweep.** `d = dir(pat)` now returns the
+  name/folder/date/bytes/isdir/datenum struct array (sorted, `.`/`..`
+  first, 0x1 on no match) instead of only printing — the
+  `isempty(dir(p))` idiom works (`ls` keeps its print form);
+  `ismember` accepts char/cellstr text membership
+  (`ismember('fp16',{'h','fp16'})`); `[F,E] = log2(X)` is the frexp-style
+  two-output form; `fprintf(fid,fmt,…)` writes to `fopen` file ids (1/2
+  = stdout/stderr); `rand('seed'|'state'|'twister',v)` legacy seeding;
+  `p = which('n')` returns a char instead of printing; `ax = subplot(…)`
+  returns the figure number as the axes handle; `plot` accepts
+  `('Name',value)` property pairs; `switch`/`case {a,b}` matches any cell
+  element; and a builtin without a multi-output form now runs
+  single-output under `[a,b] = f(…)` (over-demand errors "too few
+  outputs"). The reworded "unknown function or variable 'x'" message
+  also moved files that used to die on `'<name>' is not a function`
+  from runtime-error into unknown-builtin — that bucket's +17 is mostly
+  reclassification, not new gaps.
+- **The 8 remaining runtime errors are all environmental:** five read
+  data files the harvest never downloads (`*.mat`, `*.jpg` — only `.m`
+  files are collected: the CDT doc scripts and `rtnlinv.m`,
+  `test_main.m`), and two `cd` into lab-machine paths
+  (`buildZipFile.m`, `mean_tc_acrossSessions_example.m`). The single
+  timeout is `dtiTrackWholeBrainStats.m`, which `load`s from the dead
+  UNC share `//snarp/…` — Windows takes ~21 s to fail the lookup
+  (os error 53), over the 15 s budget; MatCraft does report "cannot
+  read", just too late. None are semantic gaps.
 - **Rejected as infeasible/out-of-scope** (documented, not stubbed):
   `ncreadatt`/`h5struct`/`h5*` (netCDF/HDF5 file formats — no
   readers in-tree), `SX`/`casadi` (the CasADi symbolic toolbox the
@@ -94,7 +126,7 @@
 | Rank | Failure class | Files | Status |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~Parse fails (residual)~~ | ~~19~~ → 2 | **Drained 93 → 2** — `classdef` OOP landed; the only remaining fails are two non-code doc files (prose saved as `.m`). |
-| 2 | Missing builtins / repo-local helpers | 77 | Real builtins landed (`vline` `wmean` `filesep` `get` `set` `argv`); remainder is repo-local helpers, external toolboxes (CasADi `SX` ×12), and documented rejects. |
+| 2 | Missing builtins / repo-local helpers | 92 | Real builtins landed (`vline` `wmean` `filesep` `get` `set` `argv`); remainder is repo-local helpers, external toolboxes (CasADi `SX` ×18), and documented rejects. Count rose 77 → 92 largely on error-message reclassification (`'x' is not a function` → `unknown function or variable 'x'`), not new gaps. |
 | ~~3~~ | ~~`classdef` OOP~~ | ~~16 of parse-fail~~ | **Resolved** — `classdef`/`properties`/`methods`/`enumeration` sections, ctors, dispatch (`obj.m(…)`, `m(obj,…)`, `obj@Super`), `@dir` methods, `isa`/`class`/`isobject`, handle classes. Deferred: object arrays, `events`, `Constant`/`Dependent`/`Abstract` enforcement, packages, `metaclass`, enumeration objects. |
 | 4 | `global`/`persistent` semantics | unknown count | **Resolved** — `global x` links a frame to the shared store, `persistent x` keeps values across calls of the same function. |
 | ~~5~~ | ~~Non-UTF-8 sources~~ | ~~36~~ | **Resolved** — `read_m_source` decodes latin-1 when UTF-8 fails; wired into CLI, engine `script.run`, `run`, function loading and the Studio editor. |

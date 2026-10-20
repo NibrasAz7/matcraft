@@ -45,7 +45,9 @@ by observing MathWorks software.
 - `!cmd …` — shell escape, equivalent to `system('cmd …')` (native only),
   with no `ans` produced.
 - `while cond ... end` (hard iteration cap: 1,000,000).
-- `switch expr ... case v ... otherwise ... end` — string and scalar matching.
+- `switch expr ... case v ... otherwise ... end` — string and scalar
+  matching; `case {a, b, c}` matches when the expression equals any cell
+  element.
 - `try ... catch ... end` / `try ... catch e ... end` — `e.message` and
   `e.identifier` carry the error text and ID.
 - `break`, `continue`, `return` — work inside loops and at script level.
@@ -132,7 +134,8 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 - Bodies run in a **fresh local scope**: parameters bind arguments, all other
   names are local, and nothing leaks to the caller's workspace.
 - `[a, b] = f(x)` binds multiple outputs; `y = f(x)` or `f(x)` takes the
-  first. `~` ignores a slot: `[a, ~, c] = f(x)`, `function [a, ~] = g(…)`,
+  first. A builtin without a multi-output form runs single-output and
+  reports too few outputs when the targets do not fit. `~` ignores a slot: `[a, ~, c] = f(x)`, `function [a, ~] = g(…)`,
   `function r = g(~, b)`. Targets are not limited to plain names —
   `[s.f, v(i)] = f(x)` assigns through field/subscript paths, like
   `[regular.B1_H, regular.B1_I] = max(...)`.
@@ -223,9 +226,12 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); N-D arrays reduce along `dim` over the whole array (`sum(ones(2,3,4),3)` → 2×3×1) and default to the first non-singleton dim; two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
 | Running | `cumsum cumprod diff sort unique find` (`find` multi-output; `cumsum`/`cumprod`/`diff` are 2-D-only) |
 | Statistics | `nansum nanmean nanprod nanmin nanmax nanstd nanvar nanmedian cov prctile quantile hist histc wmean` — `nan*` skips `NaN`s; `cov(X)`, `cov(x,y)`, `cov(X,1)`; `prctile(x,p)`/`quantile(x,q)` interpolate per column; `hist(x,n|edges)` (2nd output = centres), `histc(x,edges)` per column; `wmean(A,W)` is the weighted mean `sum(A.*W)/sum(W)` along the first non-singleton dim (`'all'`, `'dim',d`, `'omitnan'`/`'includenan'`) |
-| Sets | `ismember setdiff union intersect setxor` (`[tf,loc] = ismember(A,B)`; `'rows'`/`'legacy'` unsupported) and `sortrows` (`sortrows(M)`, `sortrows(M,cols)`, `[M,I]`), `accumarray(subs,vals)` |
+| Sets | `ismember setdiff union intersect setxor` (`[tf,loc] = ismember(A,B)` — numeric, or whole-string
+  membership when either side is a cellstr (`ismember('fp16',{'h','fp16'})`);
+  `'rows'`/`'legacy'` unsupported) and `sortrows` (`sortrows(M)`, `sortrows(M,cols)`, `[M,I]`), `accumarray(subs,vals)` |
 | Indexing / N-D | `sub2ind ind2sub ndgrid permute ipermute shiftdim flip bsxfun` — `permute`/`ipermute` reorder dims, `shiftdim` shifts them, `flip(A,dim)` reverses along a dim, `bsxfun(f,A,B)` applies a builtin op or handle with singleton-dim expansion |
-| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` + degree trig `sind cosd tand asind acosd atand atan2d` |
+| Element-wise | `abs sqrt exp log log10 log2 expm1 log1p sin cos tan asin acos atan atan2 sinh cosh tanh sech csch coth floor ceil round fix sign mod rem hypot nthroot nextpow2 pow2 dot cross deg2rad rad2deg sinc db2pow pow2db uint8 rectpuls tripuls` + degree trig `sind cosd tand asind acosd atand atan2d`
+  (`[F,E] = log2(X)` is the frexp-style two-output form: `X = F .* 2.^E` with |F| in [0.5,1)) |
 | Bits | `bitand bitor bitxor bitshift bitget bitset bitcmp` — operands convert to `u64` (integer, non-negative, < 2^53); `bitcmp(x)`/`bitcmp(x,n)` complements the low `n` bits (default 64) |
 | Casts | `single int8 int16 int32 int64 uint16 uint32 uint64` — saturate-and-round to the target range (storage stays `f64`, so `class` still reports `double`) |
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
@@ -238,20 +244,30 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
-| Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
-| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*` is bookkeeping only) |
+| Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`;
+  the legacy `rand('seed',v)`/`rand('state',v)`/`rand('twister',v)` forms set and `rand('state')` reads it; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
+| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*` is bookkeeping only;
+  `d = dir(pat)` returns a name/folder/date/bytes/isdir/datenum struct array
+  (sorted, `.`/`..` first, 0x1 when nothing matches; `ls` prints the listing);
+  `p = which('n')` returns the located path/description char or `''`) |
 | System | `version ver computer ispc isunix ismac getenv setenv system fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license optimset optimget` — `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0 |
 | UI | `input waitbar drawnow beep ishandle findobj findall ishold gca get set argv` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number; `get(0,'ScreenSize')`/`'ScreenDepth'`/`'Children'` report a fixed virtual screen, `get(fig,'prop')`/`get(fig)` reads figure limits/labels/grid; `set(0,'Default*',v)` stores root defaults `get` reads back, `set(fig,'prop',v,…)` writes the same props; `argv()` returns an empty cellstr (scripts take no args) |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
-| Output | `fprintf sprintf` (`%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
+| Output | `fprintf sprintf` (`fprintf(fid,fmt,…)` writes to an `fopen` file id, 1/2 = stdout/stderr;
+  `%d %i %f %e %g %s %c %x %%`, `\n \t \\`, width/precision, cyclic args) |
 | Functions | `nargin nargout varargin varargout narginchk nargoutchk` (inside a `function`), `nargchk(lo,hi,n)` (legacy message-string form) |
 | Handles | `feval func2str str2func functions arrayfun cellfun inline lasterror` — `feval(f,…)` calls a handle or name; `arrayfun(f,A)` maps over elements (scalar outputs only); `cellfun(f,C)` maps over cells (`'UniformOutput',false` gives a cell back); `functions(f)` inspects a handle; `lasterror` returns the last error struct (`message`/`identifier`) |
 | File I/O | `fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets fscanf delete` — `[fid,msg] = fopen(name,'r|w|a[+]'[,machfmt])` (fids ≥ 3, −1 on failure, `machfmt` containing `b`/`big` = big-endian; `fopen()` lists open fids, `fclose all` closes all); `[A,count] = fread(fid[,size][,prec][,skip])` and `count = fwrite(fid,A[,prec][,skip])` with `prec` in `'uchar'(default) 'schar' 'char' 'int8'…'uint64' 'single' 'float' 'double' 'short' 'long' 'bitN'…` (`size` = `n` column, `[m n]` filled column-major, `Inf` = to EOF; `*prec`/`src=>dst` forms read as char); `fseek(fid,off,'bof|cof|eof'|-1|0|1)`, `frewind`, `feof`, `pos = ftell`, `[msg,errnum] = ferror`, `fgetl`/`fgets` a line without/with the newline, `[A,count] = fscanf(fid,fmt[,size])` scans the rest of the file like `sscanf`, `delete 'file'` |
 | Text scan | `sscanf(s,fmt[,n])` → `[vals,count]` (`%d %f %e %g %i %s %c`, `%%`, `%*x` suppression, field widths, literal text); `C = textscan(s,fmt[,n])`/`strread(s,fmt)` → 1×ncol cell of column results, `'Delimiter'` and `'HeaderLines'` params |
 | Delimited | `csvwrite dlmwrite dlmread readmatrix writematrix` — `dlmread(f[,delim][,r,c])`/`readmatrix` auto-detect the delimiter; `dlmwrite(f,m[,delim][,r,c],'-append')` pads offsets; `writematrix(m,f)` |
 | Dates | `datenum now clock etime datestr` — serial day numbers with epoch 0000-01-01; `datenum(y,m,d[,h,mi,s])`, a date-string, or an N×3/N×6 datevec matrix; `datestr(x[,fmt])` for fmt 0/1/2/13/14/15/16/21/23/26/31 |
-| Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed) |
-| Plotting | `plot scatter stem bar area stairs errorbar histogram vline` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column; `vline(x[,spec])` appends vertical lines spanning the current y limits |
+| Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed; `ax = subplot(…)`
+  returns the figure number as the axes handle, like `gca`) |
+| Plotting | `plot scatter stem bar area stairs errorbar histogram vline` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column; `vline(x[,spec])` appends vertical lines spanning the current y limits;
+  `('Name',value)` pairs after each series carry line properties —
+  `color`/`linestyle`/`marker` map onto the spec, sizing/annotation props
+  (`linewidth` `markersize` `marker*color` `displayname` …) are accepted
+  and ignored until the renderer has fields for them |
 | Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
 | Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style; `image` is an alias), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
@@ -290,7 +306,10 @@ Notes:
   double is rejected (linear `x(i) = []` still works). Subscripted reads
   return one dim per subscript (`x(:,:,1)` is 2×3×1, not squeezed 2×3 —
   use `squeeze`). `.mat` files round-trip N-D dims for doubles.
-- No nested/local-scoped subfunctions. `.mat` v5 binary `save`/`load`
+- Nested `function`s register like file-local ones: a `function` inside an
+  `end`-terminated body is hoisted with a fresh scope (true M-code nested
+  functions would share the parent workspace — they do not here), and a
+  `function` following an unterminated body is a file-local sibling. `.mat` v5 binary `save`/`load`
   covers double, complex (FLAG_COMPLEX pr/pi), char and sparse (mxSPARSE
   `ir`/`jc`/`pr`) arrays — saving a cell or struct errors
   (mxCELL/mxSTRUCT writing is deferred). `load` validates the v5

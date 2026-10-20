@@ -1394,6 +1394,12 @@ impl Session {
                         name.clone(),
                         FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static: false },
                     );
+                    // Nested functions (a `function` inside an
+                    // `end`-terminated body) register like file-local
+                    // ones — a documented deviation: true nested
+                    // functions share the parent's workspace, ours get
+                    // a fresh scope.
+                    self.hoist_functions(body, file);
                 }
                 Stmt::ClassDef { .. } => self.register_class(s, file),
                 _ => {}
@@ -1653,7 +1659,12 @@ impl Session {
                     let take = match cond {
                         Some(c) => {
                             let cv = self.eval(c)?;
-                            values_equal(&val, &cv)
+                            // `case {a, b, c}` matches when the switch
+                            // expression equals ANY cell element.
+                            match &cv {
+                                Value::Cell(ca) => ca.items.iter().any(|item| values_equal(&val, item)),
+                                _ => values_equal(&val, &cv),
+                            }
                         }
                         None => true,
                     };
@@ -1712,7 +1723,15 @@ impl Session {
                             self.bind_targets(targets, outs, fname, *suppress, out)?;
                             return Ok(Flow::Normal);
                         }
-                        None => return Err(LangError::new(format!("'{fname}' is not a function"), 0)),
+                        None if self.is_builtin(fname) => {
+                            // A builtin without a multi-output form runs
+                            // single-output; `bind_targets` reports too
+                            // few outputs when the targets don't fit.
+                            let outs: Vec<Value> = self.builtin(fname, fargs)?.into_iter().collect();
+                            self.bind_targets(targets, outs, fname, *suppress, out)?;
+                            return Ok(Flow::Normal);
+                        }
+                        None => return Err(LangError::new(format!("unknown function or variable '{fname}'"), 0)),
                     }
                 }
                 let outs = self.call_function(fname, fargs, targets.len())?;
@@ -3220,6 +3239,24 @@ impl Session {
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         match name {
             "zeros" | "ones" | "eye" | "rand" | "randn" => {
+                // `rand('seed', v)` / `rand('state', v)` (and the
+                // `'twister'` alias) — the legacy seed-setting form,
+                // still common in older scripts alongside `rng`.
+                if matches!(name, "rand" | "randn") {
+                    if let Some(Expr::Str(mode)) = args.first() {
+                        if matches!(mode.to_ascii_lowercase().as_str(), "seed" | "state" | "twister") {
+                            return match args.get(1) {
+                                // `rand('state')` reads the generator state.
+                                None => Ok(Some(Value::Num(self.rng as f64))),
+                                Some(e) => {
+                                    let s = self.eval(e)?.scalar()?;
+                                    self.rng = (s as u64) | 1;
+                                    Ok(None)
+                                }
+                            };
+                        }
+                    }
+                }
                 let dims = self.dim_vec(args)?;
                 if name == "eye" && dims.len() > 2 {
                     return Err(LangError::new("eye accepts at most two dimensions", 0));
@@ -4258,9 +4295,32 @@ impl Session {
             }
             "fprintf" => {
                 let v = self.eval_args(args)?;
-                let (f, rest) = split_format_args(&v)?;
+                // `fprintf(fid, fmt, …)` — a numeric first argument ahead
+                // of the format string is the file id; 1/2 are
+                // stdout/stderr, larger fids write to the open file.
+                let (fid, fv): (u32, &[Value]) = match (v.first(), v.get(1)) {
+                    (Some(x @ (Value::Num(_) | Value::Mat(_))), Some(Value::Str(_))) => (x.scalar()? as u32, &v[1..]),
+                    _ => (1, &v[..]),
+                };
+                let (f, rest) = split_format_args(fv)?;
                 let text = sprintf_impl(&f, &rest)?;
-                self.print_buf.push_str(&text);
+                match fid {
+                    1 | 2 => self.print_buf.push_str(&text),
+                    _ => {
+                        use std::io::Write;
+                        let mut t = self.files.borrow_mut();
+                        match t.get_mut(&fid) {
+                            Some(ent) if ent.writable => {
+                                if let Err(e) = (&ent.f).write_all(text.as_bytes()) {
+                                    ent.last_err = e.to_string();
+                                    return Err(LangError::new(format!("fprintf: {e}"), 0));
+                                }
+                            }
+                            Some(_) => return Err(LangError::new("fprintf: file not opened for writing", 0)),
+                            None => return Err(LangError::new(format!("fprintf: fid {fid} not open"), 0)),
+                        }
+                    }
+                }
                 Ok(None)
             }
             "sprintf" => {
@@ -5644,6 +5704,10 @@ impl Session {
                 Ok(Some(Value::Num(code)))
             }
             "which" => {
+                // `p = which('name')` returns the located name as a char —
+                // the `.m` path, a description for functions/builtins, or
+                // `''` when not found. As a bare statement it echoes that
+                // through `ans`.
                 let v = self.eval_args(args)?;
                 let name = match v.first() {
                     Some(Value::Str(s)) => s.clone(),
@@ -5652,18 +5716,16 @@ impl Session {
                 for dir in &self.paths {
                     let f = dir.join(format!("{name}.m"));
                     if f.is_file() {
-                        self.print_buf.push_str(&format!("{}\n", f.display()));
-                        return Ok(None);
+                        return Ok(Some(Value::Str(f.display().to_string())));
                     }
                 }
                 if self.is_function(&name)? {
-                    self.print_buf.push_str(&format!("{name}: user function in session\n"));
+                    Ok(Some(Value::Str(format!("{name}: user function in session"))))
                 } else if self.is_builtin(&name) {
-                    self.print_buf.push_str(&format!("{name}: built-in function\n"));
+                    Ok(Some(Value::Str(format!("built-in ({name})"))))
                 } else {
-                    self.print_buf.push_str(&format!("'{name}' not found.\n"));
+                    Ok(Some(Value::Str(String::new())))
                 }
-                Ok(None)
             }
             "clc" | "home" => Ok(None),
             "addpath" | "rmpath" => {
@@ -5779,16 +5841,77 @@ impl Session {
                     Some(Value::Str(s)) => s.clone(),
                     _ => "*".to_string(),
                 };
-                let dir = std::env::current_dir().map_err(|e| LangError::new(format!("dir: {e}"), 0))?;
-                let read = std::fs::read_dir(&dir).map_err(|e| LangError::new(format!("dir: {e}"), 0))?;
-                for ent in read.flatten() {
-                    let name = ent.file_name().to_string_lossy().to_string();
-                    if glob_match(&pat, &name) {
-                        self.print_buf.push_str(&name);
-                        self.print_buf.push('\n');
+                // `d = dir(pat)` returns a struct array (name/folder/
+                // date/bytes/isdir/datenum) over the matches, sorted by
+                // name; a pattern matching nothing gives a 0x1 array —
+                // the `isempty(dir(p))` idiom depends on not erroring.
+                // `ls` keeps its print-only listing form.
+                let p = std::path::Path::new(&pat);
+                let (base, namepat): (std::path::PathBuf, String) = if pat.is_empty() || p.is_dir() {
+                    (if pat.is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() }, "*".to_string())
+                } else {
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| pat.clone());
+                    let dir = match p.parent() {
+                        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                        _ => std::path::PathBuf::from("."),
+                    };
+                    (dir, name)
+                };
+                let folder = if base == std::path::Path::new(".") {
+                    std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default()
+                } else {
+                    base.display().to_string()
+                };
+                // MATLAB lists '.' and '..' ahead of the sorted entries.
+                let mut rows: Vec<(String, bool, u64, f64)> = Vec::new();
+                if namepat == "*" {
+                    for nm in [".", ".."] {
+                        rows.push((nm.to_string(), true, 0, file_mtime_datenum(&base.join(nm))));
                     }
                 }
-                Ok(None)
+                if let Ok(read) = std::fs::read_dir(&base) {
+                    let mut ents: Vec<(String, bool, u64, f64)> = read
+                        .flatten()
+                        .filter_map(|ent| {
+                            let name = ent.file_name().to_string_lossy().to_string();
+                            if !glob_match(&namepat, &name) {
+                                return None;
+                            }
+                            let md = ent.metadata().ok();
+                            let isd = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                            let bytes = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                            let dn = md
+                                .as_ref()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs_f64() / 86_400.0 + 719_529.0)
+                                .unwrap_or(0.0);
+                            Some((name, isd, bytes, dn))
+                        })
+                        .collect();
+                    ents.sort_by(|a, b| a.0.cmp(&b.0));
+                    rows.extend(ents);
+                }
+                if name == "ls" {
+                    use std::fmt::Write as _;
+                    for (nm, _, _, _) in &rows {
+                        let _ = writeln!(self.print_buf, "{nm}");
+                    }
+                    return Ok(None);
+                }
+                let mut s = StructArray::with_dims(rows.len(), 1);
+                for f in ["name", "folder", "date", "bytes", "isdir", "datenum"] {
+                    s.add_field(f);
+                }
+                for (i, (nm, isd, bytes, dn)) in rows.iter().enumerate() {
+                    s.set_field(i, "name", Value::Str(nm.clone()))?;
+                    s.set_field(i, "folder", Value::Str(folder.clone()))?;
+                    s.set_field(i, "date", Value::Str(datestr_fmt(*dn, 0)))?;
+                    s.set_field(i, "bytes", Value::Num(*bytes as f64))?;
+                    s.set_field(i, "isdir", Value::Num(if *isd { 1.0 } else { 0.0 }))?;
+                    s.set_field(i, "datenum", Value::Num(*dn))?;
+                }
+                Ok(Some(Value::Struct(s)))
             }
             "tic" => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -6011,7 +6134,9 @@ impl Session {
                     return Err(LangError::new("usage: subplot(m,n,p) or subplot(mnp)", 0));
                 };
                 self.figure_mut().subplot(rows, cols, &pos);
-                Ok(None)
+                // `ax = subplot(…)` returns the axes handle — the figure
+                // number serves as one, same as `gca`.
+                Ok(Some(Value::Num(self.cur_fig as f64)))
             }
             "clf" => {
                 self.figure_mut().clear();
@@ -6613,13 +6738,24 @@ impl Session {
                 i += 1;
                 (Matrix::row_vector(xs), first_m)
             };
-            let spec = match v.get(i) {
-                Some(Value::Str(s)) => {
+            // Optional LineSpec — unless the string names a property;
+            // `('Name', value)` pairs after each series carry line
+            // properties (`plot(x,y,'b','LineWidth',2)`).
+            let mut spec = match v.get(i) {
+                Some(Value::Str(s)) if !is_plot_prop(s) => {
                     i += 1;
                     matplot::LineSpec::parse(s)
                 }
                 _ => matplot::LineSpec::new(),
             };
+            while let Some(Value::Str(key)) = v.get(i) {
+                if !is_plot_prop(key) {
+                    break;
+                }
+                let val = v.get(i + 1).ok_or_else(|| LangError::new(format!("plot: '{key}' needs a value"), 0))?.clone();
+                apply_plot_prop(&mut spec, key, &val)?;
+                i += 2;
+            }
             let (yr, yc) = y.shape();
             let yd = y.data();
             let xs: Vec<f64> = x.data().to_vec();
@@ -7186,7 +7322,7 @@ impl Session {
         if self.is_builtin(name) {
             return self.builtin_values(name, argv, nout);
         }
-        Err(LangError::new(format!("'{name}' is not a function"), 0))
+        Err(LangError::new(format!("unknown function or variable '{name}'"), 0))
     }
 
     /// `feval`-style dispatch on a handle *or* a function-name char —
@@ -7457,6 +7593,14 @@ impl Session {
             "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
             "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
+            "log2" => {
+                // [F,E] = log2(X): X = F .* 2.^E with |F| in [0.5,1).
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("log2 needs an input", 0))?.to_numeric()?;
+                let e = m.map(|x| if x.is_finite() && x != 0.0 { x.abs().log2().floor() + 1.0 } else { 0.0 });
+                let f = m.map(|x| if x.is_finite() && x != 0.0 { x / 2f64.powf(x.abs().log2().floor() + 1.0) } else { x });
+                vec![mat_or_num(f), mat_or_num(e)]
+            }
             _ => return Ok(None),
         };
         let mut out = out;
@@ -8010,6 +8154,48 @@ impl Session {
         let v = self.eval_args(args)?;
         if v.iter().skip(2).any(|x| matches!(x, Value::Str(_))) {
             return Err(LangError::new(format!("{name}: 'rows'/'legacy' flags are not supported"), 0));
+        }
+        // `ismember` on text (`ismember(fmt, {'h','fp16'})`): when either
+        // input is a cell, whole strings compare for exact equality.
+        // `Str`-vs-`Str` stays on the numeric char-wise path below.
+        if name == "ismember" && (matches!(v.first(), Some(Value::Cell(_))) || matches!(v.get(1), Some(Value::Cell(_)))) {
+            let to_strs = |x: Option<&Value>| -> Option<Vec<String>> {
+                match x {
+                    Some(Value::Str(s)) => Some(vec![s.clone()]),
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .map(|it| match it {
+                            Value::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => None,
+                }
+            };
+            let aa = to_strs(v.first()).ok_or_else(|| LangError::new("ismember: text membership needs a char or cellstr first input", 0))?;
+            let bb = to_strs(v.get(1)).ok_or_else(|| LangError::new("ismember: text membership needs a char or cellstr second input", 0))?;
+            let (ar, ac) = match v.first() {
+                Some(Value::Cell(c)) => c.shape(),
+                _ => (1, 1),
+            };
+            let mut lia = Vec::with_capacity(aa.len());
+            let mut locb = Vec::with_capacity(aa.len());
+            for a in &aa {
+                match bb.iter().position(|b| b == a) {
+                    Some(i) => {
+                        lia.push(1.0);
+                        locb.push(i as f64 + 1.0);
+                    }
+                    None => {
+                        lia.push(0.0);
+                        locb.push(0.0);
+                    }
+                }
+            }
+            let la = mat_or_num(Matrix::from_col_major(ar, ac, lia).map_err(lang)?);
+            let lb = mat_or_num(Matrix::from_col_major(ar, ac, locb).map_err(lang)?);
+            return Ok(vec![la, lb]);
         }
         let a = v.first().ok_or_else(|| LangError::new(format!("{name} needs two inputs"), 0))?.to_numeric()?;
         let a_row = a.rows() == 1;
@@ -11600,6 +11786,82 @@ fn cmatrix_delete(m: &CMatrix, specs: &IndexSpec) -> Result<CMatrix, LangError> 
 }
 
 /// `switch` case matching: strings compare literally, numbers elementwise-any.
+/// `('Name', value)` pair names accepted by the `plot` family after a
+/// LineSpec — the ones that reach the renderer (`color`, `linestyle`,
+/// `marker`) plus the accepted-and-ignored set (`linewidth`,
+/// `markersize`, `marker*color`, `displayname`, …) that has no data
+/// model yet. Kept narrow so a real spec string never misparses.
+fn is_plot_prop(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "linewidth" | "linestyle" | "color" | "marker" | "markersize" | "markerfacecolor" | "markeredgecolor" | "displayname" | "markeredgewidth"
+    )
+}
+
+/// Apply one `plot` name/value pair onto a `LineSpec`. Colour,
+/// linestyle and marker map onto the spec; sizing/annotation props are
+/// accepted and ignored (no renderer field for them yet).
+fn apply_plot_prop(spec: &mut matplot::LineSpec, key: &str, val: &Value) -> Result<(), LangError> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "color" => {
+            let rgb = match val {
+                Value::Str(s) => named_rgb(s).ok_or_else(|| LangError::new(format!("plot: unknown color '{s}'"), 0))?,
+                other => {
+                    let m = other.to_matrix()?;
+                    let d = m.data();
+                    if d.len() != 3 {
+                        return Err(LangError::new("plot: 'color' needs a letter or an [r g b] triplet", 0));
+                    }
+                    matplot::Rgb(
+                        (d[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (d[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (d[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    )
+                }
+            };
+            spec.color = Some(rgb);
+        }
+        "linestyle" => {
+            let Value::Str(s) = val else {
+                return Err(LangError::new("plot: 'linestyle' needs a string", 0));
+            };
+            spec.dash = match s.trim() {
+                "-" => matplot::DashStyle::Solid,
+                "--" => matplot::DashStyle::Dashed,
+                ":" => matplot::DashStyle::Dotted,
+                "-." => matplot::DashStyle::DashDot,
+                "none" => matplot::DashStyle::None,
+                other => return Err(LangError::new(format!("plot: unknown linestyle '{other}'"), 0)),
+            };
+        }
+        "marker" => {
+            let Value::Str(s) = val else {
+                return Err(LangError::new("plot: 'marker' needs a string", 0));
+            };
+            spec.marker = if s.trim() == "none" { None } else { matplot::LineSpec::parse(s).marker };
+        }
+        _ => {} // accepted, no renderer field yet
+    }
+    Ok(())
+}
+
+/// Colour names M-code accepts for a `color` property value.
+fn named_rgb(s: &str) -> Option<matplot::Rgb> {
+    let t = s.trim().to_ascii_lowercase();
+    matplot::LineSpec::parse(match t.as_str() {
+        "red" => "r",
+        "green" => "g",
+        "blue" => "b",
+        "cyan" => "c",
+        "magenta" => "m",
+        "yellow" => "y",
+        "black" => "k",
+        "white" => "w",
+        _ => s.trim(),
+    })
+    .color
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
@@ -12787,8 +13049,15 @@ fn expr_idents(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
         Expr::Ident(n) => {
             out.insert(n.clone());
         }
-        Expr::BraceIndex(n, args) | Expr::CallOrIndex(n, args) => {
+        Expr::BraceIndex(n, args) => {
             out.insert(n.clone());
+            for a in args {
+                expr_idents(a, out);
+            }
+        }
+        Expr::CallOrIndex(_, args) => {
+            // `f(x)` in call position is a function call, not a variable
+            // use — `inline('normpdf(x)')` has one argument, `x`.
             for a in args {
                 expr_idents(a, out);
             }
@@ -13273,6 +13542,17 @@ fn now_serial() -> Result<f64, LangError> {
     {
         Err(LangError::new("now/clock are not available on wasm", 0))
     }
+}
+
+/// M-code serial date number for a file's mtime (UNIX seconds -> days
+/// since the fixed epoch). Missing/unreadable mtimes map to serial 0.
+fn file_mtime_datenum(p: &std::path::Path) -> f64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64() / 86_400.0 + 719_529.0)
+        .unwrap_or(0.0)
 }
 
 const MONTH3: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
