@@ -1,8 +1,9 @@
 //! matplot — MatCraft's plotting crate.
 //!
-//! Phase 3 scope: a `Figure` data model (what `plot`/`scatter`/`stem`/`bar`
-//! build) and a headless SVG renderer. No GPU, no windowing — the interactive
-//! wgpu viewer lands later and consumes the same model.
+//! Phase 3 scope: a `Figure` data model (what `plot`/`scatter`/`stem`/`bar`,
+//! `text` and `imshow` build) and a headless SVG renderer. No GPU, no
+//! windowing — the interactive wgpu viewer lands later and consumes the
+//! same model.
 
 /// One plotted data set.
 #[derive(Debug, Clone)]
@@ -24,6 +25,9 @@ pub struct Series {
     pub labels: Vec<String>,
     /// `errorbar` half-amplitudes, one per point.
     pub err: Option<Vec<f64>>,
+    /// `ImageRgb` pixel payload — row-major RGBA8, `zshape` = (rows, cols).
+    /// `None` for every other kind.
+    pub rgba: Option<Vec<u8>>,
     pub spec: LineSpec,
 }
 
@@ -58,6 +62,12 @@ pub enum SeriesKind {
     Surf,
     /// `mesh` — a 3-D surface wireframe coloured by z.
     Mesh,
+    /// `text` — a string anchored at a data point: `x[0]`/`y[0]` carry
+    /// the anchor, `labels[0]` the text, `spec.color` the colour.
+    Text,
+    /// `imshow`-class true-color image: `zshape` = (rows, cols), `rgba`
+    /// carries row-major RGBA8 pixels.
+    ImageRgb,
 }
 
 /// Dash pattern from a line spec like `'r--o'`.
@@ -112,6 +122,9 @@ pub struct LineSpec {
     pub color: Option<Rgb>,
     pub dash: DashStyle,
     pub marker: Option<Marker>,
+    /// `'FontSize'` value in px — consumed by `Text` series today;
+    /// reserved as the `'MarkerSize'` carrier for point kinds.
+    pub size: Option<f64>,
 }
 
 impl Default for LineSpec {
@@ -122,12 +135,12 @@ impl Default for LineSpec {
 
 impl LineSpec {
     pub fn new() -> Self {
-        LineSpec { color: None, dash: DashStyle::Solid, marker: None }
+        LineSpec { color: None, dash: DashStyle::Solid, marker: None, size: None }
     }
 
     /// Parse a MATLAB-style spec string. Unknown characters are ignored.
     pub fn parse(s: &str) -> Self {
-        let mut out = LineSpec { color: None, dash: DashStyle::Solid, marker: None };
+        let mut out = LineSpec { color: None, dash: DashStyle::Solid, marker: None, size: None };
         let mut saw_dash = false;
         let cs: Vec<char> = s.chars().collect();
         let mut i = 0;
@@ -573,7 +586,7 @@ impl Figure {
         if matches!(kind, SeriesKind::Scatter | SeriesKind::Stem | SeriesKind::Bar | SeriesKind::ErrorBar) && spec.dash == DashStyle::Solid {
             spec.dash = DashStyle::None;
         }
-        self.series.push(Series { kind, x, y, z: Vec::new(), zshape: (0, 0), levels: Vec::new(), labels: Vec::new(), err, spec });
+        self.series.push(Series { kind, x, y, z: Vec::new(), zshape: (0, 0), levels: Vec::new(), labels: Vec::new(), err, rgba: None, spec });
     }
 
     /// `plot3` — a 3-D point-list series.
@@ -581,7 +594,18 @@ impl Figure {
         if spec.color.is_none() {
             spec.color = Some(self.next_color());
         }
-        self.series.push(Series { kind: SeriesKind::Line3, x, y, z, zshape: (0, 0), levels: Vec::new(), labels: Vec::new(), err: None, spec });
+        self.series.push(Series {
+            kind: SeriesKind::Line3,
+            x,
+            y,
+            z,
+            zshape: (0, 0),
+            levels: Vec::new(),
+            labels: Vec::new(),
+            err: None,
+            rgba: None,
+            spec,
+        });
     }
 
     /// `imagesc`/`contour`/`surf`/`mesh` — grid data with column-major `z`,
@@ -602,7 +626,7 @@ impl Figure {
         if spec.color.is_none() {
             spec.color = Some(self.next_color());
         }
-        self.series.push(Series { kind, x, y, z, zshape: (rows, cols), levels, labels: Vec::new(), err: None, spec });
+        self.series.push(Series { kind, x, y, z, zshape: (rows, cols), levels, labels: Vec::new(), err: None, rgba: None, spec });
     }
 
     /// `pie` — slice values and labels.
@@ -618,7 +642,47 @@ impl Figure {
             levels: Vec::new(),
             labels,
             err: None,
+            rgba: None,
             spec,
+        });
+    }
+
+    /// `text` — a string anchored at the data point (`x`, `y`). The text
+    /// colour defaults to black rather than consuming the line cycle;
+    /// `spec.size` is the font size in px when set.
+    pub fn push_text(&mut self, x: f64, y: f64, label: String, mut spec: LineSpec) {
+        if spec.color.is_none() {
+            spec.color = Some(Rgb(0x00, 0x00, 0x00));
+        }
+        self.series.push(Series {
+            kind: SeriesKind::Text,
+            x: vec![x],
+            y: vec![y],
+            z: Vec::new(),
+            zshape: (0, 0),
+            levels: Vec::new(),
+            labels: vec![label],
+            err: None,
+            rgba: None,
+            spec,
+        });
+    }
+
+    /// `imshow` — a true-colour raster: `rgba` is row-major RGBA8 over a
+    /// `rows`×`cols` pixel grid; `x`/`y` hold the column/row cell-centre
+    /// coordinates (same convention as `Image`).
+    pub fn push_rgba(&mut self, x: Vec<f64>, y: Vec<f64>, rows: usize, cols: usize, rgba: Vec<u8>) {
+        self.series.push(Series {
+            kind: SeriesKind::ImageRgb,
+            x,
+            y,
+            z: Vec::new(),
+            zshape: (rows, cols),
+            levels: Vec::new(),
+            labels: Vec::new(),
+            err: None,
+            rgba: Some(rgba),
+            spec: LineSpec::new(),
         });
     }
 }
@@ -683,7 +747,7 @@ fn view2d(fig: &Figure) -> (f64, f64, f64, f64) {
     for s in &fig.series {
         // Image grids: coordinate vectors hold cell centres — extend the
         // range by half a cell so the image edge lands on the axis limit.
-        let (xpad, ypad) = if s.kind == SeriesKind::Image { (half_step(&s.x), half_step(&s.y)) } else { (0.0, 0.0) };
+        let (xpad, ypad) = if matches!(s.kind, SeriesKind::Image | SeriesKind::ImageRgb) { (half_step(&s.x), half_step(&s.y)) } else { (0.0, 0.0) };
         for &v in &s.x {
             let t = tx(v);
             if t.is_finite() {
@@ -726,6 +790,40 @@ fn view2d(fig: &Figure) -> (f64, f64, f64, f64) {
 /// Escape text for XML.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Standard base64 (no line breaks) for SVG `data:` URIs.
+fn b64(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for ch in data.chunks(3) {
+        let (b0, b1, b2) = (ch.first().copied().unwrap_or(0) as u32, ch.get(1).copied().unwrap_or(0) as u32, ch.get(2).copied().unwrap_or(0) as u32);
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if ch.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Row-major RGBA8 → PNG bytes for an `<image>` data URI. A `None`
+/// return skips the series rather than failing the whole render.
+fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    let need = w.checked_mul(h)?.checked_mul(4)? as usize;
+    if w == 0 || h == 0 || rgba.len() < need {
+        return None;
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(rgba.get(..need)?).ok()?;
+    }
+    Some(out)
 }
 
 /// Compact tick label: `3`, `0.5`, `1e-06`.
@@ -1042,6 +1140,41 @@ fill=\"{col}\" fill-opacity=\"0.75\" stroke=\"{col}\" stroke-width=\"1\"/>\n",
                     }
                 }
             }
+            SeriesKind::Text => {
+                // `<text>` anchored at the data point; y offset lifts the
+                // baseline so the glyph box sits centred on the anchor.
+                if let Some((x, y)) = pt(0) {
+                    let size = s.spec.size.unwrap_or(12.0).clamp(1.0, 400.0);
+                    let label = s.labels.first().map(String::as_str).unwrap_or("");
+                    o.push_str(&format!(
+                        "<text x=\"{x:.2}\" y=\"{:.2}\" font-size=\"{size:.1}\" fill=\"{col}\">{}</text>\n",
+                        y + size * 0.35,
+                        esc(label)
+                    ));
+                }
+            }
+            SeriesKind::ImageRgb => {
+                // True-colour raster: encode the RGBA payload to PNG and
+                // embed it as a data-URI `<image>` spanning the cell edges.
+                let (rows, cols) = s.zshape;
+                if let (Some(rgba), Some(&xa), Some(&xb), Some(&ya), Some(&yb)) = (s.rgba.as_ref(), s.x.first(), s.x.last(), s.y.first(), s.y.last())
+                {
+                    if let Some(png) = encode_rgba_png(cols, rows, rgba) {
+                        let (dx, dy) = (half_step(&s.x), half_step(&s.y));
+                        let (px0, px1) = (sx(xa - dx), sx(xb + dx));
+                        let (py0, py1) = (sy(ya - dy), sy(yb + dy));
+                        let (rx, rw) = (px0.min(px1), (px1 - px0).abs());
+                        let (ry, rh) = (py0.min(py1), (py1 - py0).abs());
+                        if rx.is_finite() && ry.is_finite() && rw > 0.0 && rh > 0.0 {
+                            o.push_str(&format!(
+                                "<image x=\"{rx:.2}\" y=\"{ry:.2}\" width=\"{rw:.2}\" height=\"{rh:.2}\" \
+preserveAspectRatio=\"none\" href=\"data:image/png;base64,{}\"/>\n",
+                                b64(&png)
+                            ));
+                        }
+                    }
+                }
+            }
             SeriesKind::Contour => {
                 let (cl, ch) = caxis(fig);
                 let cspan = (ch - cl).abs().max(f64::EPSILON);
@@ -1295,7 +1428,8 @@ fn contour_segments(s: &Series, lv: f64) -> Vec<((f64, f64), (f64, f64))> {
 /// The `colorbar` strip — a vertical colormap gradient with min/max labels,
 /// drawn right of the axes when `fig.colorbar` and a mapped series exist.
 fn draw_colorbar(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64) {
-    let has_mapped = fig.series.iter().any(|s| s.zshape != (0, 0));
+    // True-colour rasters have a zshape but no mapped scalar data.
+    let has_mapped = fig.series.iter().any(|s| s.zshape != (0, 0) && s.kind != SeriesKind::ImageRgb);
     if !fig.colorbar || !has_mapped {
         return;
     }
@@ -1757,6 +1891,45 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains("demo"));
         assert!(svg.contains("<path"));
+    }
+
+    #[test]
+    fn text_series_renders() {
+        let mut f = Figure::new();
+        f.push(SeriesKind::Line, vec![0.0, 1.0], vec![0.0, 1.0], LineSpec::new());
+        let mut spec = LineSpec::new();
+        spec.size = Some(14.0);
+        f.push_text(0.5, 0.5, "hello <there>".to_string(), spec);
+        let svg = to_svg(&f);
+        assert!(svg.contains("font-size=\"14.0\""));
+        assert!(svg.contains("hello &lt;there&gt;"));
+    }
+
+    #[test]
+    fn rgba_series_renders() {
+        let mut f = Figure::new();
+        f.yrev = true;
+        // 2x2: red, green / blue, white — row-major RGBA8.
+        let px = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        f.push_rgba(vec![1.0, 2.0], vec![1.0, 2.0], 2, 2, px);
+        let svg = to_svg(&f);
+        assert!(svg.contains("<image"));
+        assert!(svg.contains("data:image/png;base64,"));
+        // The raster expands the view by a half cell on each side.
+        let (x0, x1, _, _) = view_limits(&f);
+        assert!((x0 - 0.5).abs() < 0.1 && (x1 - 2.5).abs() < 0.1);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rgba_rasterizes() {
+        // The embedded PNG data URI must survive the resvg path.
+        let mut f = Figure::new();
+        f.push_rgba(vec![1.0], vec![1.0], 1, 1, vec![255, 0, 0, 255]);
+        let png = to_png(&f, 1.0).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let pdf = to_pdf(&f).unwrap();
+        assert!(pdf.starts_with(b"%PDF-1.4"));
     }
 
     #[test]

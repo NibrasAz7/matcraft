@@ -9,8 +9,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# PNG encoder for the `<image>` data URIs `to_svg` emits — pure Rust, wasm-safe.
+png = "0.18"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-png = "0.18"
 resvg = "0.45"
 flate2 = "1.1"

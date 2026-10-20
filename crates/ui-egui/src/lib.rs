@@ -1094,9 +1094,40 @@ impl MatApp {
                     ui.weak("function handle — read-only (edit by reassigning the variable)");
                 }
                 matlang::Value::Object(o) => {
-                    ui.weak(format!("{} object — properties (read-only; edit via obj.prop = …):", o.class_name));
-                    for f in o.prop_names() {
-                        ui.monospace(format!("  .{f}"));
+                    ui.weak(format!("{} object — scalar properties edit in place (runs `{name}.prop = …`):", o.class_name));
+                    // `MObject` exposes prop names but no value getter
+                    // outside matlang — each prop's current display text
+                    // comes from the `disp` listing ("<name>: <item>" lines).
+                    let listing = matlang::fmt_value(v, false).to_string();
+                    for (i, f) in o.prop_names().iter().enumerate() {
+                        let text = listing
+                            .lines()
+                            .map(str::trim)
+                            .find_map(|l| l.strip_prefix(f.as_str()).and_then(|r| r.strip_prefix(':')).map(|r| r.trim().to_string()))
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("  .{f}"));
+                            // `[n]`/`'s'` items are scalar-ish and editable;
+                            // larger values stay read-only like the struct
+                            // path. A bad entry surfaces as the run's error.
+                            let init = text
+                                .strip_prefix('[')
+                                .and_then(|t| t.strip_suffix(']'))
+                                .map(str::to_string)
+                                .or_else(|| (text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2).then(|| text.clone()));
+                            match init {
+                                Some(init) => {
+                                    let buf = self.var_edits.entry((0, i + 1)).or_insert_with(|| init.clone());
+                                    let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(160.0).font(egui::TextStyle::Monospace));
+                                    if resp.lost_focus() && *buf != init {
+                                        run = Some(format!("{name}.{f} = {buf}"));
+                                    }
+                                }
+                                None => {
+                                    ui.monospace(format!("= {text}"));
+                                }
+                            }
+                        });
                     }
                 }
                 // Sparse was materialized to dense above — never reached.

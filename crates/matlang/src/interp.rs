@@ -6501,6 +6501,136 @@ impl Session {
                 }
                 Ok(None)
             }
+            "text" => {
+                // text(x, y, 'str' [, name, value]…) — labels anchored at
+                // data points; appends like `hold on`. Vector x/y place a
+                // copy of the label at each point; a cellstr of matching
+                // length gives each point its own label (scalar sides
+                // broadcast). `'Position'` overrides the anchor,
+                // `'Color'`/`'FontSize'` style the series.
+                let v = self.eval_args(args)?;
+                if v.len() < 3 {
+                    return Err(LangError::new("text needs (x, y, 'string')", 0));
+                }
+                let (xm, ym) = (v[0].to_matrix()?, v[1].to_matrix()?);
+                if xm.numel() != ym.numel() {
+                    return Err(LangError::new("text: x and y must have the same number of elements", 0));
+                }
+                let labels: Vec<String> = match &v[2] {
+                    Value::Str(s) => vec![s.clone()],
+                    Value::Cell(c) => c
+                        .items
+                        .iter()
+                        .map(|e| match e {
+                            Value::Str(s) => s.clone(),
+                            other => fmt_value(other, false).to_string(),
+                        })
+                        .collect(),
+                    _ => return Err(LangError::new("text: the label must be a string or a cell array of strings", 0)),
+                };
+                let n = labels.len().max(xm.numel());
+                if n == 0 || (labels.len() != 1 && labels.len() != n) || (xm.numel() != 1 && xm.numel() != n) {
+                    return Err(LangError::new("text: label count must match the position count (or be scalar)", 0));
+                }
+                let mut spec = matplot::LineSpec::new();
+                let mut pos: Option<(f64, f64)> = None;
+                let mut i = 3;
+                while i < v.len() {
+                    let Value::Str(key) = &v[i] else {
+                        return Err(LangError::new("text: property names must be strings", 0));
+                    };
+                    let val = v.get(i + 1).ok_or_else(|| LangError::new(format!("text: '{key}' needs a value"), 0))?.clone();
+                    if key.trim().eq_ignore_ascii_case("position") {
+                        let pm = val.to_matrix()?;
+                        let d = pm.data();
+                        if d.len() < 2 {
+                            return Err(LangError::new("text: 'position' needs [x y]", 0));
+                        }
+                        pos = Some((d[0], d[1]));
+                    } else {
+                        apply_plot_prop(&mut spec, key, &val)?;
+                    }
+                    i += 2;
+                }
+                let fig = self.figure_mut();
+                for k in 0..n {
+                    let (px, py) = pos.unwrap_or_else(|| {
+                        let last = xm.numel().saturating_sub(1);
+                        (xm.get_linear(k.min(last)).unwrap_or(0.0), ym.get_linear(k.min(last)).unwrap_or(0.0))
+                    });
+                    let label = labels.get(k).or_else(|| labels.first()).cloned().unwrap_or_default();
+                    fig.push_text(px, py, label, spec.clone());
+                }
+                Ok(None)
+            }
+            "imshow" => {
+                // imshow(A) | imshow(A, [lo hi] | []) | imshow('file.png')
+                // — a true-colour raster series (y axis reversed, like
+                // `imagesc`). Grey/RGB doubles follow the `imwrite`
+                // convention: data max ≤ 1 is the [0,1] range, larger is
+                // already 0–255; `[]` scales to the data min/max.
+                let v = self.eval_args(args)?;
+                let first = v.first().ok_or_else(|| LangError::new("imshow needs an image or a filename", 0))?;
+                let (rows, cols, rgba) = match first {
+                    Value::Str(s) => {
+                        let bytes = std::fs::read(s).map_err(|e| LangError::new(format!("imshow: cannot read {s}: {e}"), 0))?;
+                        let (w, h, px, ch) = crate::imgpng::decode(&bytes)?;
+                        check_elems(h.saturating_mul(w).saturating_mul(4))?;
+                        let mut rgba = Vec::with_capacity(w * h * 4);
+                        for i in 0..w.saturating_mul(h) {
+                            if ch == 1 {
+                                let g = px.get(i).copied().unwrap_or(0);
+                                rgba.extend_from_slice(&[g, g, g, 255]);
+                            } else {
+                                rgba.extend_from_slice(&[
+                                    px.get(i * 3).copied().unwrap_or(0),
+                                    px.get(i * 3 + 1).copied().unwrap_or(0),
+                                    px.get(i * 3 + 2).copied().unwrap_or(0),
+                                    255,
+                                ]);
+                            }
+                        }
+                        (h, w, rgba)
+                    }
+                    other => {
+                        let m = other.to_matrix()?;
+                        let range = match v.get(1) {
+                            None => None,
+                            Some(val) => {
+                                let rm = val.to_matrix()?;
+                                let d = rm.data();
+                                if d.is_empty() {
+                                    // `imshow(A, [])` scales to the data range.
+                                    let mm = m.data().iter().copied().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| {
+                                        if x.is_finite() {
+                                            (a.min(x), b.max(x))
+                                        } else {
+                                            (a, b)
+                                        }
+                                    });
+                                    Some(mm)
+                                } else if d.len() >= 2 {
+                                    Some((d[0], d[1]))
+                                } else {
+                                    return Err(LangError::new("imshow: display range must be [] or [lo hi]", 0));
+                                }
+                            }
+                        };
+                        rgba_from_matrix(&m, range)?
+                    }
+                };
+                if !self.figure_mut().hold {
+                    self.figure_mut().series.clear();
+                }
+                {
+                    let fig = self.figure_mut();
+                    fig.yrev = true;
+                    let xv: Vec<f64> = (1..=cols).map(|k| k as f64).collect();
+                    let yv: Vec<f64> = (1..=rows).map(|k| k as f64).collect();
+                    fig.push_rgba(xv, yv, rows, cols, rgba);
+                }
+                Ok(None)
+            }
             "pie" => {
                 // pie(x) | pie(x, labels) | pie(x, explode)
                 let v = self.eval_args(args)?;
@@ -11794,7 +11924,16 @@ fn cmatrix_delete(m: &CMatrix, specs: &IndexSpec) -> Result<CMatrix, LangError> 
 fn is_plot_prop(s: &str) -> bool {
     matches!(
         s.trim().to_ascii_lowercase().as_str(),
-        "linewidth" | "linestyle" | "color" | "marker" | "markersize" | "markerfacecolor" | "markeredgecolor" | "displayname" | "markeredgewidth"
+        "linewidth"
+            | "linestyle"
+            | "color"
+            | "marker"
+            | "markersize"
+            | "markerfacecolor"
+            | "markeredgecolor"
+            | "displayname"
+            | "markeredgewidth"
+            | "fontsize"
     )
 }
 
@@ -11839,6 +11978,9 @@ fn apply_plot_prop(spec: &mut matplot::LineSpec, key: &str, val: &Value) -> Resu
                 return Err(LangError::new("plot: 'marker' needs a string", 0));
             };
             spec.marker = if s.trim() == "none" { None } else { matplot::LineSpec::parse(s).marker };
+        }
+        "fontsize" => {
+            spec.size = Some(val.scalar()?.max(1.0));
         }
         _ => {} // accepted, no renderer field yet
     }
@@ -12290,6 +12432,54 @@ fn grid_coords(m: &Matrix, n: usize) -> Vec<f64> {
     (1..=n).map(|k| k as f64).collect()
 }
 
+/// `imshow` pixel conversion: an M×N or M×N×3 matrix → `(rows, cols,
+/// row-major RGBA8)`. `range` (`[lo hi]` or the data min/max when the
+/// caller passed `[]`) maps to [0,255]; `None` follows the `imwrite`
+/// convention — data max ≤ 1 is the [0,1] range, larger values are
+/// already 0–255.
+fn rgba_from_matrix(m: &Matrix, range: Option<(f64, f64)>) -> Result<(usize, usize, Vec<u8>), LangError> {
+    let dims = m.dims();
+    if dims.len() > 3 {
+        return Err(LangError::new("imshow needs a 2-D or MxNx3 image", 0));
+    }
+    let (h, w, ch) = (dims.first().copied().unwrap_or(0), dims.get(1).copied().unwrap_or(0), dims.get(2).copied().unwrap_or(1));
+    if ch != 1 && ch != 3 {
+        return Err(LangError::new("imshow: third dimension must be 1 or 3", 0));
+    }
+    check_elems(h.saturating_mul(w).saturating_mul(ch).saturating_mul(4))?;
+    let (lo, hi) = match range {
+        Some(l) => l,
+        None => {
+            let max = m.data().iter().copied().fold(0.0f64, f64::max);
+            if max <= 1.0 {
+                (0.0, 1.0)
+            } else {
+                (0.0, 255.0)
+            }
+        }
+    };
+    let span = hi - lo;
+    if !span.is_finite() || span == 0.0 {
+        return Err(LangError::new("imshow: empty display range", 0));
+    }
+    let to8 = |v: f64| (((v - lo) / span).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for r in 0..h {
+        for c in 0..w {
+            if ch == 1 {
+                let g = to8(m.get_nd(&[r, c]).unwrap_or(0.0));
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            } else {
+                for k in 0..3 {
+                    rgba.push(to8(m.get_nd(&[r, c, k]).unwrap_or(0.0)));
+                }
+                rgba.push(255);
+            }
+        }
+    }
+    Ok((h, w, rgba))
+}
+
 fn histcounts(m: &Matrix, nb: usize) -> (Vec<f64>, Vec<f64>) {
     let nb = nb.max(1);
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -12583,6 +12773,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "clim",
     "imagesc",
     "image",
+    "text",
     "pie",
     "contour",
     "plot3",
@@ -12737,6 +12928,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "im2double",
     "imread",
     "imwrite",
+    "imshow",
     "bitand",
     "bitor",
     "bitxor",
@@ -17172,5 +17364,44 @@ end",
         } else {
             panic!("fieldnames(o) is not a cell");
         }
+    }
+
+    #[test]
+    fn text_and_imshow() {
+        use matplot::SeriesKind;
+        let mut s = Session::new();
+        // text() appends a Text series without clearing the plot; name/value
+        // pairs style it ('Position' may override the anchor).
+        s.run("plot(0:4, [0 1 4 9 16]); text(2, 9, 'parabola', 'Color', 'r', 'FontSize', 14)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series.len(), 2);
+        assert_eq!(fig.series[1].kind, SeriesKind::Text);
+        assert_eq!(fig.series[1].labels[0], "parabola");
+        assert_eq!(fig.series[1].x, vec![2.0]);
+        assert_eq!(fig.series[1].spec.size, Some(14.0));
+        let svg = matplot::to_svg(fig);
+        assert!(svg.contains("parabola"));
+        // Vector anchors + matching cellstr → one Text series per label.
+        s.run("text([1 2], [2 4], {'lo','hi'})").unwrap();
+        assert_eq!(s.figs[0].series.len(), 4);
+        assert!(s.figs[0].series.iter().skip(2).all(|x| x.kind == SeriesKind::Text));
+        // 'Position' overrides the anchor.
+        s.run("text(0, 0, 'moved', 'Position', [3 4])").unwrap();
+        assert_eq!(s.figs[0].series[4].x, vec![3.0]);
+        // M×N×3 RGB → ImageRgb raster on a y-reversed axes.
+        s.run("clf; R = zeros(2,3,3); R(:,:,1) = 1; R(1,1,2) = 0.5; imshow(R)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series[0].kind, SeriesKind::ImageRgb);
+        assert_eq!(fig.series[0].zshape, (2, 3));
+        assert!(fig.yrev);
+        assert_eq!(fig.series[0].rgba.as_ref().map(|v| v.len()), Some(2 * 3 * 4));
+        // R=1 → 255; G channel of (1,1) = 0.5 → 128; pixel (r0,c0) starts the buffer.
+        let rgba = fig.series[0].rgba.as_ref().unwrap();
+        assert_eq!(&rgba[..4], &[255, 128, 0, 255]);
+        let svg = matplot::to_svg(fig);
+        assert!(svg.contains("data:image/png;base64,"));
+        // Gray M×N: values > 1 read as 0–255; `[]` scales to the data range.
+        s.run("clf; imshow(magic(4), [])").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::ImageRgb);
     }
 }

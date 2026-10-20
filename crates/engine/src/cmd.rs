@@ -65,7 +65,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("image io", "imread imwrite im2double fspecial"),
     ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc global persistent import argv"),
     ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir"),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image pie contour plot3 surf mesh vline saveas exportgraphics print"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image imshow text pie contour plot3 surf mesh vline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.
@@ -313,9 +313,19 @@ fn path_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
 }
 
 fn figure_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
+    // Per-figure series kinds so control-channel/MCP clients can see what
+    // each figure holds (kind names are the `SeriesKind` variant names).
+    let figs: Vec<Json> = s
+        .lang()
+        .figures()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| json!({"n": i + 1, "series": f.series.iter().map(|s| json!({"kind": format!("{:?}", s.kind)})).collect::<Vec<_>>()}))
+        .collect();
     Ok(json!({
         "count": s.lang().figures().len(),
         "current": s.lang().current_figure(),
+        "figs": figs,
     }))
 }
 
@@ -357,7 +367,7 @@ fn run_opts(p: &Json, cmd: &str) -> Result<simcraft_engine::RunOpts, EngineError
             Some(v) => v.as_f64().map(Some).ok_or_else(|| EngineError::bad_params(cmd, format!("`{key}` must be a number"))),
         }
     };
-    Ok(simcraft_engine::RunOpts { solver, dt: num("dt")?, tstop: num("tstop")? })
+    Ok(simcraft_engine::RunOpts { solver, dt: num("dt")?, tstop: num("tstop")?, rtol: None, atol: None, min_step: None, max_step: None })
 }
 
 fn sim_run(s: &mut Session, p: &Json) -> Result<Json, EngineError> {
@@ -541,7 +551,7 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "session.reset", label: "Reset the session", params: "{}", run: session_reset },
     CommandSpec { id: "path.add", label: "Add a function search dir", params: "{dir}", run: path_add },
     CommandSpec { id: "path.list", label: "List the search path", params: "{}", run: path_list },
-    CommandSpec { id: "figure.list", label: "List open figures", params: "{} → {count,current}", run: figure_list },
+    CommandSpec { id: "figure.list", label: "List open figures", params: "{} → {count,current,figs}", run: figure_list },
     CommandSpec { id: "figure.export", label: "Export a figure to SVG", params: "{path, figure?}", run: figure_export },
     CommandSpec { id: "functions.list", label: "List builtin functions", params: "{}", run: functions_list },
     CommandSpec {
