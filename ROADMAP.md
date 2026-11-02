@@ -272,9 +272,11 @@
   function-signature popup that follows the caret, highlights the current
   argument and understands local `function` definitions.
 - Class wave (2026-11): `addlistener`/`notify` handle events, object
-  arrays with growth/deletion/concatenation, and enforced
+  arrays with growth/deletion/concatenation, enforced
   `Access`/`GetAccess`/`SetAccess`, `Constant`, `Dependent`, `Abstract`
-  and `Sealed` attributes.
+  and `Sealed` attributes, `.mat` v5 object serialization (including
+  handle-store reattachment), and `subsref`/`subsasgn` dispatch for
+  `()`/`{}` indexing.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,

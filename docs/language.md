@@ -219,6 +219,11 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   `a(i) = []` deletes, `size`/`numel` report the array shape, and
   `[a b]`/`[a; b]` concatenate objects of the same class. Element methods
   and event stores live on each scalar element.
+- `subsref`/`subsasgn`: a class that defines `subsref(obj,s)` handles
+  `()` and `{}` reads; `subsasgn(obj,s,v)` handles `()` and `{}` writes.
+  The `s` struct has `type` (`'()'` or `'{}'`) and a cell `subs` of index
+  values (`':'` is passed as a char). Object arrays and property access
+  still work when the class does not define these methods.
 - Operator overloads: `+ - * .* / ./ \ ^ .^` map to
   `plus minus mtimes times mrdivide rdivide mldivide mpower power`,
   comparisons to `eq ne lt le gt ge`, `& |` to `and or`, `-x +x ~x` to
@@ -228,8 +233,9 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 - `Class.member` evaluates an `enumeration` member's backing value.
   Not in (parse harmlessly or error clearly): packages, `handle.notify`'s
   built-in lifecycle events beyond declared class events, enumeration
-  objects, COM automation, `.mat` save/load of objects (errors),
-  `subsref`/`subsasgn`, `builtin('method', obj, …)` dispatch, dynamic props.
+  objects, COM automation, `builtin('method', obj, …)` dispatch, dynamic
+  props, and `subsref`/`subsasgn` dispatch for `.` field access (only
+  `()`/`{}` are dispatched).
 
 ## Builtin library
 
@@ -339,12 +345,12 @@ Notes:
   `end`-terminated body is hoisted with a fresh scope (true M-code nested
   functions would share the parent workspace — they do not here), and a
   `function` following an unterminated body is a file-local sibling. `.mat` v5 binary `save`/`load`
-  covers double, complex (FLAG_COMPLEX pr/pi), char and sparse (mxSPARSE
-  `ir`/`jc`/`pr`) arrays — saving a cell or struct errors
-  (mxCELL/mxSTRUCT writing is deferred). `load` validates the v5
-  header (a non-MAT `.mat` errors; so does a file with no numeric data),
-  `S = load('f')` returns the file's vars as a struct, and `save` errors
-  on undefined variables.
+  covers double, complex (FLAG_COMPLEX pr/pi), char, sparse (mxSPARSE
+  `ir`/`jc`/`pr`), cell (mxCELL), struct (mxSTRUCT), object and object-array
+  (mxOBJECT with class name + property fields) values; loaded handle-class
+  objects reattach their shared store and listener table. `load` validates
+  the v5 header (a non-MAT `.mat` errors), `S = load('f')` returns the
+  file's vars as a struct, and `save` errors on undefined variables.
 - All allocations driven by input are capped (`zeros(1e9)` errors with
   `allocation exceeds limit` rather than aborting) — matrices ~1e8
   elements, cells ~1e7, figures 1000.

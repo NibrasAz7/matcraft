@@ -9,7 +9,7 @@
 
 use matcore::{CMatrix, CNum, Matrix};
 
-use crate::interp::{CellArray, StructArray};
+use crate::interp::{CellArray, MObject, StructArray};
 use crate::Value;
 
 // mi* data types (subset we read/write).
@@ -26,6 +26,7 @@ const MI_UTF16: u32 = 17;
 // mx* array classes.
 const MX_CELL: u32 = 1;
 const MX_STRUCT: u32 = 2;
+const MX_OBJECT: u32 = 3;
 const MX_CHAR: u32 = 4;
 const MX_SPARSE: u32 = 5;
 const MX_DOUBLE: u32 = 6;
@@ -139,8 +140,8 @@ fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
         Value::Sparse(s) => Ok(sparse_element(name, s)),
         Value::Cell(c) => cell_element(name, c),
         Value::Struct(s) => struct_element(name, s),
-        Value::Object(_) => Err(format!("cannot save '{name}' — objects are not supported in .mat v5")),
-        Value::Func(_) => Err(format!("cannot save '{name}' — function handles are not supported in .mat v5")),
+        Value::Object(o) => object_element(name, o),
+        Value::Func(_) => Err(format!("cannot save '{name}' - function handles are not supported in .mat v5")),
     }
 }
 
@@ -197,6 +198,48 @@ fn struct_element(name: &str, s: &crate::interp::StructArray) -> Result<Vec<u8>,
     for i in 0..s.numel() {
         for f in &fields {
             let v = s.field_at(i, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let inner = value_element("", &v)?;
+            push_tag(&mut m, MI_MATRIX, &inner);
+        }
+    }
+    Ok(m)
+}
+
+/// mxOBJECT element: struct layout with the class name inserted between
+/// the array name and the field-name length. Object arrays store each
+/// element's property set as one struct record.
+fn object_element(name: &str, o: &MObject) -> Result<Vec<u8>, String> {
+    let dims = o.array_dims();
+    let (rows, cols) = (dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1));
+    let elements = o.array_elements();
+    let fields = elements.first().map(|e| e.props_map().field_names()).unwrap_or_default();
+    if elements.iter().any(|e| e.props_map().field_names() != fields) {
+        return Err("cannot save object array — elements have different properties".into());
+    }
+    let mut m = Vec::new();
+    let mut af = Vec::with_capacity(8);
+    af.extend_from_slice(&MX_OBJECT.to_le_bytes());
+    af.extend_from_slice(&0u32.to_le_bytes());
+    push_tag(&mut m, MI_UINT32, &af);
+    let mut dv = Vec::with_capacity(8);
+    dv.extend_from_slice(&(rows as u32).to_le_bytes());
+    dv.extend_from_slice(&(cols as u32).to_le_bytes());
+    push_tag(&mut m, MI_INT32, &dv);
+    push_tag(&mut m, MI_INT8, name.as_bytes());
+    push_tag(&mut m, MI_INT8, o.class_name.as_bytes());
+    let fnlen = fields.iter().map(|f| f.len() + 1).max().unwrap_or(0).max(1) as u32;
+    push_tag(&mut m, MI_INT32, &fnlen.to_le_bytes());
+    let mut fnb = Vec::with_capacity(fnlen as usize * fields.len());
+    for f in &fields {
+        let mut b = f.clone().into_bytes();
+        b.resize(fnlen as usize, 0);
+        fnb.extend_from_slice(&b);
+    }
+    push_tag(&mut m, MI_INT8, &fnb);
+    for el in &elements {
+        let props = el.props_map();
+        for f in &fields {
+            let v = props.field_at(0, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
             let inner = value_element("", &v)?;
             push_tag(&mut m, MI_MATRIX, &inner);
         }
@@ -270,6 +313,56 @@ impl<'a> Rd<'a> {
         let _ = self.bytes(pad);
         Some((tag, p))
     }
+}
+
+/// Read the struct/object field-name table and field values that follow
+/// the array name. `t`/`p` are the already-read Field Name Length element.
+fn read_struct_payload(r: &mut Rd<'_>, rows: usize, cols: usize, t: u32, p: &[u8]) -> Result<StructArray, String> {
+    if t != MI_INT32 || p.len() < 4 {
+        return Err("bad struct field-name length".into());
+    }
+    let fnlen = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+    if fnlen == 0 || fnlen > 65536 {
+        return Err("bad struct field-name length".into());
+    }
+    let (ft, fp) = r.element().ok_or("truncated struct field names")?;
+    if !matches!(ft, MI_INT8 | MI_UINT8 | MI_UTF8) {
+        return Err("bad struct field names".into());
+    }
+    let nfields = fp.len() / fnlen;
+    let mut names = Vec::with_capacity(nfields);
+    for i in 0..nfields {
+        let chunk = fp.get(i * fnlen..(i + 1) * fnlen).unwrap_or(&[]);
+        let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+        names.push(String::from_utf8_lossy(&chunk[..end]).into_owned());
+    }
+    let n = rows.saturating_mul(cols);
+    if n.saturating_mul(nfields) > MAX_NESTED {
+        return Err("struct array too large".into());
+    }
+    let mut vals: Vec<Vec<Value>> = (0..nfields).map(|_| Vec::with_capacity(n)).collect();
+    for _el in 0..n {
+        for f in 0..nfields {
+            let (et, ep) = r.element().ok_or("truncated struct field data")?;
+            if et != MI_MATRIX {
+                return Err("struct field element is not an miMATRIX".into());
+            }
+            let (_, v) = read_matrix(ep)?;
+            if let Some(slot) = vals.get_mut(f) {
+                slot.push(v);
+            }
+        }
+    }
+    let mut sa = StructArray::with_dims(rows, cols);
+    for (f, fname) in names.iter().enumerate() {
+        sa.add_field(fname);
+        if let Some(field_vals) = vals.get_mut(f) {
+            for (i, v) in field_vals.drain(..).enumerate() {
+                sa.set_field(i, fname, v).map_err(|e| e.message)?;
+            }
+        }
+    }
+    Ok(sa)
 }
 
 fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
@@ -420,54 +513,36 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
             Ok((name, Value::Cell(CellArray::from_col_major(rows, cols, items))))
         }
         MX_STRUCT => {
-            // (t, p) read above is the Field Name Length element (miINT32).
-            if t != MI_INT32 || p.len() < 4 {
-                return Err("bad struct field-name length".into());
-            }
-            let fnlen = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
-            if fnlen == 0 || fnlen > 65536 {
-                return Err("bad struct field-name length".into());
-            }
-            let (ft, fp) = r.element().ok_or("truncated struct field names")?;
-            if !matches!(ft, MI_INT8 | MI_UINT8 | MI_UTF8) {
-                return Err("bad struct field names".into());
-            }
-            let nfields = fp.len() / fnlen;
-            let mut names = Vec::with_capacity(nfields);
-            for i in 0..nfields {
-                let chunk = fp.get(i * fnlen..(i + 1) * fnlen).unwrap_or(&[]);
-                let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
-                names.push(String::from_utf8_lossy(&chunk[..end]).into_owned());
-            }
-            let n = rows.saturating_mul(cols);
-            if n.saturating_mul(nfields) > MAX_NESTED {
-                return Err("struct array too large".into());
-            }
-            // Field values: per element (column order), one miMATRIX per
-            // field, in field-name order.
-            let mut vals: Vec<Vec<Value>> = (0..nfields).map(|_| Vec::with_capacity(n)).collect();
-            for _el in 0..n {
-                for f in 0..nfields {
-                    let (et, ep) = r.element().ok_or("truncated struct field data")?;
-                    if et != MI_MATRIX {
-                        return Err("struct field element is not an miMATRIX".into());
-                    }
-                    let (_, v) = read_matrix(ep)?;
-                    if let Some(slot) = vals.get_mut(f) {
-                        slot.push(v);
-                    }
-                }
-            }
-            let mut sa = StructArray::with_dims(rows, cols);
-            for (f, fname) in names.iter().enumerate() {
-                sa.add_field(fname);
-                if let Some(field_vals) = vals.get_mut(f) {
-                    for (i, v) in field_vals.drain(..).enumerate() {
-                        sa.set_field(i, fname, v).map_err(|e| e.message)?;
-                    }
-                }
-            }
+            let sa = read_struct_payload(&mut r, rows, cols, t, p)?;
             Ok((name, Value::Struct(sa)))
+        }
+        MX_OBJECT => {
+            if !matches!(t, MI_INT8 | MI_UINT8 | MI_UTF8) {
+                return Err("bad object class name".into());
+            }
+            let end = p.iter().position(|&b| b == 0).unwrap_or(p.len());
+            let class_name = String::from_utf8_lossy(&p[..end]).into_owned();
+            if class_name.is_empty() {
+                return Err("empty object class name".into());
+            }
+            let (ft, fp) = r.element().ok_or("truncated object field-name length")?;
+            let sa = read_struct_payload(&mut r, rows, cols, ft, fp)?;
+            let n = rows.saturating_mul(cols);
+            if n == 1 {
+                return Ok((name, Value::Object(MObject::from_saved(class_name, sa))));
+            }
+            let fields = sa.field_names();
+            let mut elements = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut props = StructArray::new();
+                for f in &fields {
+                    props.add_field(f);
+                    let v = sa.field_at(i, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                    props.set_field(0, f, v).map_err(|e| e.message)?;
+                }
+                elements.push(MObject::from_saved(class_name.clone(), props));
+            }
+            Ok((name, Value::Object(MObject::array(class_name, elements, (rows, cols)))))
         }
         _ => Err(format!("unsupported array class {class}")),
     }
@@ -601,5 +676,25 @@ mod tests {
             }
             v => panic!("expected Sparse, got {v:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_object_and_object_array() {
+        let mut a = StructArray::new();
+        a.add_field("x");
+        a.set_field(0, "x", Value::Num(3.0)).unwrap();
+        let scalar = MObject::from_saved("Pt".into(), a);
+        let mut b = StructArray::new();
+        b.add_field("x");
+        b.set_field(0, "x", Value::Num(4.0)).unwrap();
+        let second = MObject::from_saved("Pt".into(), b);
+        let arr = MObject::array("Pt".into(), vec![scalar, second], (1, 2));
+        let got = roundtrip(vec![("p".to_string(), Value::Object(arr))]);
+        let Value::Object(o) = &got[0].1 else { panic!("loaded value is not an object") };
+        assert_eq!(o.class_name, "Pt");
+        assert_eq!(o.array_dims(), vec![1, 2]);
+        let elems = o.array_elements();
+        assert_eq!(elems[0].props_map().field_at(0, "x"), Some(&Value::Num(3.0)));
+        assert_eq!(elems[1].props_map().field_at(0, "x"), Some(&Value::Num(4.0)));
     }
 }

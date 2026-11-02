@@ -326,7 +326,7 @@ impl MObject {
         }
     }
 
-    fn array(class_name: String, elements: Vec<MObject>, dims: (usize, usize)) -> Self {
+    pub(crate) fn array(class_name: String, elements: Vec<MObject>, dims: (usize, usize)) -> Self {
         MObject {
             class_name,
             props: ObjStore::Owned(StructArray::new()),
@@ -335,16 +335,41 @@ impl MObject {
         }
     }
 
-    fn is_array(&self) -> bool {
+    /// Rebuild a scalar object loaded from a MAT-file.
+    pub(crate) fn from_saved(class_name: String, props: StructArray) -> Self {
+        MObject::new(class_name, props, false)
+    }
+
+    pub(crate) fn is_array(&self) -> bool {
         self.array.is_some()
     }
 
-    fn array_dims(&self) -> Vec<usize> {
+    pub(crate) fn array_dims(&self) -> Vec<usize> {
         self.array.as_ref().map(|a| a.dims.clone()).unwrap_or_else(|| vec![1, 1])
     }
 
-    fn array_elements(&self) -> Vec<MObject> {
+    pub(crate) fn array_elements(&self) -> Vec<MObject> {
         self.array.as_ref().map(|a| a.elements.clone()).unwrap_or_else(|| vec![self.clone()])
+    }
+
+    /// Restore handle semantics after loading: object files store only
+    /// properties + class name, so the session reattaches the shared store
+    /// and listener table when the class is a handle class.
+    pub(crate) fn into_handle(self) -> Self {
+        if let Some(arr) = self.array {
+            let elements = arr.elements.into_iter().map(|e| e.into_handle()).collect();
+            return MObject {
+                class_name: self.class_name,
+                props: ObjStore::Owned(StructArray::new()),
+                listeners: None,
+                array: Some(Box::new(ObjectArray { elements, dims: arr.dims })),
+            };
+        }
+        if self.listeners.is_some() {
+            return self;
+        }
+        let props = self.props_map();
+        MObject::new(self.class_name, props, true)
     }
 
     /// Value-class constructor helper (`class(s,'name')` objects own
@@ -396,7 +421,7 @@ impl MObject {
     }
 
     /// Snapshot of the property struct (display, `fieldnames`, `get`).
-    fn props_map(&self) -> StructArray {
+    pub(crate) fn props_map(&self) -> StructArray {
         if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
             return first.props_map();
         }
@@ -2345,14 +2370,29 @@ impl Session {
                 }
                 Ok(Some(Value::Cell(ca)))
             }
-            Expr::BraceIndex(name, args) => {
-                let ca = match self.var_get(name) {
-                    Some(Value::Cell(c)) => c.clone(),
-                    Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
-                    None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
-                };
-                self.cell_content(&ca, args)
-            }
+            Expr::BraceIndex(name, args) => match self.var_get(name).cloned() {
+                Some(Value::Cell(c)) => {
+                    let picked = self.cell_pick(&c, args)?;
+                    match picked.len() {
+                        1 => Ok(picked.into_iter().next()),
+                        n => Err(LangError::new(
+                            format!("expected one output from a curly brace or dot indexing expression, but there were {n} results"),
+                            0,
+                        )),
+                    }
+                }
+                Some(Value::Object(o)) => {
+                    if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                        let s = self.subs_struct("{}", args)?;
+                        let out = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)?;
+                        Ok(out.into_iter().next())
+                    } else {
+                        Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
+                    }
+                }
+                Some(_) => Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
+                None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
+            },
             Expr::Field(base, field) => {
                 let v = self.eval(base)?;
                 match v {
@@ -2624,7 +2664,17 @@ impl Session {
 
     fn indexed_assign(&mut self, name: &str, index: &[Expr], v: Value, braces: bool) -> Result<(), LangError> {
         if braces {
-            // `c{i} = v` — content assignment; creates/grows the cell.
+            // `c{i} = v` - content assignment; creates/grows the cell.
+            if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
+                if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                    let s = self.subs_struct("{}", index)?;
+                    let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
+                    let new = out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0))?;
+                    self.vars.insert(name.to_string(), new);
+                    return Ok(());
+                }
+                return Err(LangError::new(format!("brace assignment on '{name}' needs a 'subsasgn' method"), 0));
+            }
             let ca = match self.vars.remove(name) {
                 Some(Value::Cell(c)) => c,
                 Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (clear it to reassign as a cell)"), 0)),
@@ -2826,18 +2876,32 @@ impl Session {
     /// literals, multi-target assignment, and index positions.
     fn eval_multi(&mut self, e: &Expr) -> Result<Vec<Value>, LangError> {
         match e {
-            Expr::BraceIndex(name, args) => {
-                let ca = match self.var_get(name) {
-                    Some(Value::Cell(c)) => c.clone(),
-                    Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
-                    None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
-                };
-                self.cell_pick(&ca, args)
-            }
+            Expr::BraceIndex(name, args) => match self.var_get(name).cloned() {
+                Some(Value::Cell(c)) => self.cell_pick(&c, args),
+                Some(Value::Object(o)) => {
+                    if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                        let s = self.subs_struct("{}", args)?;
+                        self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)
+                    } else {
+                        Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
+                    }
+                }
+                Some(_) => Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
+                None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
+            },
             Expr::BraceIdx(base, args) => {
                 // The base of the chain must yield exactly one value.
                 match self.eval(base)? {
                     Value::Cell(ca) => self.cell_pick(&ca, args),
+                    Value::Object(o) => {
+                        if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                            let s = self.subs_struct("{}", args)?;
+                            let out = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)?;
+                            Ok(out)
+                        } else {
+                            Err(LangError::new("brace indexing on an object needs a 'subsref' method", 0))
+                        }
+                    }
                     _ => Err(LangError::new("brace indexing needs a cell array", 0)),
                 }
             }
@@ -2959,6 +3023,14 @@ impl Session {
             }
             PathStep::Brace(ix) => {
                 let ca = match cur {
+                    Value::Object(o) => {
+                        if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                            let s = self.subs_struct("{}", ix)?;
+                            let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
+                            return out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                        }
+                        return Err(LangError::new("brace assignment on an object needs a 'subsasgn' method", 0));
+                    }
                     Value::Cell(c) => c,
                     Value::Mat(m) if m.numel() == 0 => CellArray::new(0, 0),
                     _ => return Err(LangError::new("brace indexing needs a cell array", 0)),
@@ -2992,6 +3064,11 @@ impl Session {
                 return Ok(target);
             }
             let o = o.clone();
+            if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                let s = self.subs_struct("()", index)?;
+                let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
+                return out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+            }
             return self.object_paren_assign(o, index, v);
         }
         if let Value::Struct(sa) = target {
@@ -3279,7 +3356,29 @@ impl Session {
         table_subset(o, &rows, &cols)
     }
 
+    /// Build the `subs` struct MATLAB passes to `subsref`/`subsasgn`.
+    fn subs_struct(&mut self, kind: &str, args: &[Expr]) -> Result<Value, LangError> {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            let v = match a {
+                Expr::Colon => Value::Str(":".into()),
+                Expr::End => return Err(LangError::new("'end' is not supported in a custom subsref index", 0)),
+                _ => self.eval(a)?,
+            };
+            vals.push(v);
+        }
+        let mut s = StructArray::new();
+        s.set_field(0, "type", Value::Str(kind.into()))?;
+        s.set_field(0, "subs", Value::Cell(CellArray::row(vals)))?;
+        Ok(Value::Struct(s))
+    }
+
     fn object_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+            let s = self.subs_struct("()", args)?;
+            let out = self.call_def("subsref", &def, vec![Value::Object(o.clone()), s], 1, None)?;
+            return out.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0));
+        }
         let dims = o.array_dims();
         let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
         let specs = self.index_specs(args, &dims, numel)?;
@@ -9001,6 +9100,19 @@ impl Session {
         Ok(self.funcs.contains_key(name) || self.classes.contains_key(name))
     }
 
+    /// Reattach handle semantics to objects loaded from a MAT-file when
+    /// their class is known and inherits `handle`.
+    fn restore_loaded_value(&mut self, v: Value) -> Result<Value, LangError> {
+        if let Value::Object(o) = &v {
+            let chain = self.class_chain(&o.class_name)?;
+            let handle = chain.iter().any(|d| d.supers.iter().any(|s| s == "handle"));
+            if handle {
+                return Ok(Value::Object(o.clone().into_handle()));
+            }
+        }
+        Ok(v)
+    }
+
     /// The class plus its resolvable superclasses, ancestors first.
     /// Unknown superclasses (`handle`, builtin types, missing files) end
     /// the walk.
@@ -14093,6 +14205,7 @@ impl Session {
                 if !name_filter.is_empty() && !name_filter.iter().any(|f| f == &n) {
                     continue;
                 }
+                let val = self.restore_loaded_value(val)?;
                 self.vars.insert(n.clone(), val.clone());
                 loaded.push((n, val));
             }
@@ -20587,6 +20700,99 @@ end",
         assert_eq!(s.get("yc"), Some(&Value::Num(2.0)));
         s.run("a(2) = []; n2 = numel(a);").unwrap();
         assert_eq!(s.get("n2"), Some(&Value::Num(2.0)));
+    }
+
+    #[test]
+    fn classdef_object_mat_roundtrip() {
+        let dir = m_dir("matobj");
+        let file = dir.join("objects.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedPt
+    properties
+        x = 0
+    end
+    methods
+        function obj = SavedPt(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("p = SavedPt(3); q = SavedPt(4); a = [p q]; save('{path}', 'p', 'a'); clear p a; load('{path}');")).unwrap();
+        s.run("px = p.x; ax = a(2).x; asz = size(a);").unwrap();
+        assert_eq!(s.get("px"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("ax"), Some(&Value::Num(4.0)));
+        assert_eq!(s.get("asz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_handle_mat_roundtrip() {
+        let dir = m_dir("mathandle");
+        let file = dir.join("handle.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedH < handle
+    properties
+        x = 0
+    end
+    methods
+        function obj = SavedH(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("h = SavedH(1); save('{path}', 'h'); clear h; load('{path}'); h2 = h; h2.x = 7; hx = h.x;")).unwrap();
+        assert_eq!(s.get("hx"), Some(&Value::Num(7.0)));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_subsref_subsasgn() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Proxy
+    properties
+        data
+    end
+    methods
+        function obj = Proxy(d)
+            obj.data = d;
+        end
+        function r = subsref(obj, s)
+            if strcmp(s.type, '()')
+                r = obj.data(s.subs{1});
+            elseif strcmp(s.type, '{}')
+                r = obj.data{s.subs{1}};
+            end
+        end
+        function obj = subsasgn(obj, s, v)
+            if strcmp(s.type, '()')
+                obj.data(s.subs{1}) = v;
+            elseif strcmp(s.type, '{}')
+                obj.data{s.subs{1}} = v;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("p = Proxy(1:5); x = p(2); p(3) = 9; y = p.data(3);").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(9.0)));
+        s.run("q = Proxy({10, 20}); a = q{2}; q{1} = 11; b = q.data{1};").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(20.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(11.0)));
     }
 
     #[test]
