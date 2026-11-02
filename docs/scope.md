@@ -21,7 +21,7 @@ These are tracked as post-1.0 depth work, not as incomplete blocks.
 
 | Area | Status | Reason |
 | --- | --- | --- |
-| MCOS/opaque `.mat` v5 subsystem | Detected and rejected with a clear variable/class error | The subsystem layout is undocumented; no user-owned fixture is available, and guessing would silently lose object fields. MatCraft-written objects use `mxOBJECT` with fields. |
+| MCOS object arrays / nested objects | Scalar objects read/write supported | Object-array reference sets and nested object property graphs need additional subsystem bookkeeping; unsupported forms report a clear error. |
 | Advanced control | complex `zpk`, `pidtune`, MIMO `nyquist`/`margin` | Requires multi-input/output frequency-response design and tuning algorithms beyond the shipped SISO/MIMO-response surface. |
 | ODE variants | `dde23` | Delay differential equations need history functions and a different stepping model. |
 | Statistics depth | Weibull/lognormal/kernel `fitdist`, `tLocationScale`, `chi2gof`, `tsne` | Additional MLE families and embedding algorithms; existing distributions, ANOVA and UMAP are shipped. |

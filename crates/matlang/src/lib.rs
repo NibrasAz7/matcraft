@@ -13,6 +13,7 @@ mod imgpng;
 pub mod interp;
 pub mod lexer;
 pub mod matfile;
+mod mcos;
 mod netcdf;
 pub mod parser;
 mod xlsx;

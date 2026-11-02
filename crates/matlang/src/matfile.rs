@@ -13,26 +13,28 @@ use crate::interp::{CellArray, MObject, StructArray};
 use crate::Value;
 
 // mi* data types (subset we read/write).
-const MI_INT8: u32 = 1;
-const MI_UINT8: u32 = 2;
-const MI_INT32: u32 = 5;
-const MI_UINT32: u32 = 6;
-const MI_DOUBLE: u32 = 9;
-const MI_MATRIX: u32 = 14;
-const MI_COMPRESSED: u32 = 15;
-const MI_UTF8: u32 = 16;
+pub(crate) const MI_INT8: u32 = 1;
+pub(crate) const MI_UINT8: u32 = 2;
+pub(crate) const MI_INT32: u32 = 5;
+pub(crate) const MI_UINT32: u32 = 6;
+pub(crate) const MI_DOUBLE: u32 = 9;
+pub(crate) const MI_MATRIX: u32 = 14;
+pub(crate) const MI_COMPRESSED: u32 = 15;
+pub(crate) const MI_UTF8: u32 = 16;
 const MI_UTF16: u32 = 17;
 
 // mx* array classes.
-const MX_CELL: u32 = 1;
-const MX_STRUCT: u32 = 2;
-const MX_OBJECT: u32 = 3;
-const MX_CHAR: u32 = 4;
-const MX_SPARSE: u32 = 5;
-const MX_DOUBLE: u32 = 6;
-const MX_UINT8: u32 = 9;
+pub(crate) const MX_CELL: u32 = 1;
+pub(crate) const MX_STRUCT: u32 = 2;
+pub(crate) const MX_OBJECT: u32 = 3;
+pub(crate) const MX_CHAR: u32 = 4;
+pub(crate) const MX_SPARSE: u32 = 5;
+pub(crate) const MX_DOUBLE: u32 = 6;
+pub(crate) const MX_UINT8: u32 = 9;
+pub(crate) const MX_INT32: u32 = 12;
+pub(crate) const MX_UINT32: u32 = 13;
 /// MATLAB Class Object System / opaque object reference.
-const MX_OPAQUE: u32 = 17;
+pub(crate) const MX_OPAQUE: u32 = 17;
 
 /// Cap on sub-elements read from a foreign cell/struct — corrupt dims
 /// must not drive unbounded allocation.
@@ -40,7 +42,7 @@ const MAX_NESTED: usize = 10_000_000;
 
 const FLAG_COMPLEX: u32 = 0x0800;
 
-fn push_tag(out: &mut Vec<u8>, ty: u32, payload: &[u8]) {
+pub(crate) fn push_tag(out: &mut Vec<u8>, ty: u32, payload: &[u8]) {
     if payload.len() <= 4 {
         // Small data element: type+size packed in one u32, data in the next.
         out.extend_from_slice(&(ty as u16).to_le_bytes());
@@ -58,7 +60,7 @@ fn push_tag(out: &mut Vec<u8>, ty: u32, payload: &[u8]) {
 }
 
 /// Serialize one variable as a `miMATRIX` byte blob (pre-compression).
-fn matrix_element(name: &str, class: u32, flags: u32, dims: &[u32], data_ty: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn matrix_element(name: &str, class: u32, flags: u32, dims: &[u32], data_ty: u32, data: &[u8]) -> Vec<u8> {
     matrix_element_nz(name, class, flags, 0, dims, data_ty, data)
 }
 
@@ -113,7 +115,7 @@ fn sparse_element(name: &str, s: &matcore::SparseMat) -> Vec<u8> {
 /// Serialize one value as a `miMATRIX` payload (the pre-compression body).
 /// Shared by top-level variables and nested cell/struct elements — nested
 /// elements carry an empty name, per the MAT v5 spec.
-fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
+pub(crate) fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
     match val {
         Value::Num(x) => Ok(matrix_element(name, MX_DOUBLE, 0, &[1, 1], MI_DOUBLE, &x.to_le_bytes())),
         Value::Mat(m) => {
@@ -252,6 +254,19 @@ fn object_element(name: &str, o: &MObject) -> Result<Vec<u8>, String> {
 
 /// Write all `vars` to `path` in MAT v5 binary form.
 pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
+    write_impl(path, vars, false)
+}
+
+/// Write MAT v5 with objects encoded as MCOS opaque records and a subsystem
+/// block. Non-object variables use the normal compressed representation.
+pub fn write_mcos(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
+    write_impl(path, vars, true)
+}
+
+fn write_impl(path: &str, vars: &[(String, Value)], mcos: bool) -> Result<usize, String> {
+    let encoded = if mcos { crate::mcos::encode(vars)? } else { None };
+    let records: std::collections::HashMap<&str, &[u8]> =
+        encoded.as_ref().map(|e| e.records.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect()).unwrap_or_default();
     let mut out = Vec::new();
     let mut desc = format!("MATLAB 5.0 MAT-file, Platform: GLNXA64, Created by MatCraft {}", env!("CARGO_PKG_VERSION"));
     desc.truncate(116);
@@ -262,6 +277,10 @@ pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
     out.extend_from_slice(b"MI"); // endian indicator: MI = little-endian
 
     for (name, val) in vars {
+        if let Some(rec) = records.get(name.as_str()) {
+            out.extend_from_slice(rec);
+            continue;
+        }
         let inner = value_element(name, val)?;
         // For miMATRIX the byte count includes its own 8-byte padding.
         let mut inner = inner;
@@ -276,6 +295,14 @@ pub fn write(path: &str, vars: &[(String, Value)]) -> Result<usize, String> {
             enc.try_finish().map_err(|e| format!("zlib: {e}"))?;
         }
         push_tag(&mut out, MI_COMPRESSED, &comp);
+    }
+    if let Some(enc) = encoded {
+        let offset = out.len();
+        out.extend_from_slice(&enc.subsystem);
+        let bytes = (offset as u64).to_le_bytes();
+        if let Some(dst) = out.get_mut(116..124) {
+            dst.copy_from_slice(&bytes);
+        }
     }
     crate::write_file(std::path::Path::new(path), &out).map_err(|e| format!("cannot write {path}: {e}"))?;
     Ok(vars.len())
@@ -570,16 +597,50 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
     }
 }
 
+fn read_variable(payload: &[u8], ctx: Option<&crate::mcos::Ctx>, parse_error: Option<&str>) -> Result<(String, Value), String> {
+    let mut r = Rd { buf: payload, pos: 0 };
+    let class = r
+        .element()
+        .and_then(|(t, p)| if t == MI_UINT32 && p.len() >= 4 { Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]) & 0xFF) } else { None })
+        .ok_or("bad array flags")?;
+    if class == MX_OPAQUE {
+        let ctx = ctx.ok_or_else(|| match parse_error {
+            Some(e) => format!("opaque MCOS object but the subsystem could not be parsed: {e}"),
+            None => "opaque MCOS object but the file has no subsystem".to_string(),
+        })?;
+        return ctx.read_variable(payload);
+    }
+    read_matrix(payload)
+}
+
 /// Read a MAT v5 file; returns every variable found.
 pub fn read(bytes: &[u8]) -> Result<Vec<(String, Value)>, String> {
     if bytes.len() < 128 || !bytes.starts_with(b"MATLAB 5.0 MAT-file") {
         return Err("not a MAT-file v5".into());
     }
-    let mut r = Rd { buf: &bytes[128..], pos: 0 };
+    let mut subsystem_offset = 0usize;
+    if let Some(raw) = bytes.get(116..124) {
+        let mut b = [0u8; 8];
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = *raw.get(i).unwrap_or(&0);
+        }
+        let off = u64::from_le_bytes(b) as usize;
+        if off > 128 && off < bytes.len() {
+            subsystem_offset = off;
+        }
+    }
+    let ctx = if subsystem_offset != 0 { crate::mcos::Ctx::parse(bytes, subsystem_offset).ok() } else { None };
+    let parse_error = if subsystem_offset != 0 && ctx.is_none() { crate::mcos::Ctx::parse(bytes, subsystem_offset).err() } else { None };
+    let mut r = Rd { buf: bytes, pos: 128 };
     let mut vars = Vec::new();
-    while let Some((t, p)) = r.element() {
+    while r.pos < bytes.len() {
+        let start = r.pos;
+        let Some((t, p)) = r.element() else { break };
+        if start == subsystem_offset {
+            continue;
+        }
         if t == MI_MATRIX {
-            vars.push(read_matrix(p)?);
+            vars.push(read_variable(p, ctx.as_ref(), parse_error.as_deref())?);
         } else if t == MI_COMPRESSED {
             let mut dec = Vec::new();
             {
@@ -590,7 +651,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<(String, Value)>, String> {
             let mut ir = Rd { buf: &dec, pos: 0 };
             while let Some((it, ip)) = ir.element() {
                 if it == MI_MATRIX {
-                    vars.push(read_matrix(ip)?);
+                    vars.push(read_variable(ip, ctx.as_ref(), parse_error.as_deref())?);
                 }
             }
         }
@@ -654,15 +715,13 @@ mod tests {
     }
 
     #[test]
-    fn opaque_mcos_object_reports_clear_error() {
+    fn opaque_object_without_subsystem_reports_clear_error() {
         let err = read(&opaque_file("MCOS", "MyClass")).unwrap_err();
-        assert!(err.contains("mcOS object 'obj'"), "error = {err}");
-        assert!(err.contains("class 'MyClass'"), "error = {err}");
-        assert!(err.contains("subsystem"), "error = {err}");
+        assert!(err.contains("opaque MCOS object"), "error = {err}");
+        assert!(err.contains("no subsystem"), "error = {err}");
 
         let err = read(&opaque_file("OTHER", "Thing")).unwrap_err();
-        assert!(err.contains("opaque object 'obj'"), "error = {err}");
-        assert!(err.contains("class 'Thing'"), "error = {err}");
+        assert!(err.contains("opaque MCOS object"), "error = {err}");
     }
 
     #[test]
@@ -716,6 +775,39 @@ mod tests {
             }
             v => panic!("expected Mat, got {v:?}"),
         }
+    }
+
+    #[test]
+    fn reads_mcos_fixture() {
+        let vars = read(include_bytes!("../tests/fixtures/mat_v5_mcos.mat")).unwrap();
+        let (_, value) = vars.iter().find(|(n, _)| n == "obj").unwrap();
+        let Value::Object(o) = value else { panic!("obj is not an object") };
+        assert_eq!(o.class_name, "MyClass");
+        let props = o.props_map();
+        assert_eq!(props.field_at(0, "x"), Some(&Value::Num(42.0)));
+        assert_eq!(props.field_at(0, "label"), Some(&Value::Str("hi".into())));
+    }
+
+    #[test]
+    fn roundtrip_mcos_object() {
+        let mut props = StructArray::new();
+        props.add_field("x");
+        props.set_field(0, "x", Value::Num(7.0)).unwrap();
+        props.add_field("label");
+        props.set_field(0, "label", Value::Str("ok".into())).unwrap();
+        let obj = MObject::from_saved("RoundTrip".into(), props);
+        let tmp = std::env::temp_dir().join(format!("matcraft_mcos_test_{}.mat", std::process::id()));
+        let p = tmp.to_string_lossy().to_string();
+        write_mcos(&p, &[("obj".to_string(), Value::Object(obj))]).unwrap();
+        let bytes = std::fs::read(&tmp).unwrap();
+        let vars = read(&bytes).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let (_, value) = vars.iter().find(|(n, _)| n == "obj").unwrap();
+        let Value::Object(o) = value else { panic!("round-tripped value is not an object") };
+        assert_eq!(o.class_name, "RoundTrip");
+        let props = o.props_map();
+        assert_eq!(props.field_at(0, "x"), Some(&Value::Num(7.0)));
+        assert_eq!(props.field_at(0, "label"), Some(&Value::Str("ok".into())));
     }
 
     #[test]

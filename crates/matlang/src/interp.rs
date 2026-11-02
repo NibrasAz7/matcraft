@@ -14832,6 +14832,7 @@ impl Session {
         };
         if name == "save" {
             let ascii = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("-ascii") || s.eq_ignore_ascii_case("-ascii-")));
+            let mcos = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("-mcos")));
             let is_mat = path.to_ascii_lowercase().ends_with(".mat") && !ascii;
             let mut out = String::from("# matcraft 1\n");
             let named: Vec<String> = v
@@ -14851,8 +14852,13 @@ impl Session {
             }
             if is_mat {
                 let vars: Vec<(String, Value)> = names.iter().filter_map(|n| self.vars.get(n).map(|val| (n.clone(), val.clone()))).collect();
-                crate::matfile::write(&path, &vars).map_err(|e| LangError::new(e, 0))?;
-                self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5)\n", vars.len()));
+                if mcos {
+                    crate::matfile::write_mcos(&path, &vars).map_err(|e| LangError::new(e, 0))?;
+                    self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5 MCOS)\n", vars.len()));
+                } else {
+                    crate::matfile::write(&path, &vars).map_err(|e| LangError::new(e, 0))?;
+                    self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5)\n", vars.len()));
+                }
                 return Ok(None);
             }
             for n in &names {
@@ -21663,6 +21669,39 @@ end",
         assert_eq!(s.get("px"), Some(&Value::Num(3.0)));
         assert_eq!(s.get("ax"), Some(&Value::Num(4.0)));
         assert_eq!(s.get("asz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_roundtrip() {
+        let dir = m_dir("mcosobj");
+        let file = dir.join("mcos.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedMc
+    properties
+        x = 0
+        label = ''
+    end
+    methods
+        function obj = SavedMc(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("o = SavedMc(5); o.label = 'm'; save('{path}', 'o', '-mcos'); clear o; load('{path}'); x = o.x; l = o.label; c = class(o);"))
+            .unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(5.0)));
+        assert_eq!(s.get("l"), Some(&Value::Str("m".into())));
+        assert_eq!(s.get("c"), Some(&Value::Str("SavedMc".into())));
+        let bytes = std::fs::read(&file).unwrap();
+        let off = bytes.get(116..124).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).unwrap_or(0);
+        assert!(off > 128, "MCOS subsystem offset = {off}");
         rm_dir(&dir);
     }
 

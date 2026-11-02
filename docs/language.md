@@ -246,10 +246,12 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   properties support `GetAccess`/`SetAccess`/`Constant`/`Dependent`/`Hidden`
   (set through the returned handle) and are serialized with the object, so
   access metadata and values survive `save`/`load`.
-  MAT v5 opaque/mcOS variables are detected and rejected with an error naming
-  the variable and class: their fields live in the file subsystem, so reading
-  them as a normal object would silently lose data. Objects saved by MatCraft
-  are written as `mxOBJECT` records with their fields.
+  MAT v5 opaque/mcOS variables are resolved through the file's MCOS subsystem
+  (`FileWrapper__` metadata, class/property tables and saved field values), so
+  MATLAB object files load as class-tagged objects. `save(...,'-mcos')` writes
+  scalar objects as opaque records plus a subsystem; default `save` keeps the
+  field-based `mxOBJECT` encoding. MCOS object arrays and nested object fields
+  are not written yet and report a clear error.
 - `builtin('name', …)` calls a raw built-in implementation, bypassing
   user functions and class overloads. It supports multi-output builtins
   (`[r,c] = builtin('size', x)`) and numeric operator aliases such as
