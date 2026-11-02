@@ -31,6 +31,8 @@ const MX_CHAR: u32 = 4;
 const MX_SPARSE: u32 = 5;
 const MX_DOUBLE: u32 = 6;
 const MX_UINT8: u32 = 9;
+/// MATLAB Class Object System / opaque object reference.
+const MX_OPAQUE: u32 = 17;
 
 /// Cap on sub-elements read from a foreign cell/struct — corrupt dims
 /// must not drive unbounded allocation.
@@ -545,6 +547,25 @@ fn read_matrix(buf: &[u8]) -> Result<(String, Value), String> {
             }
             Ok((name, Value::Object(MObject::array(class_name, elements, (rows, cols)))))
         }
+        MX_OPAQUE => {
+            // Opaque variables are MCOS references into the file's
+            // subsystem data; the actual object fields live outside the
+            // normal variable stream. Report the reference clearly rather
+            // than silently dropping or misreading the object.
+            let type_system =
+                if matches!(t, MI_INT8 | MI_UINT8 | MI_UTF8) { String::from_utf8_lossy(p).trim_end_matches('\0').to_string() } else { String::new() };
+            let class_name = match r.element() {
+                Some((_, cp)) => String::from_utf8_lossy(cp).trim_end_matches('\0').to_string(),
+                None => String::new(),
+            };
+            let class_name = if class_name.is_empty() { "<unknown>".to_string() } else { class_name };
+            let kind = if type_system == "MCOS" { "mcOS" } else { "opaque" };
+            Err(format!(
+                "MAT v5 {kind} object '{name}' (class '{class_name}') is not supported; \
+                 its fields are stored in the MAT-file subsystem, not in the variable record. \
+                 Resave the object as a struct or load it in MATLAB with -v7.3"
+            ))
+        }
         _ => Err(format!("unsupported array class {class}")),
     }
 }
@@ -607,6 +628,41 @@ mod tests {
         let b = std::fs::read(&tmp).unwrap();
         assert_eq!(&b[126..128], b"MI");
         assert!(b.starts_with(b"MATLAB 5.0 MAT-file"));
+    }
+
+    fn opaque_file(type_system: &str, class_name: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut flags = Vec::new();
+        flags.extend_from_slice(&MX_OPAQUE.to_le_bytes());
+        flags.extend_from_slice(&0u32.to_le_bytes());
+        push_tag(&mut payload, MI_UINT32, &flags);
+        let mut dims = Vec::new();
+        dims.extend_from_slice(&1i32.to_le_bytes());
+        dims.extend_from_slice(&1i32.to_le_bytes());
+        push_tag(&mut payload, MI_INT32, &dims);
+        push_tag(&mut payload, MI_INT8, b"obj");
+        push_tag(&mut payload, MI_INT8, type_system.as_bytes());
+        push_tag(&mut payload, MI_INT8, class_name.as_bytes());
+        let mut matrix = Vec::new();
+        push_tag(&mut matrix, MI_MATRIX, &payload);
+        let mut out = vec![0u8; 128];
+        out.get_mut(..19).unwrap().copy_from_slice(b"MATLAB 5.0 MAT-file");
+        out[126] = b'M';
+        out[127] = b'I';
+        out.extend_from_slice(&matrix);
+        out
+    }
+
+    #[test]
+    fn opaque_mcos_object_reports_clear_error() {
+        let err = read(&opaque_file("MCOS", "MyClass")).unwrap_err();
+        assert!(err.contains("mcOS object 'obj'"), "error = {err}");
+        assert!(err.contains("class 'MyClass'"), "error = {err}");
+        assert!(err.contains("subsystem"), "error = {err}");
+
+        let err = read(&opaque_file("OTHER", "Thing")).unwrap_err();
+        assert!(err.contains("opaque object 'obj'"), "error = {err}");
+        assert!(err.contains("class 'Thing'"), "error = {err}");
     }
 
     #[test]

@@ -339,6 +339,9 @@
 - Dynamic-property wave (2026-11): `addprop`/`dynamicprops`/`removeprop`
   on handle objects, access-attribute enforcement and persistence through
   `.mat` v5 save/load.
+- MAT opaque-object wave (2026-11): `.mat` v5 `mxOPAQUE_CLASS`
+  variables (MCOS references into subsystem data) are recognized and
+  rejected with a clear variable/class error instead of being misread.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,

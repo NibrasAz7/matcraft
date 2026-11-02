@@ -246,8 +246,10 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   properties support `GetAccess`/`SetAccess`/`Constant`/`Dependent`/`Hidden`
   (set through the returned handle) and are serialized with the object, so
   access metadata and values survive `save`/`load`.
-  Not in (parse harmlessly or error clearly): `.mat` files containing MATLAB
-  `mcOS`/opaque objects.
+  MAT v5 opaque/mcOS variables are detected and rejected with an error naming
+  the variable and class: their fields live in the file subsystem, so reading
+  them as a normal object would silently lose data. Objects saved by MatCraft
+  are written as `mxOBJECT` records with their fields.
 - `builtin('name', …)` calls a raw built-in implementation, bypassing
   user functions and class overloads. It supports multi-output builtins
   (`[r,c] = builtin('size', x)`) and numeric operator aliases such as
