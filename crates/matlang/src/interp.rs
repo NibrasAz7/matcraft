@@ -22761,6 +22761,37 @@ end",
         assert!((scalar(&s, "v1") - (1.0 - (-1f64).exp())).abs() < 1e-4);
         assert!(scalar(&s, "v2").abs() < 1e-4);
 
+        // MIMO margins and Nyquist data are per-channel; `margin` reports the
+        // worst loop and `nyquist` returns p x m x N real/imag arrays.
+        s.run(
+            "A2 = [-1 1 0 0; 0 -1 1 0; 0 0 -1 0; 0 0 0 -1]; B2 = [0 0; 0 0; 1 0; 0 1]; \
+             C2 = [2 0 0 0; 0 0 0 2]; D2 = zeros(2,2); Gm = ss(A2,B2,C2,D2); \
+             [gm2, pm2, wcg2, wcp2] = margin(Gm); [re2, im2, w2] = nyquist(Gm, [1 2]); \
+             nr11 = re2(1,1,1); ni11 = im2(1,1,1); nr22 = re2(2,2,2); ni22 = im2(2,2,2); nc12 = re2(1,2,1);",
+        )
+        .unwrap();
+        assert_eq!(dims(&s, "re2"), vec![2, 2, 2]);
+        assert_eq!(dims(&s, "im2"), vec![2, 2, 2]);
+        assert!((scalar(&s, "gm2") - 4.0).abs() < 1e-3, "MIMO Gm = {}", scalar(&s, "gm2"));
+        assert!((scalar(&s, "wcg2") - 3f64.sqrt()).abs() < 1e-3);
+        let wcp_expected = (2f64.powf(2.0 / 3.0) - 1.0).sqrt();
+        let pm_expected = 180.0 - 3.0 * wcp_expected.atan().to_degrees();
+        assert!((scalar(&s, "pm2") - pm_expected).abs() < 1e-2, "MIMO Pm = {}", scalar(&s, "pm2"));
+        assert!((scalar(&s, "wcp2") - wcp_expected).abs() < 1e-3, "MIMO Wcp = {}", scalar(&s, "wcp2"));
+        assert!((scalar(&s, "nr11") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "ni11") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "nr22") - 0.4).abs() < 1e-9);
+        assert!((scalar(&s, "ni22") + 0.8).abs() < 1e-9);
+        assert_eq!(scalar(&s, "nc12"), 0.0);
+
+        // MIMO margin needs a square plant.
+        s.run("try, margin(ss([-1], 1, [1;1], [0;0])); catch me, mmsg = me.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("mmsg") {
+            assert!(m.contains("as many outputs as inputs"), "MIMO margin error = {m}");
+        } else {
+            panic!("non-square MIMO margin did not error");
+        }
+
         // Discrete-time state-space: no matrix exponential, direct recurrence.
         s.run("sd = ss([0.5 0; 0 0.25], [1;1], [1 0.5], 0, 0.1); [yd, td] = step(sd, 0:0.1:1);").unwrap();
         assert_eq!(s.get("yd").unwrap().dims(), (11, 1));

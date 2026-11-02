@@ -350,6 +350,9 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- MIMO-margin wave (2026-11): `nyquist` returns `p x m x N` real/imag
+  arrays for state-space systems, and `margin` evaluates every loop and
+  reports the worst gain and phase margins with square-plant validation.
 - PID-tuning wave (2026-11): `pidtune` designs P/PI/PD/PID/PIDF
   controllers to a 60 degree phase margin at an explicit or default
   crossover, with exact open-loop magnitude normalisation and a filtered

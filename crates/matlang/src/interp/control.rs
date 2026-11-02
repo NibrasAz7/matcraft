@@ -1042,15 +1042,46 @@ impl Session {
     }
 
     fn nyquist_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
-        let (num, den) = tf_parts(argv.first().ok_or_else(|| LangError::new("nyquist needs a system", 0))?)?;
-        let w = match argv.get(1) {
-            Some(v) => v.to_numeric()?.data().to_vec(),
-            None => logspace_vec(-2.0, 2.0, 500),
+        let sys = argv.first().ok_or_else(|| LangError::new("nyquist needs a system", 0))?;
+        let (w, column) = match argv.get(1) {
+            Some(v) => {
+                let m = v.to_numeric()?;
+                (m.data().to_vec(), m.rows() > m.cols())
+            }
+            None => (logspace_vec(-2.0, 2.0, 500), false),
         };
+        if let Some((a, b, c, d)) = mimo_ss_parts(sys)? {
+            let resp = ss_freq_response(&a, &b, &c, &d, &w)?;
+            let (p, m) = (c.rows(), b.cols());
+            let nw = w.len();
+            check_elems(p.saturating_mul(m).saturating_mul(nw))?;
+            let mut re = vec![0.0f64; p.saturating_mul(m).saturating_mul(nw)];
+            let mut im = vec![0.0f64; p.saturating_mul(m).saturating_mul(nw)];
+            for (k, h) in resp.iter().enumerate() {
+                for out in 0..p {
+                    for inp in 0..m {
+                        let z = h.get(out.saturating_mul(m).saturating_add(inp)).copied().unwrap_or(CNum::real(0.0));
+                        let idx = k.saturating_mul(p).saturating_mul(m).saturating_add(inp.saturating_mul(p)).saturating_add(out);
+                        if let Some(slot) = re.get_mut(idx) {
+                            *slot = z.re;
+                        }
+                        if let Some(slot) = im.get_mut(idx) {
+                            *slot = z.im;
+                        }
+                    }
+                }
+            }
+            let rem = Matrix::from_col_major_nd(&[p, m, nw], re).map_err(lang)?;
+            let imm = Matrix::from_col_major_nd(&[p, m, nw], im).map_err(lang)?;
+            let wrap = |v: Vec<f64>| if column { Value::Mat(Matrix::col_vector(v)) } else { Value::Mat(Matrix::row_vector(v)) };
+            return Ok(vec![Value::Mat(rem), Value::Mat(imm), wrap(w)]);
+        }
+        let (num, den) = tf_parts(sys)?;
         let h = freq_response(&num, &den, &w);
         let re: Vec<f64> = h.iter().map(|z| z.re).collect();
         let im: Vec<f64> = h.iter().map(|z| z.im).collect();
-        Ok(vec![Value::Mat(Matrix::row_vector(re)), Value::Mat(Matrix::row_vector(im)), Value::Mat(Matrix::row_vector(w))])
+        let wrap = |v: Vec<f64>| if column { Value::Mat(Matrix::col_vector(v)) } else { Value::Mat(Matrix::row_vector(v)) };
+        Ok(vec![wrap(re), wrap(im), wrap(w)])
     }
 
     fn damp_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
@@ -1164,10 +1195,7 @@ fn is_stable(v: Option<&Value>) -> Result<bool, LangError> {
     Ok(poles.iter().all(|z| if ts > 0.0 { (z.re * z.re + z.im * z.im).sqrt() < 1.0 } else { z.re < 0.0 }))
 }
 
-fn margin_values(v: &Value) -> Result<(f64, f64, f64, f64), LangError> {
-    let (num, den) = tf_parts(v)?;
-    let w = logspace_vec(-3.0, 3.0, 4000);
-    let h = freq_response(&num, &den, &w);
+fn margins_from_response(w: &[f64], h: &[CNum]) -> (f64, f64, f64, f64) {
     let mag: Vec<f64> = h.iter().map(|z| (z.re * z.re + z.im * z.im).sqrt()).collect();
     let mut phase: Vec<f64> = h.iter().map(|z| z.im.atan2(z.re).to_degrees()).collect();
     for i in 1..phase.len() {
@@ -1212,7 +1240,47 @@ fn margin_values(v: &Value) -> Result<(f64, f64, f64, f64), LangError> {
             gm = if mm > 0.0 { 1.0 / mm } else { f64::INFINITY };
         }
     }
-    Ok((gm, pm, wcg, wcp))
+    (gm, pm, wcg, wcp)
+}
+
+fn margin_values(v: &Value) -> Result<(f64, f64, f64, f64), LangError> {
+    if let Some((a, b, c, d)) = mimo_ss_parts(v)? {
+        let (p, m) = (c.rows(), b.cols());
+        if p != m {
+            return Err(LangError::new("margin: MIMO systems must have as many outputs as inputs", 0));
+        }
+        let w = logspace_vec(-3.0, 3.0, 4000);
+        let resp = ss_freq_response(&a, &b, &c, &d, &w)?;
+        let mut worst_gm = f64::INFINITY;
+        let mut worst_pm = f64::NAN;
+        let mut worst_wcg = f64::NAN;
+        let mut worst_wcp = f64::NAN;
+        let mut gm_dist = f64::INFINITY;
+        for out in 0..p {
+            for inp in 0..m {
+                let channel: Vec<CNum> =
+                    resp.iter().map(|h| h.get(out.saturating_mul(m).saturating_add(inp)).copied().unwrap_or(CNum::real(0.0))).collect();
+                let (gm, pm, wcg, wcp) = margins_from_response(&w, &channel);
+                if pm.is_finite() && (worst_pm.is_nan() || pm < worst_pm) {
+                    worst_pm = pm;
+                    worst_wcp = wcp;
+                }
+                if gm.is_finite() && gm > 0.0 {
+                    let dist = gm.ln().abs();
+                    if dist < gm_dist {
+                        gm_dist = dist;
+                        worst_gm = gm;
+                        worst_wcg = wcg;
+                    }
+                }
+            }
+        }
+        return Ok((worst_gm, worst_pm, worst_wcg, worst_wcp));
+    }
+    let (num, den) = tf_parts(v)?;
+    let w = logspace_vec(-3.0, 3.0, 4000);
+    let h = freq_response(&num, &den, &w);
+    Ok(margins_from_response(&w, &h))
 }
 
 fn bandwidth_value(argv: &[Value]) -> Result<f64, LangError> {
