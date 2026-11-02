@@ -1,10 +1,12 @@
-//! Minimal HDF5 reader/writer for contiguous numeric datasets.
+//! Pure-Rust HDF5 reader/writer for numeric datasets.
 //!
-//! Writer: HDF5 superblock v0, object header v1, a root-group symbol table
-//! (B-tree + local heap + SNOD), and contiguous little-endian f64 datasets.
-//! Reader: the same layout plus simple h5py-style v0 files using root symbol
-//! tables. Superblock v2/3 and chunked datasets are rejected with a clear
-//! message instead of guessing.
+//! Writer: superblock v2 (default) or v3, v2 object headers with link
+//! messages for the root group, chunked little-endian f64 datasets and
+//! fixed-array chunk indexes; `write_bytes_v0` keeps the older
+//! symbol-table layout available for reference. Reader: superblocks
+//! v0/v1/v2/v3, object headers v1/v2, symbol tables and link messages,
+//! compact/contiguous/chunked data, fixed-array/extensible-array/B-tree
+//! chunk indexes, virtual datasets and common filters.
 
 use crate::LangError;
 
@@ -22,9 +24,17 @@ pub(crate) struct H5Dataset {
     pub data: Vec<f64>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct H5File {
     pub datasets: Vec<H5Dataset>,
+    /// Superblock format to write: 2 (default, widest compatibility) or 3.
+    pub superblock_version: u8,
+}
+
+impl Default for H5File {
+    fn default() -> Self {
+        H5File { datasets: Vec::new(), superblock_version: 2 }
+    }
 }
 
 fn u16_at(b: &[u8], p: usize) -> Option<u16> {
@@ -451,9 +461,11 @@ pub(crate) fn write_bytes(file: &H5File) -> Result<Vec<u8>, LangError> {
     }
     let total = cursor.max(48);
     let mut out = vec![0u8; total];
-    // Superblock v3.
+    // Superblock v2 or v3 — identical fixed fields; the version selects
+    // the HDF5 library-version semantics.
+    let sb_version = if file.superblock_version == 3 { 3 } else { 2 };
     out.get_mut(0..8).unwrap_or(&mut []).copy_from_slice(b"\x89HDF\r\n\x1a\n");
-    out[8] = 3;
+    out[8] = sb_version;
     out[9] = 8;
     out[10] = 8;
     out[11] = 0;
@@ -746,20 +758,24 @@ fn read_bytes_opts(b: &[u8], base: Option<std::path::PathBuf>, depth: usize, fol
         return Err(LangError::new("hdf5: bad HDF5 signature", 0));
     };
     let rctx = H5ReadCtx { base, depth, follow_virtual };
-    match version {
+    let mut file = match version {
         0 | 1 => {
             let ctx =
                 H5Ctx { offset_size: b.get(sb + 13).copied().unwrap_or(8) as usize, length_size: b.get(sb + 14).copied().unwrap_or(8) as usize };
             let root_oh = off_at(b, sb + 64, ctx);
-            read_root_v1(b, ctx, root_oh, &rctx)
+            read_root_v1(b, ctx, root_oh, &rctx)?
         }
         2 | 3 => {
             let ctx = H5Ctx { offset_size: b.get(sb + 9).copied().unwrap_or(8) as usize, length_size: b.get(sb + 10).copied().unwrap_or(8) as usize };
             let root_oh = off_at(b, sb + 36, ctx);
-            read_root_v2(b, ctx, root_oh, &rctx)
+            read_root_v2(b, ctx, root_oh, &rctx)?
         }
-        other => Err(LangError::new(format!("hdf5: unsupported superblock version {other}"), 0)),
-    }
+        other => return Err(LangError::new(format!("hdf5: unsupported superblock version {other}"), 0)),
+    };
+    // v0/v1 files are rewritten with a v2 superblock; v2 and v3 are
+    // preserved on save so a read/write round trip does not change format.
+    file.superblock_version = if version == 3 { 3 } else { 2 };
+    Ok(file)
 }
 
 fn read_root_v1(b: &[u8], ctx: H5Ctx, root_oh: usize, rctx: &H5ReadCtx) -> Result<H5File, LangError> {
@@ -2184,16 +2200,30 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_chunked_v3_writer() {
+    fn roundtrip_v2_superblock_writer() {
         let data: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
         let mut f = H5File::default();
+        f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone() });
+        let bytes = write_bytes(&f).unwrap();
+        assert_eq!(bytes.get(8), Some(&2));
+        assert_eq!(u32_at(&bytes, 44), Some(lookup3(&bytes[..44])));
+        let back = read_bytes(&bytes).unwrap();
+        assert_eq!(back.superblock_version, 2);
+        assert_eq!(back.datasets.len(), 1);
+        assert_eq!(back.datasets[0].dims, vec![100, 100]);
+        assert_eq!(back.datasets[0].data, data);
+    }
+
+    #[test]
+    fn roundtrip_v3_superblock_writer() {
+        let data: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
+        let mut f = H5File { superblock_version: 3, ..H5File::default() };
         f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone() });
         let bytes = write_bytes(&f).unwrap();
         assert_eq!(bytes.get(8), Some(&3));
         assert_eq!(u32_at(&bytes, 44), Some(lookup3(&bytes[..44])));
         let back = read_bytes(&bytes).unwrap();
-        assert_eq!(back.datasets.len(), 1);
-        assert_eq!(back.datasets[0].dims, vec![100, 100]);
+        assert_eq!(back.superblock_version, 3);
         assert_eq!(back.datasets[0].data, data);
     }
 
@@ -2238,6 +2268,18 @@ mod tests {
     #[test]
     fn read_superblock_v2_contiguous() {
         check_fixture(include_bytes!("../tests/fixtures/h5_v2_contiguous.h5"), "a", &[6], 6);
+    }
+
+    #[test]
+    fn read_writer_v2_fixture() {
+        let f = read_bytes(include_bytes!("../tests/fixtures/h5_writer_v2.h5")).unwrap();
+        assert_eq!(f.superblock_version, 2);
+        let grid = f.datasets.iter().find(|d| d.name == "grid").unwrap();
+        assert_eq!(grid.dims, vec![2, 3]);
+        assert_eq!(grid.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let line = f.datasets.iter().find(|d| d.name == "line").unwrap();
+        assert_eq!(line.dims, vec![5]);
+        assert_eq!(line.data, vec![9.0, 8.0, 7.0, 6.0, 5.0]);
     }
 
     #[test]

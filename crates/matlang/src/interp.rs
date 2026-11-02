@@ -21961,6 +21961,35 @@ end",
     }
 
     #[test]
+    fn hdf5_superblock_version_option() {
+        let dir = m_dir("h5sb");
+        let v2 = dir.join("v2.h5");
+        let v3 = dir.join("v3.h5");
+        let a = v2.to_string_lossy().replace('\\', "/");
+        let b = v3.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "h5create('{a}', '/x', [2 2]); h5write('{a}', '/x', [1 2; 3 4]); x2 = h5read('{a}', '/x'); \
+             h5create('{b}', '/x', [2 2], 'SuperblockVersion', 3); h5write('{b}', '/x', [5 6; 7 8]); x3 = h5read('{b}', '/x');"
+        ))
+        .unwrap();
+        let b2 = std::fs::read(&v2).unwrap();
+        let b3 = std::fs::read(&v3).unwrap();
+        assert_eq!(b2.get(8), Some(&2));
+        assert_eq!(b3.get(8), Some(&3));
+        assert_eq!(s.get("x2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0, 2.0, 4.0]));
+        assert_eq!(s.get("x3").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![5.0, 7.0, 6.0, 8.0]));
+
+        s.run(&format!("try, h5create('{a}', '/bad', [1 1], 'SuperblockVersion', 4); catch e, sbmsg = e.message; end")).unwrap();
+        if let Some(Value::Str(m)) = s.get("sbmsg") {
+            assert!(m.contains("must be 2 or 3"), "superblock error = {m}");
+        } else {
+            panic!("invalid SuperblockVersion did not error");
+        }
+        rm_dir(&dir);
+    }
+
+    #[test]
     fn hdf5_netcdf_io() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);

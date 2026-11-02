@@ -9,6 +9,7 @@ templates or sample files — ever.
 | `assets/app-icon/matcraft-*.png`, `matcraft.ico` | ArtCraft contributors | generated in code (plotted-curve motif, navy/cyan) | MIT OR Apache-2.0 | Original art; regenerate by drawing, never copied. |
 | `crates/matlang/tests/fixtures/h5_v0_gzip.h5` | MatCraft contributors | generated from deterministic 0..23 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v0, gzip, B-tree v1 chunks |
 | `crates/matlang/tests/fixtures/h5_v2_contiguous.h5` | MatCraft contributors | generated from deterministic 0..5 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v2, contiguous dataset |
+| `crates/matlang/tests/fixtures/h5_writer_v2.h5` | MatCraft contributors | written by MatCraft's HDF5 writer from deterministic 1..6 and 9..5 vectors; contents verified with h5py 3.16 | CC0-1.0 | HDF5 superblock v2 writer fixture, two datasets |
 | `crates/matlang/tests/fixtures/h5_v3_gzip.h5` | MatCraft contributors | generated from deterministic 0..23 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, fixed-array chunks |
 | `crates/matlang/tests/fixtures/h5_v3_bt2.h5` | MatCraft contributors | generated from deterministic 0..11 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, B-tree v2 chunks |
 | `crates/matlang/tests/fixtures/h5_ea_plain.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, one unlimited dimension, extensible-array index |

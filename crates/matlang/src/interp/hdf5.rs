@@ -19,6 +19,26 @@ fn dataset_name(v: &Value) -> Result<String, LangError> {
     }
 }
 
+/// MatCraft extension: `h5create(..., 'SuperblockVersion', 2|3)` chooses
+/// the superblock format for new files (v2 is the default).
+fn superblock_version_option(argv: &[Value], at: usize) -> Result<Option<u8>, LangError> {
+    let mut i = at;
+    while i + 1 < argv.len() {
+        if let Value::Str(key) = &argv[i] {
+            if key.eq_ignore_ascii_case("SuperblockVersion") {
+                let m = argv[i + 1].to_numeric()?;
+                let v = m.as_scalar().ok_or_else(|| LangError::new("SuperblockVersion must be scalar", 0))?.round();
+                if v != 2.0 && v != 3.0 {
+                    return Err(LangError::new("SuperblockVersion must be 2 or 3", 0));
+                }
+                return Ok(Some(v as u8));
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
 struct Selection {
     start: Vec<usize>,
     count: Vec<usize>,
@@ -212,6 +232,9 @@ impl Session {
                 }
                 let count = dims.iter().fold(1usize, |a, &b| a.saturating_mul(b));
                 file.datasets.push(H5Dataset { name: ds_name, dims, data: vec![0.0; count] });
+                if let Some(v) = superblock_version_option(&argv, 3)? {
+                    file.superblock_version = v;
+                }
                 crate::hdf5::write(&path, &file)?;
                 Ok(vec![])
             }

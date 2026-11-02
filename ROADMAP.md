@@ -320,6 +320,10 @@
   metadata checksums. Round-trips are checked with the native reader and
   h5py 3.16/HDF5 2.0 (multiple datasets, 100×100 multi-chunk grids, 1-D row
   chunks, gzip/chunk metadata).
+- HDF5 superblock-v2 wave (2026-11): new files default to superblock v2 for
+  wider library compatibility, `h5create(...,'SuperblockVersion',3)` opts
+  into v3, and read/write round trips preserve the file's format. A
+  writer-produced v2 fixture is read back with the native reader and h5py.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,
