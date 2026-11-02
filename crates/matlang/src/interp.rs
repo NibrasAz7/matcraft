@@ -4197,6 +4197,28 @@ impl Session {
     /// Builtin functions. Returns `Ok(None)` for commands that only print.
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         match name {
+            "builtin" => {
+                let v = self.eval_args(args)?;
+                let target = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("builtin needs a function name as its first argument", 0)),
+                };
+                let rest = v.get(1..).unwrap_or(&[]).to_vec();
+                if let Some(op) = builtin_binop(&target) {
+                    if rest.len() != 2 {
+                        return Err(LangError::new(format!("builtin('{target}', ...) needs two operands"), 0));
+                    }
+                    if rest.iter().any(|v| matches!(v, Value::Object(_))) {
+                        return Err(LangError::new(format!("builtin('{target}', ...) has no built-in object implementation"), 0));
+                    }
+                    return Ok(Some(self.binary(op, rest[0].clone(), rest[1].clone())?));
+                }
+                if !self.is_builtin(&target) {
+                    return Err(LangError::new(format!("builtin: '{target}' is not a built-in function"), 0));
+                }
+                let out = self.builtin_values(&target, rest, 1)?;
+                Ok(out.into_iter().next())
+            }
             "zeros" | "ones" | "eye" | "rand" | "randn" | "true" | "false" => {
                 // `rand('seed', v)` / `rand('state', v)` (and the
                 // `'twister'` alias) — the legacy seed-setting form,
@@ -10216,6 +10238,18 @@ impl Session {
     /// multi-output form (caller reports "not a function").
     fn builtin_multi(&mut self, name: &str, args: &[Expr], nout: usize) -> Result<Option<Vec<Value>>, LangError> {
         let out = match name {
+            "builtin" => {
+                let v = self.eval_args(args)?;
+                let target = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("builtin needs a function name as its first argument", 0)),
+                };
+                if !self.is_builtin(&target) {
+                    return Err(LangError::new(format!("builtin: '{target}' is not a built-in function"), 0));
+                }
+                let rest = v.get(1..).unwrap_or(&[]).to_vec();
+                self.builtin_values(&target, rest, nout)?
+            }
             "feval" => {
                 // `[a,b] = feval(@f, x)` — multi-output call through a handle.
                 let v = self.eval_args(args)?;
@@ -15203,6 +15237,29 @@ fn assign_table_rows(target: &Value, rows: &[usize], src: &Value) -> Result<Valu
     }
 }
 
+fn builtin_binop(name: &str) -> Option<BinOp> {
+    Some(match name {
+        "plus" => BinOp::Add,
+        "minus" => BinOp::Sub,
+        "mtimes" => BinOp::Mul,
+        "times" => BinOp::ElemMul,
+        "mrdivide" => BinOp::Div,
+        "rdivide" => BinOp::ElemDiv,
+        "mldivide" => BinOp::Backslash,
+        "mpower" => BinOp::Pow,
+        "power" => BinOp::ElemPow,
+        "eq" => BinOp::Eq,
+        "ne" => BinOp::Neq,
+        "lt" => BinOp::Lt,
+        "le" => BinOp::Le,
+        "gt" => BinOp::Gt,
+        "ge" => BinOp::Ge,
+        "and" => BinOp::And,
+        "or" => BinOp::Or,
+        _ => return None,
+    })
+}
+
 fn index_list(v: &Value, dim_len: usize) -> Result<Vec<usize>, LangError> {
     let m = v.to_matrix()?;
     // Logical indexing: a 0/1 mask the length of the indexed dimension
@@ -16709,6 +16766,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "narginchk",
     "nargoutchk",
     "feval",
+    "builtin",
     "func2str",
     "str2func",
     "functions",
@@ -22340,6 +22398,53 @@ end",
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.get(0..4), Some(b"CDF\x01".as_slice()));
         rm_dir(&dir);
+    }
+
+    #[test]
+    fn builtin_bypasses_class_overloads() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Shadow\n\
+             properties\n x = 7\n end\n\
+             methods\n\
+               function n = size(obj)\n n = 99;\n end\n\
+               function n = numel(obj)\n n = 98;\n end\n\
+             end\n\
+             end",
+        )
+        .unwrap();
+        s.run(
+            "o = Shadow(); normal_size = size(o); normal_numel = numel(o); \
+             bs = builtin('size', o); bn = builtin('numel', o); bc = builtin('class', o); \
+             bx = builtin('get', o, 'x'); bch = builtin('char', 65); [br, bcol] = builtin('size', o);",
+        )
+        .unwrap();
+        assert_eq!(s.get("normal_size"), Some(&Value::Num(99.0)));
+        assert_eq!(s.get("normal_numel"), Some(&Value::Num(98.0)));
+        assert_eq!(s.get("bs").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 1.0]));
+        assert_eq!(s.get("bn"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("bc"), Some(&Value::Str("Shadow".into())));
+        assert_eq!(s.get("bx"), Some(&Value::Num(7.0)));
+        assert_eq!(s.get("bch"), Some(&Value::Str("A".into())));
+        assert_eq!(s.get("br"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("bcol"), Some(&Value::Num(1.0)));
+        s.run("bop = builtin('plus', 1, 2); bdot = builtin('mtimes', [1 2], [3;4]);").unwrap();
+        assert_eq!(s.get("bop"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("bdot"), Some(&Value::Num(11.0)));
+
+        s.run("try, builtin('plus', o, o); catch oe, omsg = oe.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("omsg") {
+            assert!(m.contains("no built-in object implementation"), "operator error = {m}");
+        } else {
+            panic!("builtin operator on objects did not error");
+        }
+
+        s.run("try, builtin('no_such_builtin', 1); catch be, bmsg = be.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("bmsg") {
+            assert!(m.contains("not a built-in function"), "builtin error = {m}");
+        } else {
+            panic!("unknown builtin name did not error");
+        }
     }
 
     #[test]

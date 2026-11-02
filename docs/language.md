@@ -240,9 +240,13 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   class defines the method, else a clear "not defined for class" error.
 - `Class.member` evaluates an `enumeration` member's backing value, now
   returning a class instance.
-  Not in (parse harmlessly or error clearly): `builtin('method', obj, …)`
-  dispatch, dynamic props beyond declared fields, and `.mat` files
-  containing MATLAB `mcOS`/opaque objects.
+  Not in (parse harmlessly or error clearly): dynamic props beyond declared
+  fields, and `.mat` files containing MATLAB `mcOS`/opaque objects.
+- `builtin('name', …)` calls a raw built-in implementation, bypassing
+  user functions and class overloads. It supports multi-output builtins
+  (`[r,c] = builtin('size', x)`) and numeric operator aliases such as
+  `plus`, `mtimes`, `eq` and `and`; operators on class instances report
+  that no built-in object implementation exists.
 - Windows COM automation: `actxserver('ProgID')` starts a long-lived
   PowerShell bridge process that owns the COM object and speaks
   JSON-lines over stdin/stdout, so the Rust core stays free of `unsafe`.
