@@ -265,6 +265,10 @@
   (row `out*m+inp`) using `C(jwI-A)^-1B+D`; SISO shapes are unchanged.
   Cross-checked against analytic diagonal and shared-input state-space
   responses. `examples/control.m` demonstrates it.
+- Parallel/GPU wave (2026-11): Rayon-backed large matrix multiplication,
+  `maxNumCompThreads`/`parpool` worker configuration, and an optional `gpu`
+  feature (`gpuArray`/`gather`/`canUseGPU`/`gpuDevice`) that runs matmul on a
+  wgpu compute shader with a transparent CPU fallback.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,

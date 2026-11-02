@@ -67,12 +67,12 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("ode", "ode45 ode15s odeset odeget deval"),
     (
         "corpus classes",
-        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count parpool parfeval fetchOutputs onCleanup categorical reordercats categories countcats addcats removecats mergecats renamecats isundefined isdatetime isduration istimetable datetime duration seconds",
+        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count parpool maxNumCompThreads gpuArray gather canUseGPU existsOnGPU gpuDevice parfeval fetchOutputs onCleanup categorical reordercats categories countcats addcats removecats mergecats renamecats isundefined isdatetime isduration istimetable datetime duration seconds",
     ),
     ("anova", "anova1 anova2 multcompare friedman"),
     (
         "xlsx/table",
-        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing table2cell cell2table struct2table struct2cell cell2struct addvars setvartype convertvars removevars renamevars summary findgroups splitapply varfun rowfun join innerjoin outerjoin groupsummary fillmissing rmmissing standardizeMissing fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace findstr jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines rethrow verLessThan inputname validateattributes validatestring mustBeNumeric mustBeNonempty mustBePositive mustBeInteger mustBeMember mustBeText mustBeA mustBeScalarOrEmpty mustBeFinite mustBeReal",
+        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing table2cell cell2table struct2table struct2cell cell2struct addvars setvartype convertvars removevars renamevars summary findgroups splitapply varfun rowfun join innerjoin outerjoin groupsummary stack unstack fillmissing rmmissing standardizeMissing fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace findstr jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines rethrow verLessThan inputname validateattributes validatestring mustBeNumeric mustBeNonempty mustBePositive mustBeInteger mustBeMember mustBeText mustBeA mustBeScalarOrEmpty mustBeFinite mustBeReal",
     ),
     ("hdf5/netcdf", "h5read h5write h5create h5disp ncread ncwrite ncinfo ncdisp"),
     (

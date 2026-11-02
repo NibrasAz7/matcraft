@@ -369,6 +369,22 @@ impl Matrix {
         }
         let (m, k, n) = (self.rows(), self.cols(), other.cols());
         let mut out = Matrix::zeros(m, n);
+        #[cfg(not(target_arch = "wasm32"))]
+        if m.saturating_mul(k).saturating_mul(n) > 50_000 {
+            use rayon::prelude::*;
+            out.data.par_chunks_mut(m).enumerate().for_each(|(c, col)| {
+                for i in 0..k {
+                    let b = other.get(i, c).unwrap_or(0.0);
+                    if b == 0.0 {
+                        continue;
+                    }
+                    for (r, slot) in col.iter_mut().enumerate() {
+                        *slot += self.get(r, i).unwrap_or(0.0) * b;
+                    }
+                }
+            });
+            return Ok(out);
+        }
         for c in 0..n {
             for i in 0..k {
                 let b = other.get(i, c).unwrap_or(0.0);
@@ -661,6 +677,40 @@ impl Matrix {
     }
 }
 
+/// Configure the process-wide parallel worker pool. Returns false when the
+/// pool was already initialized (the first setting wins).
+#[cfg(not(target_arch = "wasm32"))]
+static CONFIGURED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_num_threads(n: usize) -> bool {
+    let n = n.max(1);
+    CONFIGURED_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+    rayon::ThreadPoolBuilder::new().num_threads(n).build_global().is_ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_num_threads(_n: usize) -> bool {
+    false
+}
+
+/// Number of workers currently available to parallel matrix kernels.
+pub fn num_threads() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let configured = CONFIGURED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        if configured > 0 {
+            configured
+        } else {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +843,22 @@ mod tests {
         // …but a trailing-singleton 3-D view still counts as a matrix.
         assert!(page.is_matrix());
         assert!(page.det().is_ok());
+    }
+
+    #[test]
+    fn parallel_matmul_large_identity() {
+        let n = 200;
+        let mut a = Matrix::zeros(n, n);
+        for c in 0..n {
+            for r in 0..n {
+                let _ = a.set(r, c, ((r * 31 + c * 17) % 97) as f64);
+            }
+        }
+        let out = a.matmul(&Matrix::eye(n, n)).unwrap();
+        assert_eq!(out.dims(), a.dims());
+        for i in 0..n {
+            assert_eq!(out.get(i, i), a.get(i, i));
+        }
     }
 
     #[test]

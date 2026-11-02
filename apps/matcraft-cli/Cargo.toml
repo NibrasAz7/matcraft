@@ -12,6 +12,9 @@ workspace = true
 name = "matcraft-cli"
 path = "src/main.rs"
 
+[features]
+gpu = ["matlang/gpu"]
+
 [dependencies]
 matcraft_engine = { path = "../../crates/engine" }
 matcraft_mcp = { path = "../../crates/mcp" }

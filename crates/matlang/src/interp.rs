@@ -19,6 +19,7 @@ mod anova;
 mod control;
 mod corpus;
 mod ga;
+mod gpu;
 mod hdf5;
 mod image;
 mod maps;
@@ -782,6 +783,11 @@ impl Value {
             Value::Str(_) => Err(LangError::new("string used where a number was expected", 0)),
             Value::Cell(_) => Err(LangError::new("cell array used where a number was expected", 0)),
             Value::Struct(_) => Err(LangError::new("struct used where a number was expected", 0)),
+            Value::Object(o) if o.class_name == "gpuArray" => match o.prop("Data") {
+                Some(Value::Mat(m)) => Ok(m),
+                Some(v) => v.to_matrix(),
+                None => Err(LangError::new("gpuArray has no data", 0)),
+            },
             Value::Object(o) => Err(LangError::new(format!("'{}' object used where a number was expected", o.class_name), 0)),
             Value::Func(_) => Err(LangError::new("function handle used where a number was expected", 0)),
         }
@@ -845,6 +851,10 @@ impl Value {
             }
             Value::Cell(c) => c.shape(),
             Value::Struct(s) => (s.rows(), s.cols()),
+            Value::Object(o) if o.class_name == "gpuArray" => match o.prop("Data") {
+                Some(Value::Mat(m)) => m.shape(),
+                _ => (1, 1),
+            },
             Value::Object(_) => (1, 1),
             Value::Sparse(s) => s.shape(),
             Value::Func(_) => (1, 1),
@@ -3324,6 +3334,19 @@ impl Session {
     }
 
     fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, LangError> {
+        let gpu_a = matches!(&a, Value::Object(o) if o.class_name == "gpuArray");
+        let gpu_b = matches!(&b, Value::Object(o) if o.class_name == "gpuArray");
+        if gpu_a || gpu_b {
+            let aa = gather_value(&a);
+            let bb = gather_value(&b);
+            if op == BinOp::Mul && gpu_a && gpu_b {
+                let ma = aa.to_matrix()?;
+                let mb = bb.to_matrix()?;
+                return gpu::matmul(&ma, &mb).map(|m| wrap_gpu(Value::Mat(m)));
+            }
+            let r = self.binary(op, aa, bb)?;
+            return Ok(wrap_gpu(r));
+        }
         // Operator overloading: an object operand defers to its class's
         // `plus`/`mtimes`/`eq`/… method — MATLAB's dominant-argument rule.
         if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
@@ -5793,7 +5816,7 @@ impl Session {
             "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
             | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" | "convertvars" | "removevars"
             | "renamevars" | "summary" | "findgroups" | "splitapply" | "varfun" | "rowfun" | "join" | "innerjoin" | "outerjoin" | "groupsummary"
-            | "fillmissing" | "rmmissing" | "standardizeMissing" => {
+            | "stack" | "unstack" | "fillmissing" | "rmmissing" | "standardizeMissing" => {
                 let v = self.eval_args(args)?;
                 let out = self.xlsx_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -5831,9 +5854,56 @@ impl Session {
                 Ok(out.into_iter().next())
             }
             "table" => self.table_call(args),
+            "maxNumCompThreads" => {
+                let v = self.eval_args(args)?;
+                if let Some(n) = v.first() {
+                    let n = n.scalar()?.max(1.0) as usize;
+                    let _ = matcore::set_num_threads(n);
+                    return Ok(Some(Value::Num(n as f64)));
+                }
+                Ok(Some(Value::Num(matcore::num_threads() as f64)))
+            }
+            "gpuArray" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "gpuArray" => Ok(Some(Value::Object(o.clone()))),
+                    Some(x) => Ok(Some(wrap_gpu(x.clone()))),
+                    None => Err(LangError::new("gpuArray needs data", 0)),
+                }
+            }
+            "gather" => {
+                let v = self.eval_args(args)?;
+                let out = match v.first() {
+                    Some(Value::Cell(c)) => {
+                        let mut out = c.clone();
+                        for i in 0..out.numel() {
+                            if let Some(x) = out.get_linear(i) {
+                                out.set_linear(i, gather_value(x));
+                            }
+                        }
+                        Value::Cell(out)
+                    }
+                    Some(x) => gather_value(x),
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                };
+                Ok(Some(out))
+            }
+            "canUseGPU" | "existsOnGPU" => {
+                let _ = self.eval_args(args)?;
+                Ok(Some(Value::Num(if gpu::available() { 1.0 } else { 0.0 })))
+            }
+            "gpuDevice" => {
+                let mut props = StructArray::new();
+                props.set_field(0, "Name", Value::Str(gpu::device_name()))?;
+                props.set_field(0, "Available", Value::Num(if gpu::available() { 1.0 } else { 0.0 }))?;
+                props.set_field(0, "DriverVersion", Value::Str("wgpu".into()))?;
+                props.set_field(0, "TotalMemory", Value::Num(0.0))?;
+                Ok(Some(Value::Struct(props)))
+            }
             "parpool" => {
                 let v = self.eval_args(args)?;
                 let workers = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(1.0).max(1.0);
+                let _ = matcore::set_num_threads(workers as usize);
                 let mut props = StructArray::new();
                 props.set_field(0, "NumWorkers", Value::Num(workers))?;
                 Ok(Some(Value::Object(MObject::new("parallel.Pool".into(), props, true))))
@@ -9305,7 +9375,7 @@ impl Session {
             "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
             | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" | "convertvars" | "removevars"
             | "renamevars" | "summary" | "findgroups" | "splitapply" | "varfun" | "rowfun" | "join" | "innerjoin" | "outerjoin" | "groupsummary"
-            | "fillmissing" | "rmmissing" | "standardizeMissing" => {
+            | "stack" | "unstack" | "fillmissing" | "rmmissing" | "standardizeMissing" => {
                 let v = self.eval_args(args)?;
                 self.xlsx_builtin(name, v, nout)?
             }
@@ -13689,6 +13759,20 @@ fn importdata_value(path: &str) -> Result<Value, LangError> {
     }
 }
 
+fn wrap_gpu(v: Value) -> Value {
+    let mut props = StructArray::new();
+    let _ = props.set_field(0, "Data", v);
+    let _ = props.set_field(0, "Device", Value::Str(gpu::device_name()));
+    Value::Object(MObject::owned("gpuArray".into(), props))
+}
+
+fn gather_value(v: &Value) -> Value {
+    match v {
+        Value::Object(o) if o.class_name == "gpuArray" => o.prop("Data").unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+        other => other.clone(),
+    }
+}
+
 fn diary_write_to(path: &std::path::Path, text: &str) {
     if text.is_empty() {
         return;
@@ -15103,6 +15187,12 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "table",
     "table2array",
     "parpool",
+    "maxNumCompThreads",
+    "gpuArray",
+    "gather",
+    "canUseGPU",
+    "existsOnGPU",
+    "gpuDevice",
     "parfeval",
     "fetchOutputs",
     "onCleanup",
@@ -15176,6 +15266,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "innerjoin",
     "outerjoin",
     "groupsummary",
+    "stack",
+    "unstack",
     "fillmissing",
     "rmmissing",
     "standardizeMissing",
@@ -21278,6 +21370,22 @@ end",
         assert!((scalar(&s, "ye21") - 3.0).abs() < 1e-9);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_array_matmul_roundtrip() {
+        if !gpu::available() {
+            return;
+        }
+        let mut s = Session::new();
+        s.run("A=gpuArray([1 2;3 4]); B=gpuArray([5 6;7 8]); C=gather(A*B);").unwrap();
+        let c = s.get("C").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        let expected = [19.0, 43.0, 22.0, 50.0];
+        assert_eq!(c.len(), expected.len());
+        for (a, b) in c.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-4, "gpu result {a} vs {b}");
+        }
     }
 
     #[test]

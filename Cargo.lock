@@ -2430,6 +2430,9 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 [[package]]
 name = "matcore"
 version = "0.1.0"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "matcraft"
@@ -2512,13 +2515,16 @@ dependencies = [
 name = "matlang"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "craft-atomic",
  "flate2",
  "matcore",
  "matplot",
+ "pollster 0.4.0",
  "regex",
  "serde_json",
  "ureq",
+ "wgpu",
 ]
 
 [[package]]

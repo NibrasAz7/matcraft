@@ -1224,6 +1224,150 @@ fn rmmissing_table(t: &Value) -> Result<Value, LangError> {
     Ok(Value::Object(MObject::owned("table".into(), props)))
 }
 
+fn stack_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let vars = parse_name_list(argv.get(1));
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let data_name = argv
+        .windows(2)
+        .find_map(|w| match (&w[0], &w[1]) {
+            (Value::Str(k), Value::Str(v)) if k.eq_ignore_ascii_case("NewDataVariableName") => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Data".into());
+    let index_name = argv
+        .windows(2)
+        .find_map(|w| match (&w[0], &w[1]) {
+            (Value::Str(k), Value::Str(v)) if k.eq_ignore_ascii_case("IndexVariableName") => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Index".into());
+    let selected: Vec<String> = if vars.is_empty() { names.clone() } else { vars };
+    let constants: Vec<String> = names.iter().filter(|n| !selected.contains(n)).cloned().collect();
+    let mut props = StructArray::new();
+    let mut out_names = Vec::new();
+    for name in &constants {
+        let col = table_field(t, name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let mut vals = Vec::with_capacity(rows.saturating_mul(selected.len()));
+        for r in 0..rows {
+            for _ in &selected {
+                vals.push(variable_at(&col, r));
+            }
+        }
+        props.set_field(0, name, column_from_cells(&vals, vals.len()))?;
+        out_names.push(name.clone());
+    }
+    let mut data_vals = Vec::new();
+    let mut index_vals = Vec::new();
+    for v in &selected {
+        let col = table_field(t, v).ok_or_else(|| LangError::new(format!("stack: missing variable '{v}'"), 0))?;
+        for r in 0..rows {
+            data_vals.push(variable_at(&col, r));
+            index_vals.push(Value::Str(v.clone()));
+        }
+    }
+    props.set_field(0, &data_name, column_from_cells(&data_vals, data_vals.len()))?;
+    props.set_field(0, &index_name, Value::Cell(CellArray::col(index_vals)))?;
+    out_names.push(data_name);
+    out_names.push(index_name);
+    props.set_field(0, "Properties", table_properties(out_names, rows.saturating_mul(selected.len())))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn unstack_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let index_name = match argv.get(1) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(LangError::new("unstack needs an index variable", 0)),
+    };
+    let data_name = match argv.get(2) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(LangError::new("unstack needs a data variable", 0)),
+    };
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let idx = table_field(t, &index_name).ok_or_else(|| LangError::new("unstack: missing index variable", 0))?;
+    let dat = table_field(t, &data_name).ok_or_else(|| LangError::new("unstack: missing data variable", 0))?;
+    let constants: Vec<String> = names.iter().filter(|n| **n != index_name && **n != data_name).cloned().collect();
+    let mut levels: Vec<String> = Vec::new();
+    for r in 0..rows {
+        if let Value::Str(s) = variable_at(&idx, r) {
+            if !levels.contains(&s) {
+                levels.push(s);
+            }
+        }
+    }
+    // One output row per distinct constant-value combination; in the common
+    // one-row-per-group case this is simply the first occurrence.
+    let mut seen: Vec<String> = Vec::new();
+    let mut order: Vec<usize> = Vec::new();
+    for r in 0..rows {
+        let key = constants
+            .iter()
+            .map(|c| match table_field(t, c).map(|col| variable_at(&col, r)) {
+                Some(Value::Str(s)) => s,
+                Some(Value::Num(x)) => format!("{x}"),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        if !seen.contains(&key) {
+            seen.push(key);
+            order.push(r);
+        }
+    }
+    let mut props = StructArray::new();
+    let mut out_names = Vec::new();
+    for c in &constants {
+        let col = table_field(t, c).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let vals: Vec<Value> = order.iter().map(|&r| variable_at(&col, r)).collect();
+        props.set_field(0, c, column_from_cells(&vals, order.len()))?;
+        out_names.push(c.clone());
+    }
+    for level in &levels {
+        let mut vals = Vec::with_capacity(order.len());
+        let mut numeric = true;
+        for &r in &order {
+            let mut hit = None;
+            for rr in 0..rows {
+                if matches!(variable_at(&idx, rr), Value::Str(s) if &s == level) {
+                    let key = constants
+                        .iter()
+                        .map(|c| match table_field(t, c).map(|col| variable_at(&col, rr)) {
+                            Some(Value::Str(s)) => s,
+                            Some(Value::Num(x)) => format!("{x}"),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    let want = constants
+                        .iter()
+                        .map(|c| match table_field(t, c).map(|col| variable_at(&col, r)) {
+                            Some(Value::Str(s)) => s,
+                            Some(Value::Num(x)) => format!("{x}"),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    if key == want {
+                        hit = Some(variable_at(&dat, rr));
+                        break;
+                    }
+                }
+            }
+            let v = hit.unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            if !matches!(v, Value::Num(_) | Value::Mat(_)) {
+                numeric = false;
+            }
+            vals.push(v);
+        }
+        props.set_field(0, level, column_from_cells(&vals, order.len()))?;
+        out_names.push(level.clone());
+        let _ = numeric;
+    }
+    props.set_field(0, "Properties", table_properties(out_names, order.len()))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
 fn setvartype_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
     let Value::Object(o) = t else { return Err(LangError::new("setvartype needs a table", 0)) };
     let selected = parse_name_list(argv.get(1));
@@ -1331,6 +1475,8 @@ impl Session {
                 Ok(vec![join_tables(t1, t2, key)?])
             }
             "groupsummary" => Ok(vec![groupsummary_value(argv.first().ok_or_else(|| LangError::new("groupsummary needs a table", 0))?, &argv)?]),
+            "stack" => Ok(vec![stack_table(argv.first().ok_or_else(|| LangError::new("stack needs a table", 0))?, &argv)?]),
+            "unstack" => Ok(vec![unstack_table(argv.first().ok_or_else(|| LangError::new("unstack needs a table", 0))?, &argv)?]),
             "fillmissing" => {
                 let method = match argv.get(1) {
                     Some(Value::Str(s)) => s.to_ascii_lowercase(),
