@@ -430,6 +430,14 @@ impl MObject {
 
     /// `obj.prop = v` — writes through the shared store on handle
     /// classes, into the owned copy on value classes.
+    /// Remove a property (table variable deletion).
+    fn remove_prop(&mut self, name: &str) -> bool {
+        match &mut self.props {
+            ObjStore::Owned(s) => s.remove_field(name),
+            ObjStore::Shared(s) => s.borrow_mut().remove_field(name),
+        }
+    }
+
     fn set_prop(&mut self, name: &str, v: Value) {
         match &mut self.props {
             ObjStore::Owned(s) => {
@@ -2414,6 +2422,7 @@ impl Session {
                         )),
                     }
                 }
+                Some(Value::Object(o)) if o.class_name == "table" => self.table_brace_index(&o, args).map(Some),
                 Some(Value::Object(o)) => {
                     if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                         let s = self.subs_struct("{}", args)?;
@@ -2735,6 +2744,11 @@ impl Session {
         if braces {
             // `c{i} = v` - content assignment; creates/grows the cell.
             if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
+                if o.class_name == "table" {
+                    let new = self.table_assign(&o, index, v)?;
+                    self.vars.insert(name.to_string(), new);
+                    return Ok(());
+                }
                 if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
                     let s = self.subs_struct("{}", index)?;
                     let saved = self.subs_dot_guard;
@@ -2755,6 +2769,13 @@ impl Session {
             let ca = self.cell_brace_apply(ca, index, v)?;
             self.vars.insert(name.to_string(), Value::Cell(ca));
             return Ok(());
+        }
+        if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
+            if o.class_name == "table" {
+                let new = self.table_assign(&o, index, v)?;
+                self.vars.insert(name.to_string(), new);
+                return Ok(());
+            }
         }
         let map = match self.vars.get(name) {
             Some(Value::Object(o)) if o.class_name == "containers.Map" => Some(o.clone()),
@@ -2950,6 +2971,7 @@ impl Session {
         match e {
             Expr::BraceIndex(name, args) => match self.var_get(name).cloned() {
                 Some(Value::Cell(c)) => self.cell_pick(&c, args),
+                Some(Value::Object(o)) if o.class_name == "table" => self.table_brace_index(&o, args).map(|v| vec![v]),
                 Some(Value::Object(o)) => {
                     if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                         let s = self.subs_struct("{}", args)?;
@@ -2969,6 +2991,7 @@ impl Session {
                 // The base of the chain must yield exactly one value.
                 match self.eval(base)? {
                     Value::Cell(ca) => self.cell_pick(&ca, args),
+                    Value::Object(o) if o.class_name == "table" => self.table_brace_index(&o, args).map(|v| vec![v]),
                     Value::Object(o) => {
                         if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                             let s = self.subs_struct("{}", args)?;
@@ -3074,18 +3097,33 @@ impl Session {
                     if o.class_name == "table" && field != "Properties" {
                         // Dot-assignment adds/updates a table variable and
                         // keeps `Properties.VariableNames`/`NumRows` in sync.
-                        o.set_prop(field, new.clone());
+                        // Assigning an empty value removes an existing variable.
                         let mut names = table_var_names(&o);
-                        if !names.iter().any(|n| n == field) {
-                            names.push(field.clone());
-                        }
-                        let mut p = match o.prop("Properties") {
-                            Some(Value::Struct(s)) => s,
-                            _ => StructArray::new(),
+                        let existed = names.iter().any(|n| n == field);
+                        let empty_new = match &new {
+                            Value::Mat(m) => m.numel() == 0,
+                            Value::Cell(c) => c.numel() == 0,
+                            _ => false,
                         };
-                        p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.into_iter().map(Value::Str).collect())))?;
-                        p.set_field(0, "NumRows", Value::Num(value_row_count(&new) as f64))?;
-                        o.set_prop("Properties", Value::Struct(p));
+                        let nrows = table_num_rows(&o);
+                        if existed && empty_new {
+                            o.remove_prop(field);
+                            names.retain(|n| n != field);
+                            let rows = if names.is_empty() { 0 } else { nrows };
+                            o.set_prop("Properties", table_properties(&names, rows)?);
+                        } else {
+                            o.set_prop(field, new.clone());
+                            if !existed {
+                                names.push(field.clone());
+                            }
+                            let mut p = match o.prop("Properties") {
+                                Some(Value::Struct(s)) => s,
+                                _ => StructArray::new(),
+                            };
+                            p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.into_iter().map(Value::Str).collect())))?;
+                            p.set_field(0, "NumRows", Value::Num(value_row_count(&new) as f64))?;
+                            o.set_prop("Properties", Value::Struct(p));
+                        }
                     } else {
                         o.set_prop(field, new);
                     }
@@ -3134,6 +3172,7 @@ impl Session {
             }
             PathStep::Brace(ix) => {
                 let ca = match cur {
+                    Value::Object(o) if o.class_name == "table" => return self.table_assign(&o, ix, v),
                     Value::Object(o) => {
                         if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
                             let s = self.subs_struct("{}", ix)?;
@@ -3165,6 +3204,10 @@ impl Session {
     /// `assign_into` write.
     fn paren_apply(&mut self, target: Value, index: &[Expr], v: Value) -> Result<Value, LangError> {
         if let Value::Object(o) = &target {
+            if o.class_name == "table" {
+                let o = o.clone();
+                return self.table_assign(&o, index, v);
+            }
             if o.class_name == "containers.Map" {
                 if index.len() != 1 {
                     return Err(LangError::new("containers.Map assignment needs one key", 0));
@@ -3428,10 +3471,10 @@ impl Session {
         }
     }
 
-    /// `T(rows, cols)` for `table` objects: select rows and variables.
-    /// Supported subscripts are numeric indices, logical masks, `:` and
-    /// variable-name cellstrs/strings for the column position.
-    fn table_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+    /// Resolve a table's row and variable subscripts. Supported forms are
+    /// numeric indices, logical masks, `:`, and variable-name strings or
+    /// cellstrs for the column position.
+    fn table_selection(&mut self, o: &MObject, args: &[Expr]) -> Result<(Vec<usize>, Vec<usize>), LangError> {
         let names = table_var_names(o);
         let nrows = table_num_rows(o);
         let ncols = names.len();
@@ -3470,7 +3513,89 @@ impl Session {
         if cols.iter().any(|&c| c == 0 || c > ncols) {
             return Err(LangError::new("table: variable index out of bounds", 0));
         }
+        Ok((rows, cols))
+    }
+
+    /// `T(rows, cols)` for `table` objects: select rows and variables.
+    fn table_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, args)?;
         table_subset(o, &rows, &cols)
+    }
+
+    /// `T{rows, cols}` — table contents as one numeric matrix.
+    fn table_brace_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, args)?;
+        let names = table_var_names(o);
+        let mut columns: Vec<Vec<f64>> = Vec::with_capacity(cols.len());
+        for &c in &cols {
+            let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+            let value = o.prop(&name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let sliced = slice_table_rows(&value, &rows)?;
+            let m = sliced.to_matrix().map_err(|_| LangError::new(format!("table: contents of variable '{name}' are not numeric"), 0))?;
+            if m.numel() != rows.len() {
+                return Err(LangError::new(format!("table: variable '{name}' does not match the selected rows"), 0));
+            }
+            columns.push(m.data().to_vec());
+        }
+        let mut out = Matrix::zeros(rows.len(), cols.len());
+        for (c, col) in columns.iter().enumerate() {
+            for (r, &v) in col.iter().enumerate().take(rows.len()) {
+                let _ = out.set(r, c, v);
+            }
+        }
+        Ok(mat_or_num(out))
+    }
+
+    /// `T(rows, cols) = rhs` / `T{rows, cols} = rhs`, including row and
+    /// variable deletion with an empty right-hand side.
+    fn table_assign(&mut self, o: &MObject, index: &[Expr], rhs: Value) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, index)?;
+        let names = table_var_names(o);
+        let nrows = table_num_rows(o);
+        let all_rows = rows.len() == nrows && rows.iter().enumerate().all(|(i, &r)| r == i + 1);
+        let all_cols = cols.len() == names.len();
+        let empty_rhs = match &rhs {
+            Value::Mat(m) => m.numel() == 0,
+            Value::Cell(c) => c.numel() == 0,
+            _ => false,
+        };
+        if empty_rhs {
+            if all_cols && !all_rows {
+                return table_delete_rows(o, &rows);
+            }
+            if all_rows {
+                let keep: Vec<usize> = (1..=names.len()).filter(|c| !cols.contains(c)).collect();
+                return table_delete_vars(o, &keep);
+            }
+            return Err(LangError::new("table: deletion needs whole rows or whole variables", 0));
+        }
+        let rhs_table = match &rhs {
+            Value::Object(t) if t.class_name == "table" => Some(t),
+            _ => None,
+        };
+        let mut props = o.props_map();
+        for (j, &c) in cols.iter().enumerate() {
+            let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+            let target = props.field_at(0, &name).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let source = if let Some(t) = rhs_table {
+                let v = t.prop(&name).ok_or_else(|| LangError::new(format!("table: right-hand table has no variable '{name}'"), 0))?;
+                if table_num_rows(t) != rows.len() && table_num_rows(t) != 1 {
+                    return Err(LangError::new("table: right-hand table has the wrong number of rows", 0));
+                }
+                v
+            } else {
+                table_rhs_column(&rhs, j, cols.len(), rows.len())?
+            };
+            let updated = assign_table_rows(&target, &rows, &source)?;
+            props.set_field(0, &name, updated)?;
+        }
+        let mut p = match props.field_at(0, "Properties").cloned() {
+            Some(Value::Struct(s)) => s,
+            _ => StructArray::new(),
+        };
+        p.set_field(0, "NumRows", Value::Num(nrows as f64))?;
+        props.set_field(0, "Properties", Value::Struct(p))?;
+        Ok(Value::Object(MObject::owned("table".into(), props)))
     }
 
     /// Build the `subs` struct MATLAB passes to `subsref`/`subsasgn`.
@@ -14901,7 +15026,180 @@ fn slice_table_rows(v: &Value, rows: &[usize]) -> Result<Value, LangError> {
             }
             Ok(Value::Cell(out))
         }
+        _ if rows.is_empty() => Ok(Value::Mat(Matrix::zeros(0, 0))),
         other => Ok(other.clone()),
+    }
+}
+
+fn table_properties(names: &[String], nrows: usize) -> Result<Value, LangError> {
+    let mut p = StructArray::new();
+    p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.iter().cloned().map(Value::Str).collect())))?;
+    p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+    p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+    p.set_field(0, "NumRows", Value::Num(nrows as f64))?;
+    Ok(Value::Struct(p))
+}
+
+fn table_delete_rows(o: &MObject, rows: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let nrows = table_num_rows(o);
+    let mut keep = vec![true; nrows];
+    for &r in rows {
+        if let Some(slot) = keep.get_mut(r.saturating_sub(1)) {
+            *slot = false;
+        }
+    }
+    let kept: Vec<usize> = keep.iter().enumerate().filter_map(|(i, &k)| k.then_some(i + 1)).collect();
+    let mut props = StructArray::new();
+    for name in &names {
+        let value = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        props.set_field(0, name, slice_table_rows(&value, &kept)?)?;
+    }
+    props.set_field(0, "Properties", table_properties(&names, kept.len())?)?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn table_delete_vars(o: &MObject, keep: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let nrows = table_num_rows(o);
+    let mut kept_names = Vec::with_capacity(keep.len());
+    let mut props = StructArray::new();
+    for &c in keep {
+        let Some(name) = names.get(c.saturating_sub(1)) else { continue };
+        let value = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        props.set_field(0, name, value)?;
+        kept_names.push(name.clone());
+    }
+    let nrows = if kept_names.is_empty() { 0 } else { nrows };
+    props.set_field(0, "Properties", table_properties(&kept_names, nrows)?)?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+/// Pick the per-variable column of a numeric/cell right-hand side.
+fn table_rhs_column(rhs: &Value, j: usize, ncols: usize, nrows: usize) -> Result<Value, LangError> {
+    match rhs {
+        Value::Mat(m) => {
+            if m.numel() == 1 {
+                return Ok(Value::Num(m.get_linear(0).unwrap_or(0.0)));
+            }
+            if m.rows() == 1 && m.cols() == ncols {
+                return Ok(Value::Num(m.get(0, j).unwrap_or(0.0)));
+            }
+            if ncols == 1 && m.cols() == 1 && m.rows() == nrows {
+                return Ok(Value::Mat(m.clone()));
+            }
+            if ncols == 1 && m.rows() == 1 && m.cols() == nrows {
+                return Ok(Value::Mat(Matrix::col_vector(m.data().to_vec())));
+            }
+            if m.rows() == nrows && m.cols() == ncols {
+                let mut out = Matrix::zeros(nrows, 1);
+                for r in 0..nrows {
+                    let _ = out.set(r, 0, m.get(r, j).unwrap_or(0.0));
+                }
+                return Ok(Value::Mat(out));
+            }
+            Err(LangError::new("table: right-hand side size does not match the selected variables", 0))
+        }
+        Value::Cell(c) => {
+            if c.numel() == 1 {
+                return Ok(c.get_linear(0).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+            }
+            if c.rows == 1 && c.cols == ncols {
+                return Ok(c.get(0, j).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+            }
+            if ncols == 1 && c.cols == 1 && c.rows == nrows {
+                return Ok(Value::Cell(c.clone()));
+            }
+            if c.rows == nrows && c.cols == ncols {
+                let mut out = CellArray::new(nrows, 1);
+                for r in 0..nrows {
+                    if let Some(v) = c.get(r, j) {
+                        out.set(r, 0, v.clone());
+                    }
+                }
+                return Ok(Value::Cell(out));
+            }
+            Err(LangError::new("table: right-hand cell size does not match the selected variables", 0))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn assign_table_rows(target: &Value, rows: &[usize], src: &Value) -> Result<Value, LangError> {
+    match target {
+        Value::Mat(m) => {
+            let mut out = m.clone();
+            let scalar = match src {
+                Value::Num(x) => Some(*x),
+                Value::Mat(s) if s.numel() == 1 => s.get_linear(0),
+                _ => None,
+            };
+            if let Some(x) = scalar {
+                for &r in rows {
+                    for c in 0..out.cols() {
+                        let _ = out.set(r.saturating_sub(1), c, x);
+                    }
+                }
+                return Ok(mat_or_num(out));
+            }
+            let s = src.to_matrix()?;
+            if s.rows() == rows.len() && s.cols() == out.cols() {
+                for (i, &r) in rows.iter().enumerate() {
+                    for c in 0..out.cols() {
+                        let _ = out.set(r.saturating_sub(1), c, s.get(i, c).unwrap_or(0.0));
+                    }
+                }
+                return Ok(mat_or_num(out));
+            }
+            if rows.len() == 1 && s.numel() == out.cols() {
+                for c in 0..out.cols() {
+                    let _ = out.set(rows[0].saturating_sub(1), c, s.get_linear(c).unwrap_or(0.0));
+                }
+                return Ok(mat_or_num(out));
+            }
+            if out.cols() == 1 && s.numel() == rows.len() {
+                for (i, &r) in rows.iter().enumerate() {
+                    let _ = out.set(r.saturating_sub(1), 0, s.get_linear(i).unwrap_or(0.0));
+                }
+                return Ok(mat_or_num(out));
+            }
+            Err(LangError::new("table: variable value size does not match the selected rows", 0))
+        }
+        Value::Cell(c) => {
+            let mut out = c.clone();
+            let src_cell = match src {
+                Value::Cell(sc) => sc.clone(),
+                other => {
+                    let mut one = CellArray::new(1, 1);
+                    one.set(0, 0, other.clone());
+                    one
+                }
+            };
+            if src_cell.numel() != 1 && src_cell.rows != rows.len() {
+                return Err(LangError::new("table: cell value size does not match the selected rows", 0));
+            }
+            for (i, &r) in rows.iter().enumerate() {
+                for col in 0..out.cols {
+                    let pick = if src_cell.numel() == 1 {
+                        src_cell.get_linear(0).cloned()
+                    } else {
+                        src_cell.get(i, col.min(src_cell.cols.saturating_sub(1))).cloned()
+                    };
+                    if let Some(v) = pick {
+                        out.set(r.saturating_sub(1), col, v);
+                    }
+                }
+            }
+            Ok(Value::Cell(out))
+        }
+        Value::Num(_) | Value::Str(_) => {
+            if rows.len() == 1 {
+                Ok(src.clone())
+            } else {
+                Err(LangError::new("table: scalar variables cannot be assigned across multiple rows", 0))
+            }
+        }
+        _ => Err(LangError::new("table: unsupported variable type for assignment", 0)),
     }
 }
 
@@ -22042,6 +22340,80 @@ end",
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.get(0..4), Some(b"CDF\x01".as_slice()));
         rm_dir(&dir);
+    }
+
+    #[test]
+    fn table_subscripts_read_assign_delete() {
+        let mut s = Session::new();
+        s.run(
+            "T = table([1;2;3], [4;5;6], 'VariableNames', {'A','B'}); \
+             R = T([1 3],:); ra = R.A; rc = T{1,:}; rv = T{:,1}; rn = T(:, {'B'});",
+        )
+        .unwrap();
+        assert_eq!(s.get("ra").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        assert_eq!(s.get("rc").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())), Some((1, 2, vec![1.0, 4.0])));
+        assert_eq!(s.get("rv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(
+            s.get("rn").and_then(|v| match v {
+                Value::Object(o) => Some(o.prop_names()),
+                _ => None,
+            }),
+            Some(vec!["B".to_string(), "Properties".to_string()])
+        );
+
+        s.run("T(1,:) = [10 40]; T{2,:} = [20 30]; T(:,2) = [7;8;9];").unwrap();
+        assert_eq!(
+            s.get("T")
+                .and_then(|v| match v {
+                    Value::Object(o) => o.prop("A"),
+                    _ => None,
+                })
+                .and_then(|v| v.to_matrix().ok())
+                .map(|m| m.data().to_vec()),
+            Some(vec![10.0, 20.0, 3.0])
+        );
+        assert_eq!(
+            s.get("T")
+                .and_then(|v| match v {
+                    Value::Object(o) => o.prop("B"),
+                    _ => None,
+                })
+                .and_then(|v| v.to_matrix().ok())
+                .map(|m| m.data().to_vec()),
+            Some(vec![7.0, 8.0, 9.0])
+        );
+
+        // Logical row deletion uses the live table while resolving the mask.
+        s.run("T(T.A > 8, :) = []; h1 = height(T); a1 = T.A;").unwrap();
+        assert_eq!(s.get("h1"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("a1").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0]));
+
+        // Variable deletion by name, then add/remove through dot syntax.
+        s.run(
+            "T(:, {'B'}) = []; a_after = T.A; \
+             T2 = table([5;6], 'VariableNames', {'C'}); T2.D = [7;8]; T2.C = []; \
+             names = T2.Properties.VariableNames; h2 = height(T2); d2 = T2.D;",
+        )
+        .unwrap();
+        assert_eq!(s.get("a_after").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0]));
+        if let Some(Value::Cell(n)) = s.get("names") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("D".into())));
+        } else {
+            panic!("VariableNames is not a cell");
+        }
+        assert_eq!(s.get("h2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("d2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![7.0, 8.0]));
+
+        s.run("T2(T2.D > 7, :) = []; h3 = height(T2); T2(1) = []; h4 = height(T2);").unwrap();
+        assert_eq!(s.get("h3"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("h4"), Some(&Value::Num(0.0)));
+        s.run("try, T2(5,:) = [1]; catch e, terr = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("terr") {
+            assert!(m.contains("row index out of bounds"), "table error = {m}");
+        } else {
+            panic!("out-of-range row assignment did not error");
+        }
     }
 
     #[test]

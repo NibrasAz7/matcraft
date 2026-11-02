@@ -329,6 +329,10 @@
   `CLASS`) and variable `_Netcdf4Coordinates` into the classic dimension/
   variable model. A netCDF-C 4.10 fixture covers 2-D, 1-D coordinate,
   scalar and integer variables; classic CDF-1 writes remain the output path.
+- Table subscripting wave (2026-11): `T(rows,vars)` with numeric,
+  logical and name subscripts, single-subscript row selection, `T{rows,vars}`
+  numeric contents, row/variable assignment from matrices, cells or tables,
+  and deletion via `T(rows,:)=[]`, `T(:,vars)=[]` and `T.Var=[]`.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,
