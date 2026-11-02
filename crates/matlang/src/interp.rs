@@ -403,6 +403,15 @@ impl MObject {
         self.array.as_ref().map(|a| a.elements.clone()).unwrap_or_else(|| vec![self.clone()])
     }
 
+    /// Stable identity for handle objects (shared property store). Value
+    /// objects return 0; MCOS writing uses this to preserve cycles.
+    pub(crate) fn identity(&self) -> usize {
+        match &self.props {
+            ObjStore::Shared(s) => std::rc::Rc::as_ptr(s) as usize,
+            ObjStore::Owned(_) => 0,
+        }
+    }
+
     /// Restore handle semantics after loading: object files store only
     /// properties + class name, so the session reattaches the shared store
     /// and listener table when the class is a handle class.
@@ -21702,6 +21711,27 @@ end",
         let bytes = std::fs::read(&file).unwrap();
         let off = bytes.get(116..124).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).unwrap_or(0);
         assert!(off > 128, "MCOS subsystem offset = {off}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_array_nested() {
+        let dir = m_dir("mcoscomplex");
+        let file = dir.join("complex.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run("classdef McPart\n properties\n  x = 0\n end\nend").unwrap();
+        s.run("classdef McHolder\n properties\n  child\n end\nend").unwrap();
+        s.run(&format!(
+            "p1 = McPart(); p1.x = 1; p2 = McPart(); p2.x = 2; a = [p1 p2]; \
+             h = McHolder(); h.child = p1; save('{path}', 'a', 'h', '-mcos'); clear a h p1 p2; load('{path}'); \
+             ax2 = a(2).x; asz = size(a); hx = h.child.x; hc = class(h.child);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("ax2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("asz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("hx"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("hc"), Some(&Value::Str("McPart".into())));
         rm_dir(&dir);
     }
 

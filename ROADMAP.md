@@ -344,8 +344,9 @@
   rejected with a clear variable/class error instead of being misread.
 - MCOS-subsystem wave (2026-11): opaque `.mat` v5 variables are resolved
   through `FileWrapper__` metadata into class-tagged objects; `save(...,'-mcos')`
-  writes scalar objects as opaque records plus a subsystem, with a
-  fixture-backed reader test and a writer round trip.
+  writes scalar objects, object arrays and nested object-valued properties as
+  opaque records plus a subsystem, with fixture-backed reader tests and writer
+  round trips.
 - ODE-variant wave (2026-11): `ode23` uses the Bogacki-Shampine 3(2)
   tableau; `ode23s` reuses the TR-BDF2 stiff engine, with closed-form
   decay and stiff-decay regression tests.

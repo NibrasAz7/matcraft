@@ -811,6 +811,46 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_mcos_object_array_and_nested() {
+        let scalar = |class: &str, x: f64| {
+            let mut p = StructArray::new();
+            p.add_field("x");
+            p.set_field(0, "x", Value::Num(x)).unwrap();
+            MObject::from_saved(class.to_string(), p)
+        };
+        let arr = MObject::array("Pair".into(), vec![scalar("Pair", 1.0), scalar("Pair", 2.0)], (1, 2));
+        let mut inner = StructArray::new();
+        inner.add_field("x");
+        inner.set_field(0, "x", Value::Num(9.0)).unwrap();
+        let mut outer = StructArray::new();
+        outer.add_field("child");
+        outer.set_field(0, "child", Value::Object(MObject::from_saved("Inner".into(), inner))).unwrap();
+        outer.add_field("y");
+        outer.set_field(0, "y", Value::Num(3.0)).unwrap();
+        let vars = vec![("a".to_string(), Value::Object(arr)), ("outer".to_string(), Value::Object(MObject::from_saved("Outer".into(), outer)))];
+        let tmp = std::env::temp_dir().join(format!("matcraft_mcos_arr_{}.mat", std::process::id()));
+        let p = tmp.to_string_lossy().to_string();
+        write_mcos(&p, &vars).unwrap();
+        let bytes = std::fs::read(&tmp).unwrap();
+        let got = read(&bytes).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let (_, Value::Object(a)) = got.iter().find(|(n, _)| n == "a").unwrap() else { panic!("a is not an object") };
+        assert_eq!(a.array_dims(), vec![1, 2]);
+        let elems = a.array_elements();
+        assert_eq!(elems[0].props_map().field_at(0, "x"), Some(&Value::Num(1.0)));
+        assert_eq!(elems[1].props_map().field_at(0, "x"), Some(&Value::Num(2.0)));
+
+        let (_, Value::Object(o)) = got.iter().find(|(n, _)| n == "outer").unwrap() else { panic!("outer is not an object") };
+        assert_eq!(o.class_name, "Outer");
+        let props = o.props_map();
+        assert_eq!(props.field_at(0, "y"), Some(&Value::Num(3.0)));
+        let Some(Value::Object(child)) = props.field_at(0, "child") else { panic!("child is not an object") };
+        assert_eq!(child.class_name, "Inner");
+        assert_eq!(child.props_map().field_at(0, "x"), Some(&Value::Num(9.0)));
+    }
+
+    #[test]
     fn roundtrip_sparse() {
         let s = matcore::SparseMat::from_triplets(3, 3, &[1.0, 2.0, 3.0], &[1.0, 3.0, 2.0], &[10.0, 20.0, 30.0]).unwrap();
         let got = roundtrip(vec![("s".to_string(), Value::Sparse(s))]);

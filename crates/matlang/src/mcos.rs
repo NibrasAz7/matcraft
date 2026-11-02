@@ -406,7 +406,7 @@ impl Ctx {
         Ok((off, n))
     }
 
-    fn build_object(&self, object_id: u32) -> Result<Value, String> {
+    fn build_object(&self, object_id: u32, depth: usize) -> Result<Value, String> {
         let meta = self.object_meta(object_id)?;
         let class_id = meta.first().copied().unwrap_or(0);
         let class = self.class_name(class_id)?;
@@ -416,7 +416,7 @@ impl Ctx {
                 for (name, values) in &def.fields {
                     if let Some(v) = values.first() {
                         props.add_field(name);
-                        props.set_field(0, name, v.to_value()?).map_err(|e| e.message)?;
+                        props.set_field(0, name, self.raw_value(v, depth + 1)?).map_err(|e| e.message)?;
                     }
                 }
             }
@@ -432,7 +432,7 @@ impl Ctx {
                 let name = self.name(name_idx)?;
                 let value = match ptype {
                     0 => Value::Str(self.name(value_idx)?),
-                    1 => self.prop_vals.get(value_idx as usize).ok_or("mcos: property value out of range")?.to_value()?,
+                    1 => self.raw_value(self.prop_vals.get(value_idx as usize).ok_or("mcos: property value out of range")?, depth + 1)?,
                     2 => Value::Num(value_idx as f64),
                     other => return Err(format!("mcos: unknown property type {other}")),
                 };
@@ -444,7 +444,34 @@ impl Ctx {
         Ok(Value::Object(MObject::from_saved(class, props)))
     }
 
-    fn resolve_opaque(&self, ty: &str, class_hint: &str, refs: &[u32]) -> Result<Value, String> {
+    fn raw_value(&self, raw: &Raw, depth: usize) -> Result<Value, String> {
+        if depth > 32 {
+            return Err("mcos: field nesting is too deep".into());
+        }
+        match raw {
+            Raw::Cell { rows, cols, items } => {
+                let vals = items.iter().map(|v| self.raw_value(v, depth + 1)).collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Cell(CellArray::from_col_major(*rows, *cols, vals)))
+            }
+            Raw::Struct(s) => {
+                let mut sa = StructArray::with_dims(s.rows.max(1), s.cols.max(1));
+                for (name, values) in &s.fields {
+                    sa.add_field(name);
+                    for (i, v) in values.iter().enumerate() {
+                        sa.set_field(i, name, self.raw_value(v, depth + 1)?).map_err(|e| e.message)?;
+                    }
+                }
+                Ok(Value::Struct(sa))
+            }
+            Raw::U32(v) if v.first() == Some(&MCOS_MAGIC) => self.resolve_opaque("MCOS", "", v, depth + 1),
+            _ => raw.to_value(),
+        }
+    }
+
+    fn resolve_opaque(&self, ty: &str, class_hint: &str, refs: &[u32], depth: usize) -> Result<Value, String> {
+        if depth > 32 {
+            return Err("mcos: object reference nesting is too deep (cycle?)".into());
+        }
         if ty != "MCOS" {
             return Err(format!("mcos: type system '{ty}' is not supported"));
         }
@@ -476,7 +503,7 @@ impl Ctx {
         };
         let mut elements = Vec::with_capacity(n);
         for &id in ids {
-            match self.build_object(id)? {
+            match self.build_object(id, depth + 1)? {
                 Value::Object(o) => elements.push(o),
                 _ => return Err("mcos: object metadata did not build an object".into()),
             }
@@ -497,7 +524,7 @@ impl Ctx {
         let Raw::U32(refs) = data.as_ref() else {
             return Err("mcos: object reference is not a uint32 matrix".into());
         };
-        let value = self.resolve_opaque(&type_system, &class, refs)?;
+        let value = self.resolve_opaque(&type_system, &class, refs, 0)?;
         Ok((name, value))
     }
 }
@@ -619,99 +646,169 @@ fn finish_element(payload: Vec<u8>) -> Vec<u8> {
 }
 
 /// Encode scalar objects as MCOS opaque records plus the subsystem block.
+struct Encoder {
+    names: NameTable,
+    classes: Vec<u32>,
+    class_ids: Vec<String>,
+    object_meta: Vec<u32>,
+    prop_blocks: Vec<Vec<u32>>,
+    prop_vals: Vec<Vec<u8>>,
+    seen: std::collections::HashMap<usize, u32>,
+}
+
+impl Encoder {
+    fn new() -> Self {
+        Encoder {
+            names: NameTable { names: Vec::new() },
+            classes: vec![0, 0, 0, 0],
+            class_ids: Vec::new(),
+            object_meta: vec![0; 6],
+            prop_blocks: vec![Vec::new()],
+            prop_vals: Vec::new(),
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    fn class_id(&mut self, class_name: &str) -> u32 {
+        if let Some(pos) = self.class_ids.iter().position(|c| c == class_name) {
+            return pos as u32 + 1;
+        }
+        let cname = class_name.rsplit('.').next().unwrap_or(class_name).to_string();
+        let cidx = self.names.index(&cname);
+        let ns = class_name.rsplit_once('.').map(|(ns, _)| self.names.index(ns)).unwrap_or(0);
+        self.classes.extend_from_slice(&[ns, cidx, 0, 0]);
+        self.class_ids.push(class_name.to_string());
+        self.class_ids.len() as u32
+    }
+
+    fn reserve(&mut self, class_id: u32, identity: usize) -> u32 {
+        let oid = (self.object_meta.len() / 6) as u32;
+        self.object_meta.extend_from_slice(&[class_id, 0, 0, 0, oid, 0]);
+        self.prop_blocks.push(Vec::new());
+        if identity != 0 {
+            self.seen.insert(identity, oid);
+        }
+        oid
+    }
+
+    fn encode_object(&mut self, obj: &MObject, depth: usize) -> Result<u32, String> {
+        if depth > 32 {
+            return Err("mcos: nested objects are too deep (cycle?)".into());
+        }
+        if obj.is_array() {
+            return Err("mcos: internal error - array passed to scalar encoder".into());
+        }
+        if obj.class_name == "COM" {
+            return Err("mcos: COM objects are not serializable".into());
+        }
+        let identity = obj.identity();
+        if identity != 0 {
+            if let Some(id) = self.seen.get(&identity) {
+                return Ok(*id);
+            }
+        }
+        let class_id = self.class_id(&obj.class_name);
+        let oid = self.reserve(class_id, identity);
+        let props = obj.props_map();
+        let fields = obj.prop_names();
+        let mut block = vec![fields.len() as u32];
+        for f in &fields {
+            let value = props.field_at(0, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let name_idx = self.names.index(f);
+            let encoded = match &value {
+                Value::Object(child) => self.encode_ref(child, depth + 1)?,
+                _ => value_element("", &value)?,
+            };
+            block.extend_from_slice(&[name_idx, 1, self.prop_vals.len() as u32]);
+            self.prop_vals.push(encoded);
+        }
+        if block.len() % 2 == 1 {
+            block.push(0);
+        }
+        if let Some(slot) = self.prop_blocks.get_mut(oid as usize) {
+            *slot = block;
+        }
+        Ok(oid)
+    }
+
+    fn encode_ref(&mut self, obj: &MObject, depth: usize) -> Result<Vec<u8>, String> {
+        let elements = obj.array_elements();
+        let Some(first) = elements.first() else { return Err("mcos: empty object array".into()) };
+        let class_name = first.class_name.clone();
+        let mut ids = Vec::with_capacity(elements.len());
+        for el in &elements {
+            if el.class_name != class_name {
+                return Err("mcos: object array has mixed classes".into());
+            }
+            ids.push(self.encode_object(el, depth + 1)?);
+        }
+        let dims = obj.array_dims();
+        let class_id = self.class_id(&class_name);
+        let mut refs = vec![MCOS_MAGIC, 2, dims.first().copied().unwrap_or(1) as u32, dims.get(1).copied().unwrap_or(1) as u32];
+        refs.extend(ids);
+        refs.push(class_id);
+        Ok(uint32_matrix("", &refs, refs.len(), 1))
+    }
+}
+
+/// Encode scalar objects and object arrays as MCOS opaque records.
 pub(crate) fn encode(vars: &[(String, Value)]) -> Result<Option<Encoded>, String> {
-    let objects: Vec<(&String, &MObject)> = vars
-        .iter()
-        .filter_map(|(n, v)| match v {
-            Value::Object(o) if o.class_name != "COM" => Some((n, o)),
-            _ => None,
-        })
-        .collect();
-    if objects.is_empty() {
+    let mut enc = Encoder::new();
+    let mut records = Vec::new();
+    for (name, value) in vars {
+        let Value::Object(obj) = value else { continue };
+        if obj.class_name == "COM" {
+            return Err(format!("cannot save '{name}' - COM objects are not serializable"));
+        }
+        let refs = enc.encode_ref(obj, 0)?;
+        let rec = opaque_matrix(name, "MCOS", &obj.class_name, &refs);
+        records.push((name.clone(), finish_element(rec)));
+    }
+    if records.is_empty() {
         return Ok(None);
     }
-    let mut names = NameTable { names: Vec::new() };
-    let mut classes: Vec<u32> = vec![0, 0, 0, 0];
-    let mut class_ids: Vec<String> = Vec::new();
-    let mut object_meta: Vec<u32> = vec![0; 6];
-    let mut prop_meta: Vec<u32> = Vec::new();
-    let mut prop_vals: Vec<Vec<u8>> = Vec::new();
-    let mut records = Vec::with_capacity(objects.len());
-    for (name, obj) in &objects {
-        if obj.is_array() {
-            return Err(format!("cannot save '{name}' as MCOS - object arrays are not supported yet"));
-        }
-        let class_name = obj.class_name.clone();
-        let class_id = if let Some(pos) = class_ids.iter().position(|c| c == &class_name) {
-            pos as u32 + 1
-        } else {
-            let cname = class_name.rsplit('.').next().unwrap_or(&class_name).to_string();
-            let cidx = names.index(&cname);
-            let ns = class_name.rsplit_once('.').map(|(ns, _)| names.index(ns)).unwrap_or(0);
-            classes.extend_from_slice(&[ns, cidx, 0, 0]);
-            class_ids.push(class_name.clone());
-            class_ids.len() as u32
-        };
-        let oid = object_meta.len() / 6;
-        object_meta.extend_from_slice(&[class_id, 0, 0, 0, oid as u32, 0]);
-        let props = obj.props_map();
-        let fields: Vec<String> = obj.prop_names();
-        prop_meta.push(fields.len() as u32);
-        for f in &fields {
-            let idx = names.index(f);
-            prop_meta.extend_from_slice(&[idx, 1, prop_vals.len() as u32]);
-            let value = props.field_at(0, f).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
-            if matches!(value, Value::Object(_)) {
-                return Err(format!("cannot save '{name}' as MCOS - nested object property '{f}' is not supported yet"));
-            }
-            prop_vals.push(value_element("", &value)?);
-        }
-        if prop_meta.len() % 2 == 1 {
-            prop_meta.push(0);
-        }
-        let refs = vec![MCOS_MAGIC, 2, 1, 1, oid as u32, class_id];
-        let refs_mat = uint32_matrix("", &refs, refs.len(), 1);
-        let rec = opaque_matrix(name, "MCOS", &class_name, &refs_mat);
-        records.push(((*name).clone(), finish_element(rec)));
+    let mut prop_meta = Vec::new();
+    for block in enc.prop_blocks.iter().skip(1) {
+        prop_meta.extend_from_slice(block);
     }
-    // Metadata regions.
     let names_str = {
         let mut s = String::new();
-        for n in &names.names {
+        for n in &enc.names.names {
             s.push_str(n);
             s.push('\0');
         }
         s.into_bytes()
     };
-    let names_padded = names_str.len().div_ceil(8) * 8;
-    let mut names_bytes = names_str;
-    names_bytes.resize(names_padded, 0);
-    let classes_bytes: Vec<u8> = classes.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let objects_bytes: Vec<u8> = object_meta.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let names_bytes = {
+        let mut b = names_str;
+        let padded = b.len().div_ceil(8) * 8;
+        b.resize(padded, 0);
+        b
+    };
+    let classes_bytes: Vec<u8> = enc.classes.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let objects_bytes: Vec<u8> = enc.object_meta.iter().flat_map(|v| v.to_le_bytes()).collect();
     let props_bytes: Vec<u8> = prop_meta.iter().flat_map(|v| v.to_le_bytes()).collect();
     let dyn_props: Vec<u32> = vec![0, 0];
     let dyn_bytes: Vec<u8> = dyn_props.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let region6: Vec<u8> = Vec::new();
     let region7 = [0u8; 8];
     let mut offsets = [0u32; 8];
     let mut pos = 40usize + names_bytes.len();
     offsets[0] = pos as u32;
     pos += classes_bytes.len();
     offsets[1] = pos as u32;
-    offsets[2] = pos as u32; // no saveobj block
+    offsets[2] = pos as u32;
     pos += objects_bytes.len();
     offsets[3] = pos as u32;
     pos += props_bytes.len();
     offsets[4] = pos as u32;
     pos += dyn_bytes.len();
     offsets[5] = pos as u32;
-    pos += region6.len();
     offsets[6] = pos as u32;
     pos += region7.len();
     offsets[7] = pos as u32;
     let mut metadata = Vec::with_capacity(pos);
     metadata.extend_from_slice(&FWRAP_VERSION.to_le_bytes());
-    metadata.extend_from_slice(&(names.names.len() as u32).to_le_bytes());
+    metadata.extend_from_slice(&(enc.names.names.len() as u32).to_le_bytes());
     for o in offsets {
         metadata.extend_from_slice(&o.to_le_bytes());
     }
@@ -720,13 +817,12 @@ pub(crate) fn encode(vars: &[(String, Value)]) -> Result<Option<Encoded>, String
     metadata.extend_from_slice(&objects_bytes);
     metadata.extend_from_slice(&props_bytes);
     metadata.extend_from_slice(&dyn_bytes);
-    metadata.extend_from_slice(&region6);
     metadata.extend_from_slice(&region7);
-    let nclasses = classes.len() / 4;
-    let mut cell_items = Vec::with_capacity(prop_vals.len() + 5);
+    let nclasses = enc.classes.len() / 4;
+    let mut cell_items = Vec::with_capacity(enc.prop_vals.len() + 5);
     cell_items.push(uint8_matrix("", &metadata));
     cell_items.push(empty_cell(""));
-    cell_items.extend(prop_vals);
+    cell_items.extend(enc.prop_vals);
     let c3: Vec<Vec<u8>> = (0..nclasses).map(|_| empty_struct("", 1, 0)).collect();
     cell_items.push(cell_matrix(&c3, nclasses, 1));
     cell_items.push(matrix_element("", MX_INT32, 0, &[1, 1], MI_INT32, &0i32.to_le_bytes()));

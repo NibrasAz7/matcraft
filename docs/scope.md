@@ -21,7 +21,7 @@ These are tracked as post-1.0 depth work, not as incomplete blocks.
 
 | Area | Status | Reason |
 | --- | --- | --- |
-| MCOS object arrays / nested objects | Scalar objects read/write supported | Object-array reference sets and nested object property graphs need additional subsystem bookkeeping; unsupported forms report a clear error. |
+| MCOS cyclic handle graphs | Depth guarded | Cyclic handle-object graphs exceed the reader depth guard and report an error; acyclic scalar/array/nested graphs are supported. |
 | Advanced control | complex `zpk`, `pidtune`, MIMO `nyquist`/`margin` | Requires multi-input/output frequency-response design and tuning algorithms beyond the shipped SISO/MIMO-response surface. |
 | ODE variants | `dde23` | Delay differential equations need history functions and a different stepping model. |
 | Statistics depth | Weibull/lognormal/kernel `fitdist`, `tLocationScale`, `chi2gof`, `tsne` | Additional MLE families and embedding algorithms; existing distributions, ANOVA and UMAP are shipped. |
