@@ -169,12 +169,13 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   own, duplicates overwritten), then the `methods`-block function named
   `Name` runs as the constructor with the object pre-bound to its first
   output. A class with no constructor method just gets defaults.
-- Section/class attribute lists — `classdef (Sealed, …)`,
+- Section/class attribute lists — `classdef (Sealed, Abstract)`,
   `properties (Access = private)`, `properties (SetAccess = protected,
-  GetAccess = public, Dependent)`, `methods (Static = false)` — parse in
-  every form (`name`, `name = value`, comma or space separated). They are
-  accepted for compatibility, not enforced, **except** `methods (Static)`
-  which drops the implicit object argument.
+  GetAccess = public, Dependent)`, `methods (Static = false, Abstract)`
+  — parse in every form (`name`, `name = value`, comma or space
+  separated). `Access`/`GetAccess`/`SetAccess`, `Constant`, `Dependent`,
+  `Abstract` and `Sealed` are enforced at member access, construction and
+  subclassing time; `Static` drops the implicit object argument.
 - Properties: `obj.prop` reads, `obj.prop = v` writes (also through
   chains like `obj.a.b(2)`). Writing an undeclared property creates it —
   MATLAB errors there; the deviation keeps ad-hoc tagging working.
@@ -208,6 +209,16 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   Superclasses struct), `ismethod`, `isprop`, `fieldnames`,
   `get(obj,'p')`/`get(obj)`, `set(obj,'p',v,…)` (returns the updated
   object), `disp`/`display` honor a class `display` method.
+- Handle events: `addlistener(obj,'Event',@callback)` registers a
+  listener (returns a `listener` object whose `delete` unregisters it) and
+  `notify(obj,'Event')` calls every enabled callback with
+  `(source, eventData)`; the event data struct carries `Source`,
+  `EventName` and optional `Data`. Listener registration is limited to
+  handle classes.
+- Object arrays: `a(2) = Pt(...)`, `a(3).x = v`, `a(i).p` reads,
+  `a(i) = []` deletes, `size`/`numel` report the array shape, and
+  `[a b]`/`[a; b]` concatenate objects of the same class. Element methods
+  and event stores live on each scalar element.
 - Operator overloads: `+ - * .* / ./ \ ^ .^` map to
   `plus minus mtimes times mrdivide rdivide mldivide mpower power`,
   comparisons to `eq ne lt le gt ge`, `& |` to `and or`, `-x +x ~x` to
@@ -215,10 +226,9 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   `[a b]`/`[a; b]` object literals to `horzcat`/`vertcat` — when the
   class defines the method, else a clear "not defined for class" error.
 - `Class.member` evaluates an `enumeration` member's backing value.
-  Not in (parse harmlessly or error clearly): object arrays, `events`
-  listeners, `Constant`/`Dependent`/`Abstract`/`Sealed`/`Hidden`
-  enforcement, `Access` visibility, `superclasses` objects, packages,
-  `handle.notify`, COM automation, `.mat` save/load of objects (errors),
+  Not in (parse harmlessly or error clearly): packages, `handle.notify`'s
+  built-in lifecycle events beyond declared class events, enumeration
+  objects, COM automation, `.mat` save/load of objects (errors),
   `subsref`/`subsasgn`, `builtin('method', obj, …)` dispatch, dynamic props.
 
 ## Builtin library
@@ -255,7 +265,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Predicates | `isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isa isequal isequaln isobject` — `isa(obj,'C')` covers ancestors and `'handle'` |
 | Strings | `num2str int2str mat2str str2double str2num strcmp strcmpi strncmp strncmpi strcat upper lower strtrim strrep erase replace findstr extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines strfind strtok strmatch cellstr blanks deblank str2mat double logical char` + regex `regexp regexpi regexprep` - `str2double` maps cellstr/string arrays elementwise, `strcmp`/`strcmpi` return logical arrays for cellstr inputs, `erase`/`replace` work on strings or cellstr, and the extract/insert/predicate helpers plus `splitlines`/`readlines` cover line-oriented text (Rust regex syntax; outputs `'start' 'end' 'matchextents' 'match' 'tokens' 'split'`, options `'once' 'ignorecase' 'matchcase'`, `regexprep` honours `$1` group refs; look-around/backrefs are unsupported) |
 | Cells | `cell iscell iscellstr cell2mat num2cell celldisp` (`num2cell(A,dim)`, `num2cell` on char) |
-| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` - `fieldnames`/`isfield`/`get`/`set` also take objects; `methods`/`properties`/`events`/`metaclass`/`ismethod`/`isprop` list class members |
+| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` - `fieldnames`/`isfield`/`get`/`set` also take objects; `methods`/`properties`/`events`/`metaclass`/`ismethod`/`isprop` list class members; `addlistener`/`notify` dispatch handle events |
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |

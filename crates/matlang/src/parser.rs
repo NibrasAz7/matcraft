@@ -573,7 +573,7 @@ impl Parser {
     fn parse_classdef(&mut self, depth: usize) -> Result<Stmt, LangError> {
         self.next(); // 'classdef'
                      // Optional class attributes: `classdef (Sealed, …) Name`.
-        let _ = self.attr_parens()?;
+        let class_attrs = attr_map(&self.attr_parens()?);
         let name = match self.next() {
             Tok::Ident(n) => n,
             t => return self.err(format!("expected a class name after 'classdef', found {t:?}")),
@@ -593,14 +593,14 @@ impl Parser {
             match self.peek() {
                 Tok::Ident(k) if k == "properties" => {
                     self.next();
-                    let _ = self.attr_parens()?;
-                    self.class_props(&mut props, depth)?;
+                    let attrs = attr_map(&self.attr_parens()?);
+                    self.class_props(&mut props, &attrs, depth)?;
                 }
                 Tok::Ident(k) if k == "methods" => {
                     self.next();
-                    let attrs = self.attr_parens()?;
-                    let is_static = attr_bool(&attrs, "Static");
-                    self.class_methods(&mut methods, is_static, depth)?;
+                    let attrs = attr_map(&self.attr_parens()?);
+                    let is_static = attrs.iter().any(|(k, v)| k == "Static" && v != "false");
+                    self.class_methods(&mut methods, is_static, &attrs, depth)?;
                 }
                 Tok::Ident(k) if k == "enumeration" => {
                     self.next();
@@ -610,11 +610,11 @@ impl Parser {
                 Tok::Ident(k) if k == "events" => {
                     self.next();
                     let _ = self.attr_parens()?;
-                    self.class_props(&mut events, depth)?;
+                    self.class_props(&mut events, &[], depth)?;
                 }
                 Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
                     self.next();
-                    return Ok(Stmt::ClassDef { name, supers, props, methods, enums, events });
+                    return Ok(Stmt::ClassDef { name, supers, props, methods, enums, events, attrs: class_attrs });
                 }
                 Tok::Eof => return self.err("missing 'end' for 'classdef'"),
                 t => return self.err(format!("expected a classdef section or 'end', found {t:?}")),
@@ -624,7 +624,7 @@ impl Parser {
 
     /// `name` lines with an optional `= expr` default, up to the closing
     /// `end` (consumed) — a `properties` (or `events`) block.
-    fn class_props(&mut self, out: &mut Vec<ClassProp>, depth: usize) -> Result<(), LangError> {
+    fn class_props(&mut self, out: &mut Vec<ClassProp>, attrs: &[(String, String)], depth: usize) -> Result<(), LangError> {
         loop {
             self.skip_separators();
             match self.peek() {
@@ -642,7 +642,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    out.push(ClassProp { name: n, default });
+                    out.push(ClassProp { name: n, default, attrs: attrs.to_vec() });
                 }
                 t => return self.err(format!("expected a property name or 'end', found {t:?}")),
             }
@@ -670,7 +670,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    out.push(ClassProp { name: n, default });
+                    out.push(ClassProp { name: n, default, attrs: Vec::new() });
                 }
                 t => return self.err(format!("expected an enumeration member or 'end', found {t:?}")),
             }
@@ -680,7 +680,7 @@ impl Parser {
     /// `methods`-block items up to `end` (consumed): `function`
     /// definitions plus bodiless signatures (`out = f(args)` — abstract
     /// or implemented elsewhere in the file/`@dir`).
-    fn class_methods(&mut self, out: &mut Vec<ClassMethod>, is_static: bool, depth: usize) -> Result<(), LangError> {
+    fn class_methods(&mut self, out: &mut Vec<ClassMethod>, is_static: bool, attrs: &[(String, String)], depth: usize) -> Result<(), LangError> {
         // A method body also ends at the next section keyword — inside a
         // classdef those names are sections, not callables.
         const SECTION_STOPS: &[&str] = &["properties", "methods", "enumeration", "events"];
@@ -703,10 +703,10 @@ impl Parser {
                         let Stmt::Function { name, params, outputs, body } = f else {
                             return self.err("internal: expected a function definition");
                         };
-                        out.push(ClassMethod { name, params, outputs, body, is_static });
+                        out.push(ClassMethod { name, params, outputs, body, is_static, attrs: attrs.to_vec() });
                     }
                 }
-                _ => out.push(self.method_signature(is_static)?),
+                _ => out.push(self.method_signature(is_static, attrs)?),
             }
         }
     }
@@ -714,7 +714,7 @@ impl Parser {
     /// A bodiless method signature: `[a b] = f(p)` | `a = f(p)` |
     /// `f(p)` | `f`. No `function` keyword and no body — the
     /// declaration form abstract/extern methods use.
-    fn method_signature(&mut self, is_static: bool) -> Result<ClassMethod, LangError> {
+    fn method_signature(&mut self, is_static: bool, attrs: &[(String, String)]) -> Result<ClassMethod, LangError> {
         let mut outputs = Vec::new();
         if self.peek() == &Tok::LBracket {
             self.next();
@@ -752,7 +752,7 @@ impl Parser {
             }
         }
         let _ = self.stmt_end()?;
-        Ok(ClassMethod { name, params, outputs, body: Vec::new(), is_static })
+        Ok(ClassMethod { name, params, outputs, body: Vec::new(), is_static, attrs: attrs.to_vec() })
     }
 
     /// `a.b.C` — a possibly package-qualified name.
@@ -1188,21 +1188,34 @@ type FieldLhs = (String, Vec<PathStep>);
 
 /// `Name` in a classdef attribute list means `Name = true` unless it is
 /// followed by `= false`/`= 0` (`methods (Static = false)` counts false).
-fn attr_bool(attrs: &[Tok], name: &str) -> bool {
-    for (i, t) in attrs.iter().enumerate() {
-        if !matches!(t, Tok::Ident(n) if n == name) {
-            continue;
+/// Decode an attribute token list (`Access = private, Static, …`) into
+/// name → value pairs. A bare flag is `true`.
+fn attr_map(attrs: &[Tok]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < attrs.len() {
+        if let Tok::Ident(name) = &attrs[i] {
+            if attrs.get(i + 1) == Some(&Tok::Eq) {
+                if let Some(v) = attrs.get(i + 2) {
+                    let value = match v {
+                        Tok::Ident(s) | Tok::Str(s) => s.clone(),
+                        Tok::Num(n) => n.to_string(),
+                        Tok::Tilde => "false".into(),
+                        _ => "true".into(),
+                    };
+                    out.push((name.clone(), value));
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push((name.clone(), "true".into()));
         }
-        return match (attrs.get(i + 1), attrs.get(i + 2)) {
-            (Some(Tok::Eq), Some(Tok::Ident(v))) => matches!(v.as_str(), "true" | "on" | "yes"),
-            (Some(Tok::Eq), Some(Tok::Num(v))) => *v != 0.0,
-            _ => true,
-        };
+        i += 1;
     }
-    false
+    out
 }
 
-/// Surface text for a token — used when raw source is needed back for a
+/// Surface text for a token - used when raw source is needed back for a
 /// command-syntax word or a `!` shell-escape line. `None` for tokens that
 /// have no sensible spelling in that context.
 fn tok_text(t: &Tok) -> Option<String> {

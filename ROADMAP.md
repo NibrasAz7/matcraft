@@ -271,6 +271,10 @@
 - Editor wave (2026-11): MATLAB-style syntax colours and an Excel-style
   function-signature popup that follows the caret, highlights the current
   argument and understands local `function` definitions.
+- Class wave (2026-11): `addlistener`/`notify` handle events, object
+  arrays with growth/deletion/concatenation, and enforced
+  `Access`/`GetAccess`/`SetAccess`, `Constant`, `Dependent`, `Abstract`
+  and `Sealed` attributes.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,

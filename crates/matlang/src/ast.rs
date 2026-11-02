@@ -173,6 +173,8 @@ pub enum Stmt {
         enums: Vec<ClassProp>,
         /// `events` names, in declaration order.
         events: Vec<ClassProp>,
+        /// Class-level attributes (`Sealed`, `Abstract`, …), name → value.
+        attrs: Vec<(String, String)>,
     },
 }
 
@@ -182,6 +184,8 @@ pub enum Stmt {
 pub struct ClassProp {
     pub name: String,
     pub default: Option<Expr>,
+    /// Section attributes applied to this member, name → value.
+    pub attrs: Vec<(String, String)>,
 }
 
 /// A `methods`-block entry: either a `function` definition or a bodiless
@@ -195,6 +199,8 @@ pub struct ClassMethod {
     pub outputs: Vec<String>,
     pub body: Vec<Stmt>,
     pub is_static: bool,
+    /// Section/method attributes (`Access`, `Abstract`, …), name → value.
+    pub attrs: Vec<(String, String)>,
 }
 
 /// One slot of a `[a, b] = f(…)` multi-output target list.

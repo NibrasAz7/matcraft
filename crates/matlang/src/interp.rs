@@ -119,15 +119,70 @@ struct FuncDef {
     outputs: Vec<String>,
     body: Vec<Stmt>,
     /// Path of the `.m` file the function was defined in ("" for eval'd
-    /// code) — backs `mfilename`.
+    /// code) - backs `mfilename`.
     file: String,
-    /// `methods (Static)` — the call passes no implicit object argument.
+    /// `methods (Static)` - the call passes no implicit object argument.
     is_static: bool,
+    /// Class that owns a method definition (`None` for plain functions);
+    /// drives `private`/`protected` access checks.
+    owner: Option<String>,
+}
+
+/// Member visibility from a classdef attribute list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Access {
+    #[default]
+    Public,
+    Protected,
+    Private,
+}
+
+impl Access {
+    fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "private" => Access::Private,
+            "protected" => Access::Protected,
+            _ => Access::Public,
+        }
+    }
+
+    fn allows(self, owner: &str, caller: Option<&str>, is_subclass: bool) -> bool {
+        match self {
+            Access::Public => true,
+            Access::Private => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)),
+            Access::Protected => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)) || is_subclass,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PropAttr {
+    get_access: Access,
+    set_access: Access,
+    constant: bool,
+    dependent: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MethodAttr {
+    access: Access,
+    abstract_: bool,
+}
+
+/// One live `addlistener` registration on a handle object.
+#[derive(Debug, Clone)]
+struct EventListener {
+    id: u64,
+    event: String,
+    callback: Value,
+    enabled: bool,
 }
 
 /// A `classdef` (or an `@dir` class shell) known to the session.
 #[derive(Debug, Clone, Default)]
 struct ClassDef {
+    /// Class name as declared.
+    name: String,
     /// `< super` names verbatim; resolution walks the first one (and
     /// compares on its last `.`-separated component).
     supers: Vec<String>,
@@ -143,8 +198,42 @@ struct ClassDef {
     /// `events` names, in declaration order (inherited ones are resolved
     /// through `supers` on lookup).
     events: Vec<String>,
+    /// Property attributes by declared name (`Access`, `Constant`, …).
+    prop_attrs: HashMap<String, PropAttr>,
+    /// Method attributes by declared name (`Access`, `Abstract`, …).
+    method_attrs: HashMap<String, MethodAttr>,
+    /// Class-level attributes (`Sealed`, `Abstract`, …).
+    class_attrs: Vec<(String, String)>,
     /// `.m` file the classdef came from ("" for session-eval'd defs).
     file: String,
+}
+
+impl ClassDef {
+    fn attr_flag(&self, name: &str) -> bool {
+        attr_flag(&self.class_attrs, name)
+    }
+}
+
+fn attr_flag(attrs: &[(String, String)], name: &str) -> bool {
+    attrs.iter().any(|(k, v)| k.eq_ignore_ascii_case(name) && !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "no"))
+}
+
+fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+fn prop_attr_from(attrs: &[(String, String)]) -> PropAttr {
+    let access = attr_value(attrs, "Access");
+    PropAttr {
+        get_access: Access::parse(attr_value(attrs, "GetAccess").or(access).unwrap_or("public")),
+        set_access: Access::parse(attr_value(attrs, "SetAccess").or(access).unwrap_or("public")),
+        constant: attr_flag(attrs, "Constant"),
+        dependent: attr_flag(attrs, "Dependent"),
+    }
+}
+
+fn method_attr_from(attrs: &[(String, String)]) -> MethodAttr {
+    MethodAttr { access: Access::parse(attr_value(attrs, "Access").unwrap_or("public")), abstract_: attr_flag(attrs, "Abstract") }
 }
 
 /// One file behind an `fopen` fid. Shared `Read`/`Write`/`Seek` access on
@@ -202,11 +291,28 @@ pub struct MObject {
     /// Class name as written in `classdef`/`class(s,'name')`.
     pub class_name: String,
     props: ObjStore,
+    /// Live event listeners; only handle classes carry a store.
+    listeners: Option<std::rc::Rc<std::cell::RefCell<Vec<EventListener>>>>,
+    /// Non-empty when this object is an object-array proxy. Each entry is
+    /// a scalar object of the same class.
+    array: Option<Box<ObjectArray>>,
+}
+
+/// Heap payload for an object array, keeping `MObject` small.
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectArray {
+    elements: Vec<MObject>,
+    dims: Vec<usize>,
 }
 
 impl PartialEq for MObject {
     fn eq(&self, other: &Self) -> bool {
-        self.class_name == other.class_name && self.props_map() == other.props_map()
+        self.class_name == other.class_name
+            && match (&self.array, &other.array) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => self.props_map() == other.props_map(),
+                _ => false,
+            }
     }
 }
 
@@ -215,7 +321,30 @@ impl MObject {
         MObject {
             class_name,
             props: if handle { ObjStore::Shared(std::rc::Rc::new(std::cell::RefCell::new(props))) } else { ObjStore::Owned(props) },
+            listeners: if handle { Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))) } else { None },
+            array: None,
         }
+    }
+
+    fn array(class_name: String, elements: Vec<MObject>, dims: (usize, usize)) -> Self {
+        MObject {
+            class_name,
+            props: ObjStore::Owned(StructArray::new()),
+            listeners: None,
+            array: Some(Box::new(ObjectArray { elements, dims: vec![dims.0, dims.1] })),
+        }
+    }
+
+    fn is_array(&self) -> bool {
+        self.array.is_some()
+    }
+
+    fn array_dims(&self) -> Vec<usize> {
+        self.array.as_ref().map(|a| a.dims.clone()).unwrap_or_else(|| vec![1, 1])
+    }
+
+    fn array_elements(&self) -> Vec<MObject> {
+        self.array.as_ref().map(|a| a.elements.clone()).unwrap_or_else(|| vec![self.clone()])
     }
 
     /// Value-class constructor helper (`class(s,'name')` objects own
@@ -226,6 +355,9 @@ impl MObject {
 
     /// `obj.prop` — property value by name.
     fn prop(&self, name: &str) -> Option<Value> {
+        if self.array.is_some() {
+            return None;
+        }
         match &self.props {
             ObjStore::Owned(s) => s.field_at(0, name).cloned(),
             ObjStore::Shared(s) => s.borrow().field_at(0, name).cloned(),
@@ -233,6 +365,9 @@ impl MObject {
     }
 
     fn has_prop(&self, name: &str) -> bool {
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.has_prop(name);
+        }
         match &self.props {
             ObjStore::Owned(s) => s.has_field(name),
             ObjStore::Shared(s) => s.borrow().has_field(name),
@@ -254,11 +389,17 @@ impl MObject {
 
     /// Property field names (engine/JSON introspection).
     pub fn prop_names(&self) -> Vec<String> {
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.prop_names();
+        }
         self.props_map().field_names()
     }
 
     /// Snapshot of the property struct (display, `fieldnames`, `get`).
     fn props_map(&self) -> StructArray {
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.props_map();
+        }
         match &self.props {
             ObjStore::Owned(s) => s.clone(),
             ObjStore::Shared(s) => s.borrow().clone(),
@@ -858,7 +999,10 @@ impl Value {
                 Some(Value::Mat(m)) => m.shape(),
                 _ => (1, 1),
             },
-            Value::Object(_) => (1, 1),
+            Value::Object(o) => {
+                let d = o.array_dims();
+                (d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1))
+            }
             Value::Sparse(s) => s.shape(),
             Value::Func(_) => (1, 1),
         }
@@ -989,6 +1133,10 @@ pub struct Session {
     /// Key into `persistents` for the function now executing (`None` at
     /// base/script scope).
     cur_func_key: Option<String>,
+    /// Class whose method is executing (`private`/`protected` checks).
+    cur_class: Option<String>,
+    /// Next `addlistener` id.
+    next_listener_id: u64,
     /// `import pkg.*`/`import pkg.Name` specs recorded this session.
     imports: Vec<String>,
     /// Root-object defaults written via `set(0,'Default...',v)` — read back
@@ -1039,6 +1187,8 @@ impl Session {
             persistents: HashMap::new(),
             frame_persist: HashSet::new(),
             cur_func_key: None,
+            cur_class: None,
+            next_listener_id: 1,
             imports: Vec::new(),
             defaults: HashMap::new(),
             diary_file: None,
@@ -1494,7 +1644,14 @@ impl Session {
                 Stmt::Function { name, params, outputs, body } => {
                     self.funcs.insert(
                         name.clone(),
-                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static: false },
+                        FuncDef {
+                            params: params.clone(),
+                            outputs: outputs.clone(),
+                            body: body.clone(),
+                            file: file.to_string(),
+                            is_static: false,
+                            owner: None,
+                        },
                     );
                     // Nested functions (a `function` inside an
                     // `end`-terminated body) register like file-local
@@ -1514,7 +1671,14 @@ impl Session {
                     let is_static = def.sigs.get(name).copied().unwrap_or(false);
                     def.methods.insert(
                         name.clone(),
-                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static },
+                        FuncDef {
+                            params: params.clone(),
+                            outputs: outputs.clone(),
+                            body: body.clone(),
+                            file: file.to_string(),
+                            is_static,
+                            owner: None,
+                        },
                     );
                     break;
                 }
@@ -1525,16 +1689,25 @@ impl Session {
     /// Record a `Stmt::ClassDef` into `classes` — a later re-registration
     /// (edited file, re-run script) replaces the definition wholesale.
     fn register_class(&mut self, s: &Stmt, file: &str) {
-        let Stmt::ClassDef { name, supers, props, methods, enums, events } = s else { return };
+        let Stmt::ClassDef { name, supers, props, methods, enums, events, attrs } = s else { return };
         let mut def = ClassDef {
+            name: name.clone(),
             supers: supers.clone(),
             props: props.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
             enums: enums.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
             events: events.iter().map(|e| e.name.clone()).collect(),
+            class_attrs: attrs.clone(),
             file: file.to_string(),
             ..ClassDef::default()
         };
+        for p in props {
+            def.prop_attrs.insert(p.name.clone(), prop_attr_from(&p.attrs));
+        }
+        for e in events {
+            def.prop_attrs.insert(e.name.clone(), prop_attr_from(&e.attrs));
+        }
         for m in methods {
+            def.method_attrs.insert(m.name.clone(), method_attr_from(&m.attrs));
             if m.body.is_empty() {
                 def.sigs.insert(m.name.clone(), m.is_static);
             } else {
@@ -1547,6 +1720,7 @@ impl Session {
                         body: m.body.clone(),
                         file: file.to_string(),
                         is_static: m.is_static,
+                        owner: Some(name.clone()),
                     },
                 );
             }
@@ -2476,6 +2650,19 @@ impl Session {
             }
             return Ok(());
         }
+        // Object-array element write, including `obj(2) = obj` growth.
+        if matches!(self.vars.get(name), Some(Value::Object(_))) || matches!(v, Value::Object(_)) {
+            let cur = match self.vars.remove(name) {
+                Some(Value::Object(o)) => Value::Object(o),
+                _ => match &v {
+                    Value::Object(o) => Value::Object(MObject::array(o.class_name.clone(), Vec::new(), (0, 0))),
+                    _ => Value::Mat(Matrix::zeros(0, 0)),
+                },
+            };
+            let new = self.paren_apply(cur, index, v)?;
+            self.vars.insert(name.to_string(), new);
+            return Ok(());
+        }
         if matches!(self.vars.get(name), Some(Value::Cell(_))) || matches!(v, Value::Cell(_)) {
             return self.cell_paren_assign(name, index, v);
         }
@@ -2706,6 +2893,7 @@ impl Session {
                 // `obj.prop = v` — write into the object's store (shared
                 // for handle classes, copy-on-write for value classes).
                 if let Value::Object(mut o) = cur {
+                    self.check_prop_access(&o, field, true)?;
                     let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                     let new = self.path_set(sub, rest, v, root)?;
                     if o.class_name == "table" && field != "Properties" {
@@ -2756,6 +2944,14 @@ impl Session {
                         let _ = e;
                         Value::Struct(StructArray::new())
                     }
+                    Err(e) if matches!(rest.first(), Some(PathStep::Name(_))) && matches!(cur, Value::Object(_)) => {
+                        let _ = e;
+                        let class = match &cur {
+                            Value::Object(o) => o.class_name.clone(),
+                            _ => String::new(),
+                        };
+                        self.construct_object(&class, Vec::new())?
+                    }
                     Err(e) => return Err(e),
                 };
                 let new = self.path_set(inner, rest, v, root)?;
@@ -2795,6 +2991,8 @@ impl Session {
                 }
                 return Ok(target);
             }
+            let o = o.clone();
+            return self.object_paren_assign(o, index, v);
         }
         if let Value::Struct(sa) = target {
             let mut sa = sa;
@@ -3081,6 +3279,122 @@ impl Session {
         table_subset(o, &rows, &cols)
     }
 
+    fn object_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let dims = o.array_dims();
+        let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+        let specs = self.index_specs(args, &dims, numel)?;
+        pages_in_bounds(&specs)?;
+        let elems = o.array_elements();
+        let mut idxs: Vec<usize> = Vec::new();
+        if specs.linear {
+            for &i in specs.rows() {
+                idxs.push(i.saturating_sub(1));
+            }
+        } else {
+            for &c in specs.cols() {
+                for &r in specs.rows() {
+                    idxs.push(r.saturating_sub(1).saturating_mul(dims.first().copied().unwrap_or(1)).saturating_add(c.saturating_sub(1)));
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(idxs.len());
+        for &i in &idxs {
+            let Some(el) = elems.get(i) else {
+                return Err(LangError::new(format!("index {} out of bounds for object array", i + 1), 0));
+            };
+            out.push(el.clone());
+        }
+        if out.len() == 1 {
+            return Ok(Value::Object(out.remove(0)));
+        }
+        let out_dims = if specs.linear {
+            let col = matches!(args.first(), Some(Expr::Colon)) && !o.is_array();
+            if col {
+                (out.len(), 1)
+            } else {
+                (1, out.len())
+            }
+        } else {
+            (specs.rows().len(), specs.cols().len())
+        };
+        Ok(Value::Object(MObject::array(o.class_name.clone(), out, out_dims)))
+    }
+
+    fn object_paren_assign(&mut self, cur: MObject, index: &[Expr], v: Value) -> Result<Value, LangError> {
+        let dims = cur.array_dims();
+        let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+        let specs = self.index_specs(index, &dims, numel)?;
+        pages_in_bounds(&specs)?;
+        let mut elems = cur.array_elements();
+        let mut positions: Vec<usize> = Vec::new();
+        if specs.linear {
+            for &i in specs.rows() {
+                positions.push(i.saturating_sub(1));
+            }
+        } else {
+            for &c in specs.cols() {
+                for &r in specs.rows() {
+                    positions.push(r.saturating_sub(1).saturating_mul(dims.first().copied().unwrap_or(1)).saturating_add(c.saturating_sub(1)));
+                }
+            }
+        }
+        if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+            if !specs.linear {
+                return Err(LangError::new("object-array deletion needs linear indices", 0));
+            }
+            let mut keep = vec![true; elems.len()];
+            for &p in &positions {
+                if let Some(slot) = keep.get_mut(p) {
+                    *slot = false;
+                }
+            }
+            let kept: Vec<MObject> = elems.into_iter().enumerate().filter_map(|(i, e)| keep.get(i).copied().unwrap_or(true).then_some(e)).collect();
+            if kept.len() == 1 {
+                return Ok(Value::Object(kept.into_iter().next().unwrap_or(cur)));
+            }
+            return Ok(Value::Object(MObject::array(cur.class_name.clone(), kept.clone(), (1, kept.len()))));
+        }
+        let rhs = match v {
+            Value::Object(o) => o,
+            _ => return Err(LangError::new("object-array assignment needs an object", 0)),
+        };
+        let rhs_elems = rhs.array_elements();
+        let max_pos = positions.iter().copied().max().unwrap_or(0);
+        let needed = max_pos.saturating_add(1).max(numel);
+        while elems.len() < needed {
+            let fill = match self.construct_object(&cur.class_name, Vec::new()) {
+                Ok(Value::Object(o)) => o,
+                _ => rhs.clone(),
+            };
+            elems.push(fill);
+        }
+        for (k, &p) in positions.iter().enumerate() {
+            if let Some(slot) = elems.get_mut(p) {
+                *slot = rhs_elems.get(k % rhs_elems.len().max(1)).cloned().unwrap_or_else(|| rhs.clone());
+            }
+        }
+        let out_dims = if specs.linear {
+            if elems.len() > 1 && dims == vec![1, 1] {
+                (1, elems.len())
+            } else {
+                let (r, c) = (dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1));
+                if r.saturating_mul(c) >= elems.len() {
+                    (r, c)
+                } else {
+                    (1, elems.len())
+                }
+            }
+        } else {
+            let r = specs.rows().iter().copied().max().unwrap_or(dims.first().copied().unwrap_or(1)).max(dims.first().copied().unwrap_or(1));
+            let c = specs.cols().iter().copied().max().unwrap_or(dims.get(1).copied().unwrap_or(1)).max(dims.get(1).copied().unwrap_or(1));
+            (r, c)
+        };
+        if elems.len() == 1 {
+            return Ok(Value::Object(elems.remove(0)));
+        }
+        Ok(Value::Object(MObject::array(cur.class_name.clone(), elems, out_dims)))
+    }
+
     fn index_into(&mut self, target: &Value, args: &[Expr]) -> Result<Value, LangError> {
         if let Value::Object(o) = target {
             if o.class_name == "table" {
@@ -3093,7 +3407,7 @@ impl Session {
                 let key = self.eval(&args[0])?;
                 return maps::get(o, &key);
             }
-            return Err(LangError::new("indexing into an object is not supported (object arrays are not implemented)", 0));
+            return self.object_index(o, args);
         }
         if let Value::Cell(ca) = target {
             // `c(:)` on an empty cell yields an empty cell, not an index error.
@@ -4007,6 +4321,58 @@ impl Session {
                 }
                 Ok(Some(Value::Cell(CellArray::col(names.into_iter().map(Value::Str).collect()))))
             }
+            "addlistener" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("addlistener needs a handle object", 0)),
+                };
+                let event = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("addlistener needs an event name", 0)),
+                };
+                let callback = v.get(2).cloned().ok_or_else(|| LangError::new("addlistener needs a callback", 0))?;
+                self.check_event(&o, &event)?;
+                let Some(store) = o.listeners.clone() else {
+                    return Err(LangError::new(format!("addlistener requires a handle class ('{}' is a value class)", o.class_name), 0));
+                };
+                let id = self.next_listener_id;
+                self.next_listener_id += 1;
+                store.borrow_mut().push(EventListener { id, event: event.clone(), callback: callback.clone(), enabled: true });
+                let mut props = StructArray::new();
+                props.set_field(0, "Source", Value::Object(o))?;
+                props.set_field(0, "EventName", Value::Str(event))?;
+                props.set_field(0, "Callback", callback)?;
+                props.set_field(0, "Enabled", Value::Num(1.0))?;
+                props.set_field(0, "Id", Value::Num(id as f64))?;
+                Ok(Some(Value::Object(MObject::owned("listener".into(), props))))
+            }
+            "notify" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("notify needs a handle object", 0)),
+                };
+                let event = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("notify needs an event name", 0)),
+                };
+                self.check_event(&o, &event)?;
+                let Some(store) = o.listeners.clone() else { return Ok(Some(Value::Mat(Matrix::zeros(0, 0)))) };
+                let listeners = store.borrow().iter().filter(|l| l.enabled && l.event == event).cloned().collect::<Vec<_>>();
+                let mut data = StructArray::new();
+                data.set_field(0, "Source", Value::Object(o.clone()))?;
+                data.set_field(0, "EventName", Value::Str(event))?;
+                data.set_field(0, "Data", v.get(2).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+                for l in listeners {
+                    let cb = l.callback.clone();
+                    if !matches!(cb, Value::Func(_) | Value::Str(_)) {
+                        return Err(LangError::new("listener callback must be a function handle or name", 0));
+                    }
+                    let _ = self.call_feval_target(&cb, vec![Value::Object(o.clone()), Value::Struct(data.clone())], 0)?;
+                }
+                Ok(Some(Value::Mat(Matrix::zeros(0, 0))))
+            }
             "metaclass" => {
                 let v = self.eval_args(args)?;
                 let cname = match v.first() {
@@ -4843,6 +5209,7 @@ impl Session {
                     let o = o.clone();
                     return match v.get(1) {
                         Some(Value::Str(s)) => {
+                            self.check_prop_access(&o, s, false)?;
                             o.prop(s).map(Some).ok_or_else(|| LangError::new(format!("get: no property '{s}' on class '{}'", o.class_name), 0))
                         }
                         None => Ok(Some(Value::Struct(o.props_map()))),
@@ -4928,6 +5295,7 @@ impl Session {
                             _ => return Err(LangError::new("set: property name must be a string", 0)),
                         };
                         let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
+                        self.check_prop_access(&o, &pname, true)?;
                         o.set_prop(&pname, val.clone());
                         i += 2;
                     }
@@ -8669,6 +9037,26 @@ impl Session {
     /// ctor's first output, run the ctor method when one exists.
     fn construct_object(&mut self, name: &str, argv: Vec<Value>) -> Result<Value, LangError> {
         let chain = self.class_chain(name)?;
+        if chain.last().is_some_and(|d| d.attr_flag("Abstract")) {
+            return Err(LangError::new(format!("cannot instantiate abstract class '{name}'"), 0));
+        }
+        if chain.iter().take(chain.len().saturating_sub(1)).any(|d| d.attr_flag("Sealed")) {
+            return Err(LangError::new(format!("class '{name}' cannot inherit from a sealed superclass"), 0));
+        }
+        let mut pending: Vec<String> = Vec::new();
+        for def in &chain {
+            for (m, a) in &def.method_attrs {
+                if a.abstract_ {
+                    pending.push(m.clone());
+                }
+            }
+            for m in def.methods.keys() {
+                pending.retain(|p| p != m);
+            }
+        }
+        if let Some(m) = pending.first() {
+            return Err(LangError::new(format!("cannot instantiate class '{name}': abstract method '{m}' is not implemented"), 0));
+        }
         let mut sa = StructArray::new();
         for def in &chain {
             for (pname, dexpr) in &def.props {
@@ -8703,15 +9091,29 @@ impl Session {
             let def = self.classes.get(&cn).cloned();
             if let Some(d) = &def {
                 if let Some(m) = d.methods.get(method) {
+                    self.check_method_access(m, method)?;
                     return Ok(Some(m.clone()));
                 }
             }
             if let Some(m) = self.load_at_dir_method(&cn, method)? {
+                self.check_method_access(&m, method)?;
                 return Ok(Some(m));
             }
             cur = def.and_then(|d| d.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()));
         }
         Ok(None)
+    }
+
+    fn check_method_access(&mut self, def: &FuncDef, method: &str) -> Result<(), LangError> {
+        let Some(owner) = def.owner.clone() else { return Ok(()) };
+        let access = self.classes.get(&owner).and_then(|d| d.method_attrs.get(method)).map(|a| a.access).unwrap_or(Access::Public);
+        if !self.access_allowed(&owner, access)? {
+            return Err(LangError::new(
+                format!("method '{method}' has {} access in class '{owner}'", if access == Access::Private { "private" } else { "protected" }),
+                0,
+            ));
+        }
+        Ok(())
     }
 
     /// `@class/method.m` on the search path → the method's `FuncDef`
@@ -8739,6 +9141,8 @@ impl Session {
                     }
                 }
                 if let Some(d) = d {
+                    let mut d = d;
+                    d.owner = Some(class.to_string());
                     self.method_cache.insert(key, d.clone());
                     return Ok(Some(d));
                 }
@@ -8761,6 +9165,7 @@ impl Session {
     /// zero-extra-arg method call (`obj.m` invokes `m`).
     fn object_dot(&mut self, o: &MObject, name: &str) -> Result<Option<Value>, LangError> {
         if let Some(v) = o.prop(name) {
+            self.check_prop_access(o, name, false)?;
             return Ok(Some(v));
         }
         if let Some(v) = self.enum_value(&o.class_name, name)? {
@@ -8773,6 +9178,68 @@ impl Session {
             }
             None => Err(LangError::new(format!("'{name}' is not a property, enumeration member or method of class '{}'", o.class_name), 0)),
         }
+    }
+
+    /// Find the nearest declaration of `prop` in `class`'s chain.
+    fn prop_attr_for(&mut self, class: &str, prop: &str) -> Result<Option<(PropAttr, String)>, LangError> {
+        let chain = self.class_chain(class)?;
+        for def in chain.iter().rev() {
+            if let Some(attr) = def.prop_attrs.get(prop) {
+                return Ok(Some((attr.clone(), def.name.clone())));
+            }
+            if def.props.iter().any(|(p, _)| p == prop) {
+                return Ok(Some((PropAttr::default(), def.name.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    fn access_allowed(&mut self, owner: &str, access: Access) -> Result<bool, LangError> {
+        if access == Access::Public {
+            return Ok(true);
+        }
+        let Some(caller) = self.cur_class.clone() else { return Ok(false) };
+        let subclass = !caller.eq_ignore_ascii_case(owner) && self.is_a(&caller, owner)?;
+        Ok(access.allows(owner, Some(&caller), subclass))
+    }
+
+    fn check_prop_access(&mut self, o: &MObject, name: &str, write: bool) -> Result<(), LangError> {
+        let Some((attr, owner)) = self.prop_attr_for(&o.class_name, name)? else { return Ok(()) };
+        if write && attr.constant {
+            return Err(LangError::new(format!("cannot set Constant property '{name}' of class '{}'", o.class_name), 0));
+        }
+        if write && attr.dependent {
+            return Err(LangError::new(format!("cannot set Dependent property '{name}' of class '{}'", o.class_name), 0));
+        }
+        let access = if write { attr.set_access } else { attr.get_access };
+        if !self.access_allowed(&owner, access)? {
+            return Err(LangError::new(
+                format!("'{name}' has {} access in class '{}'", if access == Access::Private { "private" } else { "protected" }, o.class_name),
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Declared event names for a class (inherited included).
+    fn class_events(&mut self, class: &str) -> Result<Vec<String>, LangError> {
+        let mut out = Vec::new();
+        for def in self.class_chain(class)? {
+            for e in def.events {
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn check_event(&mut self, o: &MObject, event: &str) -> Result<(), LangError> {
+        let declared = self.class_events(&o.class_name)?;
+        if !declared.is_empty() && !declared.iter().any(|e| e == event) {
+            return Err(LangError::new(format!("event '{event}' is not defined by class '{}'", o.class_name), 0));
+        }
+        Ok(())
     }
 
     /// `Class.member` — evaluate a class's `enumeration` member.
@@ -8922,7 +9389,60 @@ impl Session {
                 .into_iter()
                 .next()
                 .ok_or_else(|| LangError::new("concatenation produced no value", 0)),
-            None => Err(LangError::new(format!("'[…]' concatenation is not defined for class '{cname}' (no '{mname}' method)"), 0)),
+            None => {
+                let (Value::Object(oa), Value::Object(ob)) = (&a, &b) else {
+                    return Err(LangError::new(format!("'[…]' concatenation is not defined for class '{cname}' (no '{mname}' method)"), 0));
+                };
+                if !oa.class_name.eq_ignore_ascii_case(&ob.class_name) {
+                    return Err(LangError::new("cannot concatenate objects of different classes", 0));
+                }
+                let ad = oa.array_dims();
+                let bd = ob.array_dims();
+                let ae = oa.array_elements();
+                let be = ob.array_elements();
+                let (ar, ac) = (ad.first().copied().unwrap_or(1), ad.get(1).copied().unwrap_or(1));
+                let (br, bc) = (bd.first().copied().unwrap_or(1), bd.get(1).copied().unwrap_or(1));
+                let (rows, cols) = if mname == "horzcat" {
+                    if ar != br {
+                        return Err(LangError::new("horizontal concatenation needs the same number of rows", 0));
+                    }
+                    (ar, ac.saturating_add(bc))
+                } else {
+                    if ac != bc {
+                        return Err(LangError::new("vertical concatenation needs the same number of columns", 0));
+                    }
+                    (ar.saturating_add(br), ac)
+                };
+                let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+                if mname == "horzcat" {
+                    for r in 0..ar {
+                        for c in 0..ac {
+                            if let Some(v) = ae.get(r + c * ar) {
+                                out.push(v.clone());
+                            }
+                        }
+                        for c in 0..bc {
+                            if let Some(v) = be.get(r + c * br) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                } else {
+                    for c in 0..ac {
+                        for r in 0..ar {
+                            if let Some(v) = ae.get(r + c * ar) {
+                                out.push(v.clone());
+                            }
+                        }
+                        for r in 0..br {
+                            if let Some(v) = be.get(r + c * br) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(MObject::array(oa.class_name.clone(), out, (rows, cols))))
+            }
         }
     }
 
@@ -8979,6 +9499,7 @@ impl Session {
         let saved_globals = std::mem::take(&mut self.frame_globals);
         let saved_persist = std::mem::take(&mut self.frame_persist);
         let saved_key = self.cur_func_key.replace(format!("{}::{}", def.file, name));
+        let saved_class = std::mem::replace(&mut self.cur_class, def.owner.clone());
         let saved_ctx = self.call_ctx.replace((argv.len(), nargout));
         let vararg = def.params.last().map(|p| p == "varargin").unwrap_or(false);
         let fixed = if vararg { def.params.len().saturating_sub(1) } else { def.params.len() };
@@ -9053,6 +9574,7 @@ impl Session {
         self.frame_globals = saved_globals;
         self.frame_persist = saved_persist;
         self.cur_func_key = saved_key;
+        self.cur_class = saved_class;
         self.call_ctx = saved_ctx;
         result
     }
@@ -9898,6 +10420,14 @@ impl Session {
                                     if glob_match(&file_pat, &n) && e.path().is_file() {
                                         let _ = std::fs::remove_file(e.path());
                                     }
+                                }
+                            }
+                        }
+                        Value::Object(o) if o.class_name == "listener" => {
+                            let id = o.prop("Id").and_then(|x| x.scalar().ok()).unwrap_or(-1.0);
+                            if let Some(Value::Object(src)) = o.prop("Source") {
+                                if let Some(store) = src.listeners.as_ref() {
+                                    store.borrow_mut().retain(|l| (l.id as f64) != id);
                                 }
                             }
                         }
@@ -15051,6 +15581,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "metaclass",
     "ismethod",
     "isprop",
+    "addlistener",
+    "notify",
     "fieldnames",
     "isfield",
     "rmfield",
@@ -16704,7 +17236,10 @@ pub fn describe(v: &Value) -> String {
         Value::Str(s) => format!("1x{} char", s.chars().count()),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
-        Value::Object(o) => format!("1x1 {}", o.class_name),
+        Value::Object(o) => {
+            let d = o.array_dims();
+            format!("{}x{} {}", d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1), o.class_name)
+        }
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(_) => "1x1 function_handle".into(),
     }
@@ -16902,7 +17437,10 @@ fn fmt_cell_item(v: &Value, long: bool) -> String {
         Value::Str(s) => format!("'{s}'"),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
-        Value::Object(o) => format!("1x1 {}", o.class_name),
+        Value::Object(o) => {
+            let d = o.array_dims();
+            format!("{}x{} {}", d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1), o.class_name)
+        }
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(h) => func_text(h),
     }
@@ -19893,9 +20431,17 @@ end",
     properties (SetAccess = protected, GetAccess = public, Dependent)
         c = 2
     end
+    properties (Constant)
+        k = 7
+    end
     methods ( Access = public , Static = false , Abstract = false )
         function obj = Att()
             obj.a = 1;
+        end
+    end
+    methods (Access = private)
+        function y = secret(obj)
+            y = 42;
         end
     end
     methods (Static)
@@ -19906,12 +20452,141 @@ end",
 end",
         )
         .unwrap();
-        s.run("o = Att(); v = o.c; w = o.twice(4);").unwrap();
+        s.run("o = Att(); v = o.c; w = o.twice(4); kk = o.k;").unwrap();
         assert_eq!(s.get("v"), Some(&Value::Num(2.0)));
         assert_eq!(s.get("w"), Some(&Value::Num(8.0)));
-        // `b` had no default — reads back as the empty matrix.
-        s.run("e = isempty(o.b);").unwrap();
-        assert_eq!(s.get("e"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("kk"), Some(&Value::Num(7.0)));
+        // Private reads, Constant writes, Dependent writes and private
+        // methods are rejected outside the class.
+        s.run(
+            "try, q = o.b; catch e, msg = e.message; end\n\
+             try, o.k = 8; catch e2, msg2 = e2.message; end\n\
+             try, o.c = 5; catch e3, msg3 = e3.message; end\n\
+             try, o.secret; catch e4, msg4 = e4.message; end",
+        )
+        .unwrap();
+        let msg = |s: &Session, n: &str| match s.get(n) {
+            Some(Value::Str(v)) => v.clone(),
+            _ => String::new(),
+        };
+        assert!(msg(&s, "msg").contains("private access"), "msg = {}", msg(&s, "msg"));
+        assert!(msg(&s, "msg2").contains("Constant"), "msg2 = {}", msg(&s, "msg2"));
+        assert!(msg(&s, "msg3").contains("Dependent"), "msg3 = {}", msg(&s, "msg3"));
+        assert!(msg(&s, "msg4").contains("private access"), "msg4 = {}", msg(&s, "msg4"));
+    }
+
+    #[test]
+    fn classdef_events_and_listeners() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Emitter < handle
+    properties
+        hits = 0
+    end
+    events
+        Ping
+    end
+    methods
+        function fire(obj)
+            notify(obj, 'Ping');
+        end
+    end
+end
+function bump(src, evt)
+    src.hits = src.hits + 1;
+end",
+        )
+        .unwrap();
+        s.run("e = Emitter(); l = addlistener(e, 'Ping', @bump); e.fire(); n1 = e.hits; ev = events(e);").unwrap();
+        assert_eq!(s.get("n1"), Some(&Value::Num(1.0)));
+        if let Some(Value::Cell(ev)) = s.get("ev") {
+            assert!((0..ev.numel()).any(|i| matches!(ev.get_linear(i), Some(Value::Str(x)) if x == "Ping")));
+        } else {
+            panic!("events(e) is not a cell");
+        }
+        s.run("delete(l); notify(e, 'Ping'); n2 = e.hits;").unwrap();
+        assert_eq!(s.get("n2"), Some(&Value::Num(1.0)));
+
+        // Value classes cannot own listeners.
+        s.run("classdef ValueOnly\n properties\n x = 1\n end\n end").unwrap();
+        s.run("v = ValueOnly(); try, addlistener(v, 'Ping', @bump); catch le, lmsg = le.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("lmsg") {
+            assert!(m.contains("handle class"), "listener error = {m}");
+        } else {
+            panic!("value-class addlistener did not error");
+        }
+    }
+
+    #[test]
+    fn classdef_abstract_and_sealed() {
+        let mut s = Session::new();
+        s.run(
+            "classdef AbsBase
+    properties
+        x = 1
+    end
+    methods (Abstract)
+        y = compute(obj)
+    end
+end
+classdef AbsImpl < AbsBase
+    methods
+        function y = compute(obj)
+            y = obj.x + 1;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("try, a = AbsBase(); catch ae, amsg = ae.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("abstract"), "abstract error = {m}");
+        } else {
+            panic!("abstract class instantiated");
+        }
+        s.run("b = AbsImpl(); y = b.compute();").unwrap();
+        assert_eq!(s.get("y"), Some(&Value::Num(2.0)));
+
+        s.run("classdef (Sealed) Seal\n properties\n x = 1\n end\n end\nclassdef SealKid < Seal\n end").unwrap();
+        s.run("try, sk = SealKid(); catch se, smsg = se.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("smsg") {
+            assert!(m.contains("sealed"), "sealed error = {m}");
+        } else {
+            panic!("sealed superclass was subclassed");
+        }
+    }
+
+    #[test]
+    fn classdef_object_arrays() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Pt
+    properties
+        x = 0
+    end
+    methods
+        function obj = Pt(v)
+            if nargin >= 1
+                obj.x = v;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("a = Pt(1); a(2) = Pt(2); sz = size(a); n = numel(a); y = a(2).x; a(1).x = 9; z = a(1).x;").unwrap();
+        assert_eq!(s.get("sz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("n"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("z"), Some(&Value::Num(9.0)));
+        s.run("a(3).x = 7; w = a(3).x; sz2 = size(a);").unwrap();
+        assert_eq!(s.get("w"), Some(&Value::Num(7.0)));
+        assert_eq!(s.get("sz2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        s.run("c = [a(1) a(2)]; szc = size(c); yc = c(2).x;").unwrap();
+        assert_eq!(s.get("szc").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("yc"), Some(&Value::Num(2.0)));
+        s.run("a(2) = []; n2 = numel(a);").unwrap();
+        assert_eq!(s.get("n2"), Some(&Value::Num(2.0)));
     }
 
     #[test]
