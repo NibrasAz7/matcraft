@@ -252,6 +252,78 @@ pub fn exp_inv(p: f64, mu: f64) -> f64 {
     }
 }
 
+pub fn weibull_pdf(x: f64, a: f64, b: f64) -> f64 {
+    if a.is_nan() || a <= 0.0 || b.is_nan() || b <= 0.0 || x < 0.0 {
+        return 0.0;
+    }
+    if x == 0.0 {
+        return if a < 1.0 {
+            f64::INFINITY
+        } else if a == 1.0 {
+            1.0 / b
+        } else {
+            0.0
+        };
+    }
+    let z = x / b;
+    (a / b) * z.powf(a - 1.0) * (-z.powf(a)).exp()
+}
+
+pub fn weibull_cdf(x: f64, a: f64, b: f64) -> f64 {
+    if a.is_nan() || a <= 0.0 || b.is_nan() || b <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        0.0
+    } else {
+        1.0 - (-(x / b).powf(a)).exp()
+    }
+}
+
+pub fn weibull_inv(p: f64, a: f64, b: f64) -> f64 {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) || a.is_nan() || a <= 0.0 || b.is_nan() || b <= 0.0 {
+        return f64::NAN;
+    }
+    if p == 0.0 {
+        return 0.0;
+    }
+    if p == 1.0 {
+        return f64::INFINITY;
+    }
+    b * (-(1.0 - p).ln()).powf(1.0 / a)
+}
+
+pub fn logn_pdf(x: f64, mu: f64, sigma: f64) -> f64 {
+    if mu.is_nan() || sigma.is_nan() || sigma <= 0.0 || x <= 0.0 {
+        return 0.0;
+    }
+    let z = (x.ln() - mu) / sigma;
+    (-0.5 * z * z).exp() / (x * sigma * (2.0 * PI).sqrt())
+}
+
+pub fn logn_cdf(x: f64, mu: f64, sigma: f64) -> f64 {
+    if mu.is_nan() || sigma.is_nan() || sigma <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 0.0;
+    }
+    norm_cdf((x.ln() - mu) / sigma, 0.0, 1.0)
+}
+
+pub fn logn_inv(p: f64, mu: f64, sigma: f64) -> f64 {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) || mu.is_nan() || sigma.is_nan() || sigma <= 0.0 {
+        return f64::NAN;
+    }
+    if p == 0.0 {
+        return 0.0;
+    }
+    if p == 1.0 {
+        return f64::INFINITY;
+    }
+    (mu + sigma * norm_inv(p, 0.0, 1.0)).exp()
+}
+
 pub fn unif_pdf(x: f64, a: f64, b: f64) -> f64 {
     if b <= a || x < a || x > b {
         0.0
@@ -676,6 +748,19 @@ mod tests {
         assert!((f_pdf(1.0, 5.0, 5.0) - 0.424_413_181_578_386_87).abs() < 1e-12);
         assert!((f_cdf(1.0, 5.0, 5.0) - 0.5).abs() < 1e-12);
         assert!((f_inv(0.95, 5.0, 5.0) - 5.050_329_057_632_646).abs() < 1e-8);
+    }
+
+    #[test]
+    fn weibull_lognormal_reference_values() {
+        // SciPy 1.16 reference values.
+        assert!((weibull_pdf(1.2, 2.0, 3.0) - 0.227_238_343_724_323_03).abs() < 1e-12);
+        assert!((weibull_cdf(1.2, 2.0, 3.0) - 0.147_856_211_033_788_63).abs() < 1e-12);
+        assert!((weibull_inv(0.147_856_211_033_788_63, 2.0, 3.0) - 1.2).abs() < 1e-12);
+        assert!((logn_pdf(1.0, 0.0, 1.0) - 0.398_942_280_401_432_7).abs() < 1e-12);
+        assert!((logn_cdf(1.0, 0.0, 1.0) - 0.5).abs() < 1e-7);
+        assert!((logn_inv(0.5, 0.0, 1.0) - 1.0).abs() < 1e-12);
+        assert_eq!(weibull_pdf(-1.0, 2.0, 3.0), 0.0);
+        assert_eq!(logn_pdf(0.0, 0.0, 1.0), 0.0);
     }
 
     #[test]

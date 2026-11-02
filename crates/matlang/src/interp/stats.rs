@@ -325,6 +325,55 @@ impl Session {
                 }
                 Ok(vec![mat_or_num(Matrix::from_col_major_nd(&dims, out).map_err(lang)?)])
             }
+            "wblpdf" | "wblcdf" | "wblinv" => {
+                let x = matrix_arg(argv.first(), "x")?;
+                let a = matrix_arg(argv.get(1), "a")?;
+                let b = matrix_arg(argv.get(2), "b")?;
+                let f: fn(f64, f64, f64) -> f64 = match name {
+                    "wblpdf" => stats::weibull_pdf,
+                    "wblcdf" => stats::weibull_cdf,
+                    _ => stats::weibull_inv,
+                };
+                Ok(vec![mat_or_num(map3(&x, &a, &b, f)?)])
+            }
+            "lognpdf" | "logncdf" | "logninv" => {
+                let x = matrix_arg(argv.first(), "x")?;
+                let mu = matrix_arg(argv.get(1), "mu")?;
+                let sigma = matrix_arg(argv.get(2), "sigma")?;
+                let f: fn(f64, f64, f64) -> f64 = match name {
+                    "lognpdf" => stats::logn_pdf,
+                    "logncdf" => stats::logn_cdf,
+                    _ => stats::logn_inv,
+                };
+                Ok(vec![mat_or_num(map3(&x, &mu, &sigma, f)?)])
+            }
+            "wblrnd" => {
+                let a = matrix_arg(argv.first(), "a")?;
+                let b = matrix_arg(argv.get(1), "b")?;
+                let fallback = broadcast_dims(&[&a, &b])?;
+                let dims = sample_dims(&argv, 2, &fallback)?;
+                let n = dims.iter().fold(1usize, |x, &d| x.saturating_mul(d));
+                check_elems(n)?;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let u = self.next_f64().clamp(1e-12, 1.0 - 1e-12);
+                    out.push(stats::weibull_inv(u, sample_elem(&a, i), sample_elem(&b, i)));
+                }
+                Ok(vec![mat_or_num(Matrix::from_col_major_nd(&dims, out).map_err(lang)?)])
+            }
+            "lognrnd" => {
+                let mu = matrix_arg(argv.first(), "mu")?;
+                let sigma = matrix_arg(argv.get(1), "sigma")?;
+                let fallback = broadcast_dims(&[&mu, &sigma])?;
+                let dims = sample_dims(&argv, 2, &fallback)?;
+                let n = dims.iter().fold(1usize, |x, &d| x.saturating_mul(d));
+                check_elems(n)?;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push((sample_elem(&mu, i) + sample_elem(&sigma, i) * normal_sample(self)).exp());
+                }
+                Ok(vec![mat_or_num(Matrix::from_col_major_nd(&dims, out).map_err(lang)?)])
+            }
             "iqr" => {
                 let x = matrix_arg(argv.first(), "X")?;
                 if x.rows() <= 1 || x.cols() <= 1 {
@@ -655,6 +704,26 @@ impl Session {
                     return Err(LangError::new("fitdist: Poisson data must be nonnegative integers", 0));
                 }
                 Ok(vec![make_dist("prob.PoissonDistribution", "Poisson", &[("lambda", mean)])?])
+            }
+            "weibull" | "wbl" => {
+                if x.iter().any(|v| *v <= 0.0) {
+                    return Err(LangError::new("fitdist: Weibull data must be positive", 0));
+                }
+                let (a, b) = weibull_fit(&x)?;
+                Ok(vec![make_dist("prob.WeibullDistribution", "Weibull", &[("a", a), ("b", b)])?])
+            }
+            "lognormal" | "logn" => {
+                if x.iter().any(|v| *v <= 0.0) {
+                    return Err(LangError::new("fitdist: Lognormal data must be positive", 0));
+                }
+                let logs: Vec<f64> = x.iter().map(|v| v.ln()).collect();
+                let lmu = logs.iter().sum::<f64>() / n;
+                let lvar = logs.iter().map(|v| (v - lmu) * (v - lmu)).sum::<f64>() / n;
+                let lsigma = lvar.sqrt();
+                if lsigma.is_nan() || lsigma <= 0.0 {
+                    return Err(LangError::new("fitdist: Lognormal data has zero variance", 0));
+                }
+                Ok(vec![make_dist("prob.LognormalDistribution", "Lognormal", &[("mu", lmu), ("sigma", lsigma)])?])
             }
             other => Err(LangError::new(format!("fitdist: unsupported distribution '{other}'"), 0)),
         }
@@ -1566,6 +1635,8 @@ enum ProbParams {
     Gamma { a: f64, b: f64 },
     Beta { a: f64, b: f64 },
     Poisson { lambda: f64 },
+    Weibull { a: f64, b: f64 },
+    Lognormal { mu: f64, sigma: f64 },
 }
 
 impl ProbParams {
@@ -1591,6 +1662,20 @@ impl ProbParams {
             "prob.GammaDistribution" => Ok(ProbParams::Gamma { a: num("a")?, b: num("b")? }),
             "prob.BetaDistribution" => Ok(ProbParams::Beta { a: num("a")?, b: num("b")? }),
             "prob.PoissonDistribution" => Ok(ProbParams::Poisson { lambda: num("lambda")? }),
+            "prob.WeibullDistribution" => {
+                let (a, b) = (num("a")?, num("b")?);
+                if a.is_nan() || a <= 0.0 || b.is_nan() || b <= 0.0 {
+                    return Err(LangError::new("Weibull a and b must be positive", 0));
+                }
+                Ok(ProbParams::Weibull { a, b })
+            }
+            "prob.LognormalDistribution" => {
+                let (mu, sigma) = (num("mu")?, num("sigma")?);
+                if sigma.is_nan() || sigma <= 0.0 {
+                    return Err(LangError::new("Lognormal sigma must be positive", 0));
+                }
+                Ok(ProbParams::Lognormal { mu, sigma })
+            }
             other => Err(LangError::new(format!("unsupported distribution class '{other}'"), 0)),
         }
     }
@@ -1602,6 +1687,8 @@ impl ProbParams {
             ProbParams::Gamma { a, b } => stats::gamma_pdf(x, a, b),
             ProbParams::Beta { a, b } => stats::beta_pdf(x, a, b),
             ProbParams::Poisson { lambda } => stats::poisson_pdf(x, lambda),
+            ProbParams::Weibull { a, b } => stats::weibull_pdf(x, a, b),
+            ProbParams::Lognormal { mu, sigma } => stats::logn_pdf(x, mu, sigma),
         }
     }
 
@@ -1612,6 +1699,8 @@ impl ProbParams {
             ProbParams::Gamma { a, b } => stats::gamma_cdf(x, a, b),
             ProbParams::Beta { a, b } => stats::beta_cdf(x, a, b),
             ProbParams::Poisson { lambda } => stats::poisson_cdf(x, lambda),
+            ProbParams::Weibull { a, b } => stats::weibull_cdf(x, a, b),
+            ProbParams::Lognormal { mu, sigma } => stats::logn_cdf(x, mu, sigma),
         }
     }
 
@@ -1622,6 +1711,8 @@ impl ProbParams {
             ProbParams::Gamma { a, b } => stats::gamma_inv(p, a, b),
             ProbParams::Beta { a, b } => stats::beta_inv(p, a, b),
             ProbParams::Poisson { lambda } => stats::poisson_inv(p, lambda),
+            ProbParams::Weibull { a, b } => stats::weibull_inv(p, a, b),
+            ProbParams::Lognormal { mu, sigma } => stats::logn_inv(p, mu, sigma),
         }
     }
 
@@ -1632,6 +1723,8 @@ impl ProbParams {
             ProbParams::Gamma { a, b } => a * b,
             ProbParams::Beta { a, b } => a / (a + b),
             ProbParams::Poisson { lambda } => lambda,
+            ProbParams::Weibull { a, b } => b * stats::gammaln(1.0 + 1.0 / a).exp(),
+            ProbParams::Lognormal { mu, sigma } => (mu + 0.5 * sigma * sigma).exp(),
         }
     }
 
@@ -1642,6 +1735,12 @@ impl ProbParams {
             ProbParams::Gamma { a, b } => a * b * b,
             ProbParams::Beta { a, b } => a * b / ((a + b) * (a + b) * (a + b + 1.0)),
             ProbParams::Poisson { lambda } => lambda,
+            ProbParams::Weibull { a, b } => {
+                let g1 = stats::gammaln(1.0 + 1.0 / a).exp();
+                let g2 = stats::gammaln(1.0 + 2.0 / a).exp();
+                b * b * (g2 - g1 * g1)
+            }
+            ProbParams::Lognormal { mu, sigma } => ((sigma * sigma).exp() - 1.0) * (2.0 * mu + sigma * sigma).exp(),
         }
     }
 
@@ -1660,6 +1759,8 @@ impl ProbParams {
                 }
             }
             ProbParams::Poisson { lambda } => poisson_sample(s, lambda),
+            ProbParams::Weibull { a, b } => stats::weibull_inv(s.next_f64().clamp(1e-12, 1.0 - 1e-12), a, b),
+            ProbParams::Lognormal { mu, sigma } => (mu + sigma * normal_sample(s)).exp(),
         }
     }
 }
@@ -1687,6 +1788,53 @@ fn gamma_sample(s: &mut Session, a: f64, b: f64) -> f64 {
         }
     }
     a * b
+}
+
+fn weibull_fit(x: &[f64]) -> Result<(f64, f64), LangError> {
+    let n = x.len() as f64;
+    let mean_ln = x.iter().map(|v| v.ln()).sum::<f64>() / n;
+    let score = |a: f64| -> f64 {
+        let mut s1 = 0.0f64;
+        let mut s2 = 0.0f64;
+        for &v in x {
+            let power = v.powf(a);
+            s1 += power;
+            s2 += power * v.ln();
+        }
+        if !s1.is_finite() || s1 <= 0.0 {
+            return f64::INFINITY;
+        }
+        s2 / s1 - 1.0 / a - mean_ln
+    };
+    let mut lo = 1e-6f64;
+    let mut hi = 1.0f64;
+    for _ in 0..80 {
+        if score(hi) >= 0.0 || hi >= 100.0 {
+            break;
+        }
+        hi *= 2.0;
+    }
+    if score(lo) > 0.0 {
+        lo = 1e-8;
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if score(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let a = 0.5 * (lo + hi);
+    if a.is_nan() || a <= 0.0 {
+        return Err(LangError::new("fitdist: Weibull shape fit failed", 0));
+    }
+    let mean_power = x.iter().map(|v| v.powf(a)).sum::<f64>() / n;
+    let b = mean_power.powf(1.0 / a);
+    if b.is_nan() || b <= 0.0 || !b.is_finite() {
+        return Err(LangError::new("fitdist: Weibull scale fit failed", 0));
+    }
+    Ok((a, b))
 }
 
 fn gamma_fit(x: &[f64]) -> Result<(f64, f64), LangError> {

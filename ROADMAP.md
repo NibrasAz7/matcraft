@@ -350,6 +350,10 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- Weibull/lognormal wave (2026-11): `wblpdf`/`wblcdf`/`wblinv`/
+  `wblrnd` and `lognpdf`/`logncdf`/`logninv`/`lognrnd`, plus MLE
+  `fitdist` objects with moment reducers. Reference values are checked
+  against SciPy 1.16 and fits against seeded samples.
 - DDE wave (2026-11): `dde23` integrates constant-lag delay equations
   with constant-vector or functional history, Hermite interpolation of
   delayed states, adaptive Bogacki-Shampine stepping and solution-struct

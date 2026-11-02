@@ -62,7 +62,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "statistics",
-        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween fitlm optimalleaforder",
+        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv wblpdf wblcdf wblinv lognpdf logncdf logninv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd wblrnd lognrnd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween fitlm optimalleaforder",
     ),
     ("ode", "ode45 ode15s ode23 ode23s dde23 odeset odeget deval"),
     (

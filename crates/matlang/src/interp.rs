@@ -6875,11 +6875,11 @@ impl Session {
                 Ok(out.into_iter().next())
             }
             "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
-            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "exprnd" | "unifrnd" | "poissrnd" | "binornd" | "iqr" | "corrcoef" | "regress"
-            | "kmeans" | "ttest" | "ttest2" | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv"
-            | "chi2pdf" | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf"
-            | "random" | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum"
-            | "kruskalwallis" => {
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
+            | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
+            | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf" | "chi2cdf"
+            | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random" | "cmdscale"
+            | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
                 let v = self.eval_args(args)?;
                 let out = self.stats_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -10818,11 +10818,11 @@ impl Session {
                 self.control_builtin(name, v, nout)?
             }
             "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
-            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "exprnd" | "unifrnd" | "poissrnd" | "binornd" | "iqr" | "corrcoef" | "regress"
-            | "kmeans" | "ttest" | "ttest2" | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv"
-            | "chi2pdf" | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf"
-            | "random" | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum"
-            | "kruskalwallis" => {
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
+            | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
+            | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf" | "chi2cdf"
+            | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random" | "cmdscale"
+            | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
                 let v = self.eval_args(args)?;
                 self.stats_builtin(name, v, nout)?
             }
@@ -16805,10 +16805,18 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "binopdf",
     "binocdf",
     "binoinv",
+    "wblpdf",
+    "wblcdf",
+    "wblinv",
+    "lognpdf",
+    "logncdf",
+    "logninv",
     "exprnd",
     "unifrnd",
     "poissrnd",
     "binornd",
+    "wblrnd",
+    "lognrnd",
     "iqr",
     "corrcoef",
     "regress",
@@ -23122,6 +23130,65 @@ end",
 
         let _ = std::fs::remove_file(&h5);
         let _ = std::fs::remove_file(&nc);
+    }
+
+    #[test]
+    fn statistics_weibull_lognormal() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run(
+            "wp = wblpdf(1.2, 2, 3); wc = wblcdf(1.2, 2, 3); wi = wblinv(wc, 2, 3); \
+             lp = lognpdf(1, 0, 1); lc = logncdf(1, 0, 1); li = logninv(0.5, 0, 1);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "wp") - 0.227_238_343_724_323_03).abs() < 1e-9, "wp = {}", scalar(&s, "wp"));
+        assert!((scalar(&s, "wc") - 0.147_856_211_033_788_63).abs() < 1e-9, "wc = {}", scalar(&s, "wc"));
+        assert!((scalar(&s, "wi") - 1.2).abs() < 1e-9);
+        assert!((scalar(&s, "lp") - 0.398_942_280_401_432_7).abs() < 1e-12);
+        assert!((scalar(&s, "lc") - 0.5).abs() < 1e-7);
+        assert!((scalar(&s, "li") - 1.0).abs() < 1e-12);
+
+        // MLE fit on quantiles of a known Weibull distribution.
+        s.run(
+            "rng(42); xw = wblrnd(2, 3, 1, 5000); wd = fitdist(xw, 'Weibull'); wa = wd.a; wb = wd.b; \
+             wname = wd.DistributionName; wm = mean(wd); wv = var(wd); wpdf = pdf(wd, 1.2); wcdf = cdf(wd, 1.2);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "wa") - 2.0).abs() < 0.05, "Weibull shape = {}", scalar(&s, "wa"));
+        assert!((scalar(&s, "wb") - 3.0).abs() < 0.05, "Weibull scale = {}", scalar(&s, "wb"));
+        assert_eq!(s.get("wname"), Some(&Value::Str("Weibull".into())));
+        assert!((scalar(&s, "wpdf") - matcore::stats::weibull_pdf(1.2, scalar(&s, "wa"), scalar(&s, "wb"))).abs() < 1e-12);
+        assert!((scalar(&s, "wcdf") - matcore::stats::weibull_cdf(1.2, scalar(&s, "wa"), scalar(&s, "wb"))).abs() < 1e-12);
+        let g1 = matcore::stats::gammaln(1.0 + 1.0 / scalar(&s, "wa")).exp();
+        assert!((scalar(&s, "wm") - scalar(&s, "wb") * g1).abs() < 1e-9);
+
+        // Lognormal fit recovers the exact log-space parameters.
+        s.run(
+            "ld = fitdist(exp(0.5*[-2 -1 0 1 2]), 'Lognormal'); lm = ld.mu; ls = ld.sigma; lname = ld.DistributionName; \
+             lmean = mean(ld); lvar = var(ld); lmed = median(ld); lpdf = pdf(ld, 1); lcdf = cdf(ld, 1);",
+        )
+        .unwrap();
+        assert!(scalar(&s, "lm").abs() < 1e-12);
+        assert!((scalar(&s, "ls") - 0.5f64.sqrt()).abs() < 1e-12);
+        assert_eq!(s.get("lname"), Some(&Value::Str("Lognormal".into())));
+        assert!((scalar(&s, "lmean") - 1.284_025_416_687_741_4).abs() < 1e-12);
+        assert!((scalar(&s, "lvar") - 1.069_560_557_758_917_1).abs() < 1e-10);
+        assert!((scalar(&s, "lmed") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "lpdf") - 0.564_189_583_547_756_3).abs() < 1e-12);
+        assert!((scalar(&s, "lcdf") - 0.5).abs() < 1e-7);
+
+        // Seeded random generators are reproducible, positive and right-sized.
+        s.run(
+            "rng(7); W1 = wblrnd(2, 3, 2, 3); rng(7); W2 = wblrnd(2, 3, 2, 3); weq = isequal(W1, W2); \
+             wsz = size(W1); wmin = min(W1(:)); rng(8); L1 = lognrnd(0, 0.5, 2, 2); lsz = size(L1); lmin = min(L1(:));",
+        )
+        .unwrap();
+        assert_eq!(s.get("weq"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("wsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+        assert!(scalar(&s, "wmin") > 0.0);
+        assert_eq!(s.get("lsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
+        assert!(scalar(&s, "lmin") > 0.0);
     }
 
     #[test]
