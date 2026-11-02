@@ -1160,6 +1160,9 @@ pub struct Session {
     cur_func_key: Option<String>,
     /// Class whose method is executing (`private`/`protected` checks).
     cur_class: Option<String>,
+    /// True while a user `subsref`/`subsasgn` body is running, so its own
+    /// property access bypasses the custom dot dispatch.
+    subs_dot_guard: bool,
     /// Next `addlistener` id.
     next_listener_id: u64,
     /// `import pkg.*`/`import pkg.Name` specs recorded this session.
@@ -1213,6 +1216,7 @@ impl Session {
             frame_persist: HashSet::new(),
             cur_func_key: None,
             cur_class: None,
+            subs_dot_guard: false,
             next_listener_id: 1,
             imports: Vec::new(),
             defaults: HashMap::new(),
@@ -2384,8 +2388,11 @@ impl Session {
                 Some(Value::Object(o)) => {
                     if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                         let s = self.subs_struct("{}", args)?;
-                        let out = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)?;
-                        Ok(out.into_iter().next())
+                        let saved = self.subs_dot_guard;
+                        self.subs_dot_guard = true;
+                        let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                        self.subs_dot_guard = saved;
+                        Ok(result?.into_iter().next())
                     } else {
                         Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
                     }
@@ -2394,6 +2401,14 @@ impl Session {
                 None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
             },
             Expr::Field(base, field) => {
+                if let Some(full) = Self::expr_dotted_name(e) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some(v) = self.resolve_dotted_value(&full)? {
+                            return Ok(Some(v));
+                        }
+                    }
+                }
                 let v = self.eval(base)?;
                 match v {
                     Value::Struct(m) => match m.field_values(field) {
@@ -2430,7 +2445,25 @@ impl Session {
                 }
             }
             Expr::Index(base, args) => {
-                // `obj.m(args)` — method-call syntax on a class instance:
+                // `pkg.func(args)` / `pkg.Class(args)` /
+                // `pkg.Class.method(args)` — resolve package members before
+                // treating the chain as field/index access.
+                if let Some(full) = Self::expr_dotted_name(base) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some((target, method)) = self.resolve_package_call(&full)? {
+                            let argv = self.eval_args(args)?;
+                            if let Some(m) = method {
+                                let def = self
+                                    .find_method(&target, &m)?
+                                    .ok_or_else(|| LangError::new(format!("package class '{target}' has no method '{m}'"), 0))?;
+                                return Ok(self.call_def(&m, &def, argv, 1, None)?.into_iter().next());
+                            }
+                            return Ok(self.call_function_argv(&target, argv, 1)?.into_iter().next());
+                        }
+                    }
+                }
+                // `obj.m(args)` - method-call syntax on a class instance:
                 // when `m` isn't a property the parens are the call's
                 // argument list, not subscripts (MATLAB resolves by
                 // declaration).
@@ -2668,8 +2701,11 @@ impl Session {
             if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
                 if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
                     let s = self.subs_struct("{}", index)?;
-                    let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
-                    let new = out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0))?;
+                    let saved = self.subs_dot_guard;
+                    self.subs_dot_guard = true;
+                    let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                    self.subs_dot_guard = saved;
+                    let new = result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0))?;
                     self.vars.insert(name.to_string(), new);
                     return Ok(());
                 }
@@ -2881,7 +2917,11 @@ impl Session {
                 Some(Value::Object(o)) => {
                     if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                         let s = self.subs_struct("{}", args)?;
-                        self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)
+                        let saved = self.subs_dot_guard;
+                        self.subs_dot_guard = true;
+                        let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                        self.subs_dot_guard = saved;
+                        result
                     } else {
                         Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
                     }
@@ -2896,8 +2936,11 @@ impl Session {
                     Value::Object(o) => {
                         if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                             let s = self.subs_struct("{}", args)?;
-                            let out = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None)?;
-                            Ok(out)
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                            self.subs_dot_guard = saved;
+                            result
                         } else {
                             Err(LangError::new("brace indexing on an object needs a 'subsref' method", 0))
                         }
@@ -2907,6 +2950,14 @@ impl Session {
             }
             Expr::Field(base, field) => {
                 // `s.f` on a struct array yields one value per element.
+                if let Some(full) = Self::expr_dotted_name(e) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some(v) = self.resolve_dotted_value(&full)? {
+                            return Ok(vec![v]);
+                        }
+                    }
+                }
                 match self.eval(base)? {
                     Value::Struct(m) => match m.field_values(field) {
                         Some(vals) => Ok(vals),
@@ -2954,6 +3005,22 @@ impl Session {
         let Some((step, rest)) = path.split_first() else { return Ok(v) };
         match step {
             PathStep::Name(field) => {
+                // Custom `.`-field assignment via `subsasgn` when the class
+                // defines it (the method's own body bypasses this guard).
+                if !self.subs_dot_guard {
+                    if let Value::Object(o) = &cur {
+                        if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                            let mut s = StructArray::new();
+                            s.set_field(0, "type", Value::Str(".".into()))?;
+                            s.set_field(0, "subs", Value::Cell(CellArray::row(vec![Value::Str(field.clone())])))?;
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsasgn", &def, vec![Value::Object(o.clone()), Value::Struct(s), v], 1, None);
+                            self.subs_dot_guard = saved;
+                            return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                        }
+                    }
+                }
                 // `obj.prop = v` — write into the object's store (shared
                 // for handle classes, copy-on-write for value classes).
                 if let Value::Object(mut o) = cur {
@@ -3026,8 +3093,11 @@ impl Session {
                     Value::Object(o) => {
                         if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
                             let s = self.subs_struct("{}", ix)?;
-                            let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
-                            return out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                            self.subs_dot_guard = saved;
+                            return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
                         }
                         return Err(LangError::new("brace assignment on an object needs a 'subsasgn' method", 0));
                     }
@@ -3066,8 +3136,11 @@ impl Session {
             let o = o.clone();
             if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
                 let s = self.subs_struct("()", index)?;
-                let out = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None)?;
-                return out.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                let saved = self.subs_dot_guard;
+                self.subs_dot_guard = true;
+                let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                self.subs_dot_guard = saved;
+                return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
             }
             return self.object_paren_assign(o, index, v);
         }
@@ -3376,8 +3449,11 @@ impl Session {
     fn object_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
         if let Some(def) = self.find_method(&o.class_name, "subsref")? {
             let s = self.subs_struct("()", args)?;
-            let out = self.call_def("subsref", &def, vec![Value::Object(o.clone()), s], 1, None)?;
-            return out.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0));
+            let saved = self.subs_dot_guard;
+            self.subs_dot_guard = true;
+            let out = self.call_def("subsref", &def, vec![Value::Object(o.clone()), s], 1, None);
+            self.subs_dot_guard = saved;
+            return out?.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0));
         }
         let dims = o.array_dims();
         let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
@@ -9042,6 +9118,9 @@ impl Session {
         if self.funcs.contains_key(name) || self.classes.contains_key(name) {
             return Ok(true);
         }
+        if self.resolve_imported(name)?.is_some() {
+            return Ok(true);
+        }
         self.load_function_file(name)
     }
 
@@ -9076,8 +9155,136 @@ impl Session {
         if self.funcs.contains_key(name) || self.classes.contains_key(name) {
             return Ok(());
         }
+        if name.contains('.') && self.resolve_package_member(name)? {
+            return Ok(());
+        }
+        if self.resolve_imported(name)?.is_some() {
+            return Ok(());
+        }
         let _ = self.load_function_file(name)?;
         Ok(())
+    }
+
+    /// Path of a package member: `pkg.Class` -> `<path>/+pkg/Class.m`,
+    /// `pkg.inner.f` -> `<path>/+pkg/+inner/f.m`.
+    fn package_file(&self, qualified: &str) -> Option<std::path::PathBuf> {
+        let parts: Vec<&str> = qualified.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let last = parts.last()?;
+        for dir in &self.paths {
+            let mut p = dir.clone();
+            for comp in &parts[..parts.len() - 1] {
+                p.push(format!("+{comp}"));
+            }
+            p.push(format!("{last}.m"));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Load a qualified package member and register it under its qualified
+    /// name. Returns true when a function or class became available.
+    fn resolve_package_member(&mut self, qualified: &str) -> Result<bool, LangError> {
+        if self.funcs.contains_key(qualified) || self.classes.contains_key(qualified) {
+            return Ok(true);
+        }
+        let Some(file) = self.package_file(qualified) else { return Ok(false) };
+        let parts: Vec<&str> = qualified.split('.').filter(|p| !p.is_empty()).collect();
+        let Some(bare) = parts.last().copied() else { return Ok(false) };
+        let file_s = file.display().to_string();
+        self.absorb_file(&file, bare)?;
+        let mut found = false;
+        if let Some(mut def) = self.classes.get(bare).cloned() {
+            if def.file == file_s {
+                def.name = qualified.to_string();
+                for m in def.methods.values_mut() {
+                    m.owner = Some(qualified.to_string());
+                }
+                if let Some((pkg, _)) = qualified.rsplit_once('.') {
+                    for s in &mut def.supers {
+                        if !s.contains('.') {
+                            let q = format!("{pkg}.{s}");
+                            if self.package_file(&q).is_some() {
+                                *s = q;
+                            }
+                        }
+                    }
+                }
+                self.classes.insert(qualified.to_string(), def);
+                self.classes.remove(bare);
+                found = true;
+            }
+        }
+        if let Some(def) = self.funcs.get(bare).cloned() {
+            if def.file == file_s {
+                self.funcs.insert(qualified.to_string(), def);
+                self.funcs.remove(bare);
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    /// Resolve a bare name through `import pkg.*` / `import pkg.Name`.
+    fn resolve_imported(&mut self, name: &str) -> Result<Option<String>, LangError> {
+        if name.contains('.') {
+            return Ok(self.resolve_package_member(name)?.then(|| name.to_string()));
+        }
+        for spec in self.imports.clone() {
+            if let Some(prefix) = spec.strip_suffix(".*") {
+                let q = format!("{prefix}.{name}");
+                if self.resolve_package_member(&q)? {
+                    return Ok(Some(q));
+                }
+            } else if spec.rsplit('.').next() == Some(name) && self.resolve_package_member(&spec)? {
+                return Ok(Some(spec));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Flatten a dotted `Ident`/`Field` chain (`pkg.Class.member`).
+    fn expr_dotted_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n) => Some(n.clone()),
+            Expr::Field(b, f) => Self::expr_dotted_name(b).map(|p| format!("{p}.{f}")),
+            _ => None,
+        }
+    }
+
+    /// Resolve `pkg.Enum.Member` / `Class.Member` enumeration constants
+    /// from a dotted value expression.
+    fn resolve_dotted_value(&mut self, full: &str) -> Result<Option<Value>, LangError> {
+        let parts: Vec<&str> = full.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return Ok(None);
+        }
+        let class = parts[..parts.len() - 1].join(".");
+        let member = parts[parts.len() - 1];
+        if self.resolve_package_member(&class)? || self.classes.contains_key(&class) {
+            return self.enum_value(&class, member);
+        }
+        Ok(None)
+    }
+
+    /// Resolve a dotted expression used as a call: first as a package
+    /// function/class constructor, then as `package.Class.method`.
+    fn resolve_package_call(&mut self, full: &str) -> Result<Option<(String, Option<String>)>, LangError> {
+        if self.resolve_package_member(full)? {
+            return Ok(Some((full.to_string(), None)));
+        }
+        let parts: Vec<&str> = full.split('.').filter(|p| !p.is_empty()).collect();
+        for i in (2..parts.len()).rev() {
+            let class = parts[..i].join(".");
+            if self.resolve_package_member(&class)? && self.classes.contains_key(&class) {
+                return Ok(Some((class, Some(parts[i..].join(".")))));
+            }
+        }
+        Ok(None)
     }
 
     /// Parse a `.m` file and absorb its definitions: a top-level
@@ -9127,7 +9334,7 @@ impl Session {
             }
             self.ensure_loaded(&cn)?;
             let Some(def) = self.classes.get(&cn).cloned() else { break };
-            cur = def.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string());
+            cur = def.supers.first().cloned();
             chain.push(def);
         }
         chain.reverse();
@@ -9183,8 +9390,9 @@ impl Session {
         // storage — writes inside methods land on the caller's object.
         let handle = chain.iter().any(|d| d.supers.iter().any(|s| s == "handle"));
         let obj = Value::Object(MObject::new(name.to_string(), sa, handle));
-        let Some(ctor) = self.find_method(name, name)? else { return Ok(obj) };
-        let outs = self.call_def(name, &ctor, argv, 1, Some(obj.clone()))?;
+        let ctor_name = name.rsplit('.').next().unwrap_or(name);
+        let Some(ctor) = self.find_method(name, ctor_name)? else { return Ok(obj) };
+        let outs = self.call_def(ctor_name, &ctor, argv, 1, Some(obj.clone()))?;
         Ok(outs.into_iter().next().unwrap_or(obj))
     }
 
@@ -9211,7 +9419,7 @@ impl Session {
                 self.check_method_access(&m, method)?;
                 return Ok(Some(m));
             }
-            cur = def.and_then(|d| d.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()));
+            cur = def.and_then(|d| d.supers.first().cloned());
         }
         Ok(None)
     }
@@ -9276,6 +9484,18 @@ impl Session {
     /// `obj.name` — property first, then `Class.enum_member`, then a
     /// zero-extra-arg method call (`obj.m` invokes `m`).
     fn object_dot(&mut self, o: &MObject, name: &str) -> Result<Option<Value>, LangError> {
+        if !self.subs_dot_guard {
+            if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                let mut s = StructArray::new();
+                s.set_field(0, "type", Value::Str(".".into()))?;
+                s.set_field(0, "subs", Value::Cell(CellArray::row(vec![Value::Str(name.into())])))?;
+                let saved = self.subs_dot_guard;
+                self.subs_dot_guard = true;
+                let result = self.call_def("subsref", &def, vec![Value::Object(o.clone()), Value::Struct(s)], 1, None);
+                self.subs_dot_guard = saved;
+                return result?.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0)).map(Some);
+            }
+        }
         if let Some(v) = o.prop(name) {
             self.check_prop_access(o, name, false)?;
             return Ok(Some(v));
@@ -9354,16 +9574,17 @@ impl Session {
         Ok(())
     }
 
-    /// `Class.member` — evaluate a class's `enumeration` member.
+    /// `Class.member` - construct an enumeration-member object.
     fn enum_value(&mut self, class: &str, member: &str) -> Result<Option<Value>, LangError> {
         self.ensure_loaded(class)?;
         let Some(def) = self.classes.get(class).cloned() else { return Ok(None) };
         for (n, e) in &def.enums {
             if n == member {
-                return Ok(Some(match e {
-                    Some(x) => self.eval(x)?,
-                    None => Value::Mat(Matrix::zeros(0, 0)),
-                }));
+                let argv = match e {
+                    Some(x) => vec![self.eval(x)?],
+                    None => Vec::new(),
+                };
+                return Ok(Some(self.construct_object(class, argv)?));
             }
         }
         Ok(None)
@@ -9568,11 +9789,16 @@ impl Session {
     /// `call_function` with pre-evaluated argument values — used by
     /// `feval`/function-handle dispatch where args arrive as `Value`s.
     fn call_function_argv(&mut self, name: &str, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
-        match self.funcs.get(name).cloned() {
-            Some(def) => self.call_def(name, &def, argv, nargout, None),
-            // `Name(args)` where Name is a classdef — construct an instance.
-            None if self.classes.contains_key(name) => {
-                let obj = self.construct_object(name, argv)?;
+        let key = if self.funcs.contains_key(name) || self.classes.contains_key(name) {
+            name.to_string()
+        } else {
+            self.resolve_imported(name)?.unwrap_or_else(|| name.to_string())
+        };
+        match self.funcs.get(&key).cloned() {
+            Some(def) => self.call_def(&key, &def, argv, nargout, None),
+            // `Name(args)` where Name is a classdef - construct an instance.
+            None if self.classes.contains_key(&key) => {
+                let obj = self.construct_object(&key, argv)?;
                 Ok(vec![obj])
             }
             None => Err(LangError::new(format!("unknown function '{name}'"), 0)),
@@ -20758,6 +20984,78 @@ end",
     }
 
     #[test]
+    fn package_qualified_and_imported_members() {
+        let dir = m_dir("packages");
+        std::fs::create_dir_all(dir.join("+pkg").join("+inner")).unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Thing.m"),
+            "classdef Thing\n properties\n  x = 0\n end\n methods\n  function obj = Thing(v)\n   if nargin >= 1\n    obj.x = v;\n   end\n  end\n  function y = getx(obj)\n   y = obj.x;\n  end\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("+pkg").join("helper.m"), "function y = helper(x)\ny = x + 1;\nend\n").unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Base.m"),
+            "classdef Base\n properties\n  a = 1\n end\n methods\n  function y = baseval(obj)\n   y = obj.a;\n  end\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("+pkg").join("Derived.m"), "classdef Derived < Base\n properties\n  b = 2\n end\nend\n").unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Color.m"),
+            "classdef Color\n properties\n  value = 0\n end\n methods\n  function obj = Color(v)\n   if nargin >= 1\n    obj.value = v;\n   end\n  end\n end\n enumeration\n  red (1)\n  blue (2)\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("+inner").join("Tool.m"),
+            "classdef Tool\n properties\n  x = 0\n end\n methods\n  function obj = Tool(v)\n   if nargin >= 1\n    obj.x = v;\n   end\n  end\n end\nend\n",
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("a = pkg.Thing(3); b = pkg.helper(4); c = pkg.inner.Tool(5); ca = class(a); xa = a.x; xb = a.getx();").unwrap();
+        assert_eq!(s.get("ca"), Some(&Value::Str("pkg.Thing".into())));
+        assert_eq!(s.get("xa"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("xb"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(5.0)));
+        assert_eq!(
+            s.get("c").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.inner.Tool".into())
+        );
+        s.run("import pkg.*; d = Thing(6); e = helper(7); import pkg.inner.*; f = Tool(8);").unwrap();
+        assert_eq!(
+            s.get("d").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.Thing".into())
+        );
+        assert_eq!(s.get("e"), Some(&Value::Num(8.0)));
+        assert_eq!(
+            s.get("f").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.inner.Tool".into())
+        );
+        s.run("import pkg.Thing; g = Thing(9); dv = pkg.Derived(); dval = dv.baseval(); dcls = class(dv);").unwrap();
+        assert_eq!(s.get("dval"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("dcls"), Some(&Value::Str("pkg.Derived".into())));
+        s.run("ec = pkg.Color.blue; ecv = ec.value; ecc = class(ec);").unwrap();
+        assert_eq!(s.get("ecv"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("ecc"), Some(&Value::Str("pkg.Color".into())));
+        assert_eq!(
+            s.get("g").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.Thing".into())
+        );
+        rm_dir(&dir);
+    }
+
+    #[test]
     fn classdef_subsref_subsasgn() {
         let mut s = Session::new();
         s.run(
@@ -20774,6 +21072,8 @@ end",
                 r = obj.data(s.subs{1});
             elseif strcmp(s.type, '{}')
                 r = obj.data{s.subs{1}};
+            elseif strcmp(s.type, '.')
+                r = obj.data;
             end
         end
         function obj = subsasgn(obj, s, v)
@@ -20781,18 +21081,28 @@ end",
                 obj.data(s.subs{1}) = v;
             elseif strcmp(s.type, '{}')
                 obj.data{s.subs{1}} = v;
+            elseif strcmp(s.type, '.')
+                obj.data = v;
             end
         end
     end
 end",
         )
         .unwrap();
-        s.run("p = Proxy(1:5); x = p(2); p(3) = 9; y = p.data(3);").unwrap();
+        s.run("p = Proxy(1:5); dd = p.data;").unwrap();
+        assert_eq!(s.get("dd").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+        s.run("x = p(2); p(3) = 9; y = p.data(3);").unwrap();
         assert_eq!(s.get("x"), Some(&Value::Num(2.0)));
         assert_eq!(s.get("y"), Some(&Value::Num(9.0)));
-        s.run("q = Proxy({10, 20}); a = q{2}; q{1} = 11; b = q.data{1};").unwrap();
+        s.run("q = Proxy({10, 20});").unwrap();
+        s.run("a = q{2};").unwrap();
+        s.run("q{1} = 11;").unwrap();
+        s.run("b = q.data{1};").unwrap();
         assert_eq!(s.get("a"), Some(&Value::Num(20.0)));
         assert_eq!(s.get("b"), Some(&Value::Num(11.0)));
+        s.run("r = Proxy(1:5); d = r.data; r.data = 7; d2 = r.data;").unwrap();
+        assert_eq!(s.get("d").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+        assert_eq!(s.get("d2"), Some(&Value::Num(7.0)));
     }
 
     #[test]
@@ -20926,6 +21236,19 @@ end",
         let mut s = Session::new();
         s.run(
             "classdef Col
+    properties
+        value
+    end
+    methods
+        function obj = Col(v)
+            if nargin >= 1
+                obj.value = v;
+            end
+        end
+        function r = eq(a, b)
+            r = a.value == b.value;
+        end
+    end
     enumeration
         red (1)
         blue (2)
@@ -20933,10 +21256,12 @@ end",
 end",
         )
         .unwrap();
-        // `Class.member` evaluates the member's backing value.
-        s.run("a = Col.red; b = Col.blue;").unwrap();
-        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
-        assert_eq!(s.get("b"), Some(&Value::Num(2.0)));
+        // Enumeration members are class instances carrying the backing value.
+        s.run("a = Col.red; b = Col.blue; ca = class(a); va = a.value; vb = b.value; eq = (a == b);").unwrap();
+        assert_eq!(s.get("ca"), Some(&Value::Str("Col".into())));
+        assert_eq!(s.get("va"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("vb"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("eq"), Some(&Value::Num(0.0)));
     }
 
     #[test]

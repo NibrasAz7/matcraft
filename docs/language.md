@@ -55,9 +55,8 @@ by observing MathWorks software.
   uses them re-declares `global` and then reads/writes the shared store.
   `persistent a b` inside a `function` keeps its value between calls
   (per file+function); at script scope `persistent` errors like M-code.
-- `import pkg.*` / `import pkg.Name` records the spec (bare `import`
-  echoes the list) — there is no package namespace to resolve, so this is
-  bookkeeping only.
+- `import pkg.*` / `import pkg.Name` resolves members from a `+pkg`
+  package directory on the search path; bare `import` echoes the list.
 - Command syntax: `name arg arg` = `name('arg','arg')` — `format long`,
   `clear x`, `disp hello`, `save f.txt -ascii` all work. Each whitespace-
   separated *word* is one arg, so `f.txt` and `-ascii` are literal strings,
@@ -220,22 +219,30 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   `[a b]`/`[a; b]` concatenate objects of the same class. Element methods
   and event stores live on each scalar element.
 - `subsref`/`subsasgn`: a class that defines `subsref(obj,s)` handles
-  `()` and `{}` reads; `subsasgn(obj,s,v)` handles `()` and `{}` writes.
-  The `s` struct has `type` (`'()'` or `'{}'`) and a cell `subs` of index
-  values (`':'` is passed as a char). Object arrays and property access
-  still work when the class does not define these methods.
+  `()`, `{}` and `.` reads; `subsasgn(obj,s,v)` handles `()`, `{}` and `.`
+  writes. The `s` struct has `type` (`'()'`, `'{}'` or `'.'`) and a cell
+  `subs` of index values (`':'` is passed as a char). Property/method
+  access inside the handler bypasses the override, so implementations can
+  read their own fields without recursion.
+- Packages: directories named `+pkg` under the search path provide
+  `pkg.Name`, `pkg.inner.Name` and `pkg.fn(…)`; `import pkg.*` and
+  `import pkg.Name` make members available unqualified. Package classes
+  keep their qualified class name, resolve same-package superclasses, and
+  work with methods, events, object arrays and enumeration members.
+- Enumeration members are class instances: `Color.red` runs the class
+  constructor with the declared backing value, so `color.value` and
+  `class(color)` behave like normal objects.
 - Operator overloads: `+ - * .* / ./ \ ^ .^` map to
   `plus minus mtimes times mrdivide rdivide mldivide mpower power`,
   comparisons to `eq ne lt le gt ge`, `& |` to `and or`, `-x +x ~x` to
   `uminus uplus not`, `'`/`.'` to `ctranspose`/`transpose`, and
   `[a b]`/`[a; b]` object literals to `horzcat`/`vertcat` — when the
   class defines the method, else a clear "not defined for class" error.
-- `Class.member` evaluates an `enumeration` member's backing value.
-  Not in (parse harmlessly or error clearly): packages, `handle.notify`'s
-  built-in lifecycle events beyond declared class events, enumeration
-  objects, COM automation, `builtin('method', obj, …)` dispatch, dynamic
-  props, and `subsref`/`subsasgn` dispatch for `.` field access (only
-  `()`/`{}` are dispatched).
+- `Class.member` evaluates an `enumeration` member's backing value, now
+  returning a class instance.
+  Not in (parse harmlessly or error clearly): COM automation and
+  `builtin('method', obj, …)` dispatch, dynamic props beyond declared
+  fields, and `.mat` files containing MATLAB `mcOS`/opaque objects.
 
 ## Builtin library
 
@@ -277,7 +284,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
 | Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`;
   the legacy `rand('seed',v)`/`rand('state',v)`/`rand('twister',v)` forms set and `rand('state')` reads it; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
-| Environment | `addpath rmpath savepath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `p = path` returns the joined path and `path(p)` sets it; `addpath(...,'-begin')` prepends (default) and `'-end'` appends; `savepath` persists the path (`MATCRAFT_PATH_FILE` overrides the platform location); `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*` is bookkeeping only;
+| Environment | `addpath rmpath savepath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `p = path` returns the joined path and `path(p)` sets it; `addpath(...,'-begin')` prepends (default) and `'-end'` appends; `savepath` persists the path (`MATCRAFT_PATH_FILE` overrides the platform location); `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*`/`import pkg.Name` resolve `+pkg` package members;
   `d = dir(pat)` returns a name/folder/date/bytes/isdir/datenum struct array
   (sorted, `.`/`..` first, 0x1 when nothing matches; `ls` prints the listing);
   `p = which('n')` returns the located path/description char or `''`) |

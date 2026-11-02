@@ -275,8 +275,9 @@
   arrays with growth/deletion/concatenation, enforced
   `Access`/`GetAccess`/`SetAccess`, `Constant`, `Dependent`, `Abstract`
   and `Sealed` attributes, `.mat` v5 object serialization (including
-  handle-store reattachment), and `subsref`/`subsasgn` dispatch for
-  `()`/`{}` indexing.
+  handle-store reattachment), `subsref`/`subsasgn` dispatch for
+  `()`/`{}`/`.` indexing, `+pkg` package resolution with imports, and
+  enumeration members as constructor-backed class instances.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,
