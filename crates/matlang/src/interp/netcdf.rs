@@ -118,6 +118,32 @@ fn var_from_matrix(name: String, m: &Matrix) -> NcVar {
     NcVar { name, dim_names, shape, kind: NcType::Double, data }
 }
 
+/// Give a new variable dimension names that exist in `nc`, reusing a
+/// same-length dimension when one is available and creating `dimN`
+/// otherwise. Keeps classic headers valid after importing a NetCDF-4 model
+/// with real dimension names.
+fn ensure_dimension_names(var: &mut NcVar, nc: &mut NetCdf) {
+    for axis in 0..var.shape.len() {
+        let size = var.shape.get(axis).copied().unwrap_or(1);
+        let name = if let Some((name, _)) = nc.dims.iter().find(|(_, s)| *s == size) {
+            name.clone()
+        } else {
+            let mut name = format!("dim{}", axis + 1);
+            let mut suffix = 1usize;
+            while nc.dims.iter().any(|(n, _)| n == &name) {
+                name = format!("dim{}_{suffix}", axis + 1);
+                suffix = suffix.saturating_add(1);
+            }
+            nc.dims.push((name.clone(), size));
+            name
+        };
+        if let Some(slot) = var.dim_names.get_mut(axis) {
+            *slot = name;
+        }
+    }
+    var.dim_names.truncate(var.shape.len());
+}
+
 fn type_name(kind: NcType) -> &'static str {
     match kind {
         NcType::Byte => "int8",
@@ -183,13 +209,21 @@ impl Session {
                             }
                         }
                     } else {
-                        nc.vars[pos] = new_var;
+                        let shape = nc.vars[pos].shape.clone();
+                        let dim_names = nc.vars[pos].dim_names.clone();
+                        let expected = shape.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+                        if data.numel() != expected {
+                            return Err(LangError::new("ncwrite: replacement data size does not match the variable", 0));
+                        }
+                        let mut nv = new_var;
+                        nv.shape = shape;
+                        nv.dim_names = dim_names;
+                        nc.vars[pos] = nv;
                     }
                 } else {
-                    if nc.dims.len() < 2 {
-                        nc.dims = vec![("dim1".into(), data.rows()), ("dim2".into(), data.cols())];
-                    }
-                    nc.vars.push(new_var);
+                    let mut nv = new_var;
+                    ensure_dimension_names(&mut nv, &mut nc);
+                    nc.vars.push(nv);
                 }
                 crate::netcdf::write(&path, &nc)?;
                 Ok(vec![Value::Num(0.0)])

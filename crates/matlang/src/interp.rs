@@ -22020,6 +22020,31 @@ end",
     }
 
     #[test]
+    fn netcdf4_write_roundtrip_as_classic() {
+        let dir = m_dir("nc4rt");
+        let path = dir.join("sample.nc");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/netcdf4_sample.nc");
+        std::fs::copy(&fixture, &path).unwrap();
+        let p = path.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "ncwrite('{p}', 'temp', [9 8 7; 6 5 4; 3 2 1; 0 -1 -2]); t = ncread('{p}', 'temp'); \
+             c = ncread('{p}', 'scale'); l = ncread('{p}', 'lat'); info = ncinfo('{p}'); nv = numel(info.Variables);"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.get("t").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((4, 3, vec![9.0, 6.0, 3.0, 0.0, 8.0, 5.0, 2.0, -1.0, 7.0, 4.0, 1.0, -2.0]))
+        );
+        assert_eq!(s.get("c"), Some(&Value::Num(2.5)));
+        assert_eq!(s.get("l").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![10.0, 20.0, 30.0]));
+        assert_eq!(s.get("nv"), Some(&Value::Num(4.0)));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.get(0..4), Some(b"CDF\x01".as_slice()));
+        rm_dir(&dir);
+    }
+
+    #[test]
     fn hdf5_netcdf_io() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
