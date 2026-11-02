@@ -240,9 +240,18 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   class defines the method, else a clear "not defined for class" error.
 - `Class.member` evaluates an `enumeration` member's backing value, now
   returning a class instance.
-  Not in (parse harmlessly or error clearly): COM automation and
-  `builtin('method', obj, …)` dispatch, dynamic props beyond declared
-  fields, and `.mat` files containing MATLAB `mcOS`/opaque objects.
+  Not in (parse harmlessly or error clearly): `builtin('method', obj, …)`
+  dispatch, dynamic props beyond declared fields, and `.mat` files
+  containing MATLAB `mcOS`/opaque objects.
+- Windows COM automation: `actxserver('ProgID')` starts a long-lived
+  PowerShell bridge process that owns the COM object and speaks
+  JSON-lines over stdin/stdout, so the Rust core stays free of `unsafe`.
+  `obj.Property` reads/writes, `obj.Method(args)` invokes, `get`/`set`
+  work, `class(obj)` is `'COM'`, `get(obj,'ProgID')` reports the
+  requested ProgID, and `delete(obj)` releases the COM object. Scalar
+  numeric/string/boolean results and numeric arrays are converted;
+  COM-object results report a clear error. The bridge is Windows-only
+  (other platforms report that COM needs Windows).
 
 ## Builtin library
 
@@ -289,7 +298,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   (sorted, `.`/`..` first, 0x1 when nothing matches; `ls` prints the listing);
   `p = which('n')` returns the located path/description char or `''`) |
 | Parallel / GPU | `maxNumCompThreads parpool parfeval fetchOutputs onCleanup gpuArray gather canUseGPU existsOnGPU gpuDevice` - Rayon-backed parallel matrix kernels are enabled by `maxNumCompThreads(n)`/`parpool(n)`; `gpuArray`/`gather` use a wgpu compute matmul when built with `--features gpu`, otherwise they transparently fall back to CPU | 
-| System | `version ver computer ispc isunix ismac getenv setenv system dos unix fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license diary jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver rethrow verLessThan validateattributes validatestring inputname optimset optimget` - `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `dos`/`unix` are aliases, and statement-leading `!cmd` is the same shell escape; `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0; `mfilename('fullpath')` returns the running file's path; `diary` appends console output to a file, JSON/import helpers cover configuration and numeric text, and `rethrow`/`verLessThan`/`validateattributes`/`validatestring`/`inputname` cover common error and validation paths; `actxserver` reports a clear unsupported-automation error (pure safe Rust, no COM bridge in this build) |
+| System | `version ver computer ispc isunix ismac getenv setenv system dos unix fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license diary jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver rethrow verLessThan validateattributes validatestring inputname optimset optimget` - `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `dos`/`unix` are aliases, and statement-leading `!cmd` is the same shell escape; `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0; `mfilename('fullpath')` returns the running file's path; `diary` appends console output to a file, JSON/import helpers cover configuration and numeric text, and `rethrow`/`verLessThan`/`validateattributes`/`validatestring`/`inputname` cover common error and validation paths; `actxserver` starts a Windows PowerShell COM bridge (properties, methods, `get`/`set`, `delete`) |
 | UI | `input waitbar drawnow beep ishandle findobj findall ishold gca get set argv` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number; `get(0,'ScreenSize')`/`'ScreenDepth'`/`'Children'` report a fixed virtual screen, `get(fig,'prop')`/`get(fig)` reads figure limits/labels/grid; `set(0,'Default*',v)` stores root defaults `get` reads back, `set(fig,'prop',v,…)` writes the same props; `argv()` returns an empty cellstr (scripts take no args) |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`fprintf(fid,fmt,…)` writes to an `fopen` file id, 1/2 = stdout/stderr;

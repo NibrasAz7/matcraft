@@ -16,6 +16,7 @@ use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::LangError;
 
 mod anova;
+mod com;
 mod control;
 mod corpus;
 mod ga;
@@ -293,6 +294,9 @@ pub struct MObject {
     props: ObjStore,
     /// Live event listeners; only handle classes carry a store.
     listeners: Option<std::rc::Rc<std::cell::RefCell<Vec<EventListener>>>>,
+    /// Windows COM automation session, when this object came from
+    /// `actxserver`.
+    com: Option<std::rc::Rc<std::cell::RefCell<com::ComSession>>>,
     /// Non-empty when this object is an object-array proxy. Each entry is
     /// a scalar object of the same class.
     array: Option<Box<ObjectArray>>,
@@ -322,8 +326,28 @@ impl MObject {
             class_name,
             props: if handle { ObjStore::Shared(std::rc::Rc::new(std::cell::RefCell::new(props))) } else { ObjStore::Owned(props) },
             listeners: if handle { Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))) } else { None },
+            com: None,
             array: None,
         }
+    }
+
+    /// COM automation object: properties carry `ProgID`; the PowerShell
+    /// session lives behind a shared handle so copies talk to the same COM
+    /// object.
+    pub(crate) fn com_object(progid: &str, session: com::ComSession) -> Self {
+        let mut props = StructArray::new();
+        let _ = props.set_field(0, "ProgID", Value::Str(progid.to_string()));
+        MObject {
+            class_name: "COM".into(),
+            props: ObjStore::Owned(props),
+            listeners: None,
+            com: Some(std::rc::Rc::new(std::cell::RefCell::new(session))),
+            array: None,
+        }
+    }
+
+    fn com_session(&self) -> Option<std::rc::Rc<std::cell::RefCell<com::ComSession>>> {
+        self.com.clone()
     }
 
     pub(crate) fn array(class_name: String, elements: Vec<MObject>, dims: (usize, usize)) -> Self {
@@ -331,6 +355,7 @@ impl MObject {
             class_name,
             props: ObjStore::Owned(StructArray::new()),
             listeners: None,
+            com: None,
             array: Some(Box::new(ObjectArray { elements, dims: vec![dims.0, dims.1] })),
         }
     }
@@ -356,12 +381,16 @@ impl MObject {
     /// properties + class name, so the session reattaches the shared store
     /// and listener table when the class is a handle class.
     pub(crate) fn into_handle(self) -> Self {
+        if self.com.is_some() {
+            return self;
+        }
         if let Some(arr) = self.array {
             let elements = arr.elements.into_iter().map(|e| e.into_handle()).collect();
             return MObject {
                 class_name: self.class_name,
                 props: ObjStore::Owned(StructArray::new()),
                 listeners: None,
+                com: None,
                 array: Some(Box::new(ObjectArray { elements, dims: arr.dims })),
             };
         }
@@ -2478,6 +2507,13 @@ impl Session {
                     }
                     let base_val = self.eval(b)?;
                     if let Value::Object(o) = &base_val {
+                        if o.class_name == "COM" {
+                            if let Some(session) = o.com_session() {
+                                let argv = self.eval_args(args)?;
+                                let out = session.borrow_mut().invoke(fname, &argv)?;
+                                return Ok(Some(out));
+                            }
+                        }
                         if o.class_name == "containers.Map" {
                             match fname.as_str() {
                                 "isKey" => {
@@ -3005,6 +3041,14 @@ impl Session {
         let Some((step, rest)) = path.split_first() else { return Ok(v) };
         match step {
             PathStep::Name(field) => {
+                if let Value::Object(o) = &cur {
+                    if o.class_name == "COM" {
+                        if let Some(session) = o.com_session() {
+                            session.borrow_mut().set(field, &v)?;
+                            return Ok(Value::Object(o.clone()));
+                        }
+                    }
+                }
                 // Custom `.`-field assignment via `subsasgn` when the class
                 // defines it (the method's own body bypasses this guard).
                 if !self.subs_dot_guard {
@@ -5382,6 +5426,16 @@ impl Session {
                 // `get(obj,'prop')`/`get(obj)` — object property access.
                 if let Some(Value::Object(o)) = v.first() {
                     let o = o.clone();
+                    if o.class_name == "COM" {
+                        if let Some(session) = o.com_session() {
+                            return match v.get(1) {
+                                Some(Value::Str(s)) if s == "ProgID" => Ok(o.prop(s)),
+                                Some(Value::Str(s)) => session.borrow_mut().get(s).map(Some),
+                                None => Ok(None),
+                                _ => Err(LangError::new("get: property name must be a string", 0)),
+                            };
+                        }
+                    }
                     return match v.get(1) {
                         Some(Value::Str(s)) => {
                             self.check_prop_access(&o, s, false)?;
@@ -5470,8 +5524,14 @@ impl Session {
                             _ => return Err(LangError::new("set: property name must be a string", 0)),
                         };
                         let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
-                        self.check_prop_access(&o, &pname, true)?;
-                        o.set_prop(&pname, val.clone());
+                        if o.class_name == "COM" {
+                            if let Some(session) = o.com_session() {
+                                session.borrow_mut().set(&pname, val)?;
+                            }
+                        } else {
+                            self.check_prop_access(&o, &pname, true)?;
+                            o.set_prop(&pname, val.clone());
+                        }
                         i += 2;
                     }
                     return Ok(Some(Value::Object(o)));
@@ -9484,6 +9544,18 @@ impl Session {
     /// `obj.name` — property first, then `Class.enum_member`, then a
     /// zero-extra-arg method call (`obj.m` invokes `m`).
     fn object_dot(&mut self, o: &MObject, name: &str) -> Result<Option<Value>, LangError> {
+        if let Some(session) = o.com_session() {
+            if name == "ProgID" {
+                if let Some(v) = o.prop(name) {
+                    return Ok(Some(v));
+                }
+            }
+            let got = session.borrow_mut().get(name);
+            return match got {
+                Ok(v) => Ok(Some(v)),
+                Err(_) => session.borrow_mut().invoke(name, &[]).map(Some),
+            };
+        }
         if !self.subs_dot_guard {
             if let Some(def) = self.find_method(&o.class_name, "subsref")? {
                 let mut s = StructArray::new();
@@ -10759,6 +10831,11 @@ impl Session {
                                         let _ = std::fs::remove_file(e.path());
                                     }
                                 }
+                            }
+                        }
+                        Value::Object(o) if o.class_name == "COM" => {
+                            if let Some(session) = o.com_session() {
+                                session.borrow_mut().release();
                             }
                         }
                         Value::Object(o) if o.class_name == "listener" => {
@@ -12109,13 +12186,8 @@ impl Session {
             "uimenu" => Ok(vec![Value::Num(1.0)]),
             "actxserver" => {
                 let prog = sarg(0).unwrap_or("").to_string();
-                Err(LangError::new(
-                    format!(
-                        "actxserver: COM automation is not available in this build (requested '{prog}'); \
-                         MatCraft is pure safe Rust and needs a platform automation bridge"
-                    ),
-                    0,
-                ))
+                let session = com::ComSession::start(&prog)?;
+                Ok(vec![Value::Object(MObject::com_object(&prog, session))])
             }
             "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
             "ver" => {
@@ -21103,6 +21175,20 @@ end",
         s.run("r = Proxy(1:5); d = r.data; r.data = 7; d2 = r.data;").unwrap();
         assert_eq!(s.get("d").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
         assert_eq!(s.get("d2"), Some(&Value::Num(7.0)));
+    }
+
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    #[test]
+    fn com_automation_bridge() {
+        let mut s = Session::new();
+        if s.run("w = actxserver('WScript.Shell');").is_err() {
+            return; // COM unavailable in this environment
+        }
+        s.run("p = w.ExpandEnvironmentStrings('%SystemRoot%'); w.CurrentDirectory = 'C:\\Windows'; d = w.CurrentDirectory; c = class(w); pid = get(w, 'ProgID'); delete(w);").unwrap();
+        assert!(matches!(s.get("p"), Some(Value::Str(v)) if v.eq_ignore_ascii_case("C:\\Windows")));
+        assert!(matches!(s.get("d"), Some(Value::Str(v)) if v.eq_ignore_ascii_case("C:\\Windows")));
+        assert_eq!(s.get("c"), Some(&Value::Str("COM".into())));
+        assert_eq!(s.get("pid"), Some(&Value::Str("WScript.Shell".into())));
     }
 
     #[test]

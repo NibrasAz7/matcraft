@@ -140,6 +140,7 @@ fn value_element(name: &str, val: &Value) -> Result<Vec<u8>, String> {
         Value::Sparse(s) => Ok(sparse_element(name, s)),
         Value::Cell(c) => cell_element(name, c),
         Value::Struct(s) => struct_element(name, s),
+        Value::Object(o) if o.class_name == "COM" => Err(format!("cannot save '{name}' - COM objects are not serializable")),
         Value::Object(o) => object_element(name, o),
         Value::Func(_) => Err(format!("cannot save '{name}' - function handles are not supported in .mat v5")),
     }

@@ -277,7 +277,9 @@
   and `Sealed` attributes, `.mat` v5 object serialization (including
   handle-store reattachment), `subsref`/`subsasgn` dispatch for
   `()`/`{}`/`.` indexing, `+pkg` package resolution with imports, and
-  enumeration members as constructor-backed class instances.
+  enumeration members as constructor-backed class instances. Windows COM
+  automation is available through a safe PowerShell bridge (`actxserver`,
+  property/method dispatch, `get`/`set`, `delete`).
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,
