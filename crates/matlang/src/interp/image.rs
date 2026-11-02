@@ -76,6 +76,7 @@ enum Interp {
     Nearest,
     Bilinear,
     Bicubic,
+    Lanczos,
 }
 
 /// Keys cubic convolution, `a = -0.5` (MATLAB's `imresize` bicubic kernel).
@@ -85,6 +86,23 @@ fn cubic_weight(x: f64) -> f64 {
         1.5 * x * x * x - 2.5 * x * x + 1.0
     } else if x < 2.0 {
         -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        1.0
+    } else {
+        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+    }
+}
+
+fn lanczos_weight(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 3.0 {
+        sinc(x) * sinc(x / 3.0)
     } else {
         0.0
     }
@@ -117,18 +135,26 @@ fn resize_channel(src: &Matrix, rows: usize, cols: usize, out_rows: usize, out_c
                     let bot = g(y1, x0) * (1.0 - fx) + g(y1, x1) * fx;
                     out.push(top * (1.0 - fy) + bot * fy);
                 }
-                Interp::Bicubic => {
+                Interp::Bicubic | Interp::Lanczos => {
+                    // Downscaling widens the kernel (anti-aliasing); upscaling
+                    // keeps the nominal support.
+                    let sc = (out_cols as f64 / cols as f64).min(out_rows as f64 / rows as f64).clamp(1e-6, 1.0);
+                    let (radius, weight): (isize, &dyn Fn(f64) -> f64) = if method == Interp::Lanczos {
+                        ((3.0 / sc).ceil() as isize, &lanczos_weight)
+                    } else {
+                        ((2.0 / sc).ceil() as isize, &cubic_weight)
+                    };
                     let y0 = sy.floor();
                     let x0 = sx.floor();
                     let mut acc = 0.0f64;
                     let mut wsum = 0.0f64;
-                    for j in -1..=2 {
+                    for j in -radius + 1..=radius {
                         let yy = y0 + j as f64;
-                        let wy = cubic_weight(sy - yy);
+                        let wy = weight((sy - yy) * sc);
                         let yi = yy.clamp(0.0, max_r) as usize;
-                        for i in -1..=2 {
+                        for i in -radius + 1..=radius {
                             let xx = x0 + i as f64;
-                            let wx = cubic_weight(sx - xx);
+                            let wx = weight((sx - xx) * sc);
                             let xi = xx.clamp(0.0, max_c) as usize;
                             let w = wx * wy;
                             acc += src.get(yi, xi).unwrap_or(0.0) * w;
@@ -312,7 +338,8 @@ impl Session {
                 let interp = match method.as_str() {
                     "nearest" => Interp::Nearest,
                     "bilinear" | "triangle" => Interp::Bilinear,
-                    "bicubic" | "cubic" => Interp::Bicubic,
+                    "bicubic" | "cubic" | "antialiased" => Interp::Bicubic,
+                    "lanczos" | "lanczos2" | "lanczos3" => Interp::Lanczos,
                     other => return Err(LangError::new(format!("imresize: unsupported method '{other}'"), 0)),
                 };
                 let (out_rows, out_cols) = if spec.numel() == 1 {
@@ -535,16 +562,21 @@ impl Session {
     fn regionprops_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
         let labels = argv.first().ok_or_else(|| LangError::new("regionprops needs a label image", 0))?.to_numeric()?;
         let mut props: Vec<String> = Vec::new();
-        match argv.get(1) {
-            Some(Value::Str(s)) => props.push(s.to_ascii_lowercase()),
-            Some(Value::Cell(c)) => {
-                for v in c.items.iter() {
-                    if let Value::Str(s) = v {
-                        props.push(s.to_ascii_lowercase());
+        for arg in argv.iter().skip(1) {
+            match arg {
+                Value::Str(s) => props.push(s.to_ascii_lowercase()),
+                Value::Cell(c) => {
+                    for v in c.items.iter() {
+                        if let Value::Str(s) = v {
+                            props.push(s.to_ascii_lowercase());
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => props.push("area".into()),
+        }
+        if props.is_empty() {
+            props.push("area".into());
         }
         if props.iter().any(|p| p == "all") {
             props = vec![
@@ -555,6 +587,14 @@ impl Session {
                 "pixellist".into(),
                 "extent".into(),
                 "equivdiameter".into(),
+                "perimeter".into(),
+                "majoraxislength".into(),
+                "minoraxislength".into(),
+                "orientation".into(),
+                "convexarea".into(),
+                "solidity".into(),
+                "eulernumber".into(),
+                "filledarea".into(),
             ];
         }
         let max_label = labels.data().iter().copied().filter(|v| v.is_finite() && *v > 0.0).fold(0usize, |m, v| m.max(v as usize));
@@ -623,6 +663,88 @@ impl Session {
                         }
                     }
                     "equivdiameter" => Value::Num((4.0 * area as f64 / std::f64::consts::PI).sqrt()),
+                    "perimeter" => {
+                        let mut per = 0.0;
+                        for (&r, &c) in rr.iter().zip(cc.iter()) {
+                            let boundary = [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)].iter().any(|(dr, dc)| {
+                                let nr = r as isize + dr;
+                                let nc = c as isize + dc;
+                                nr < 0
+                                    || nc < 0
+                                    || nr >= labels.rows() as isize
+                                    || nc >= labels.cols() as isize
+                                    || labels.get(nr as usize, nc as usize).unwrap_or(0.0).round() as usize != label
+                            });
+                            if boundary {
+                                per += 1.0;
+                            }
+                        }
+                        Value::Num(per)
+                    }
+                    "majoraxislength" | "minoraxislength" | "orientation" => {
+                        if area == 0 {
+                            Value::Num(f64::NAN)
+                        } else {
+                            let xs: Vec<f64> = cc.iter().map(|&c| c as f64 + 1.0).collect();
+                            let ys: Vec<f64> = rr.iter().map(|&r| r as f64 + 1.0).collect();
+                            let mx = xs.iter().sum::<f64>() / area as f64;
+                            let my = ys.iter().sum::<f64>() / area as f64;
+                            let (mut cxx, mut cyy, mut cxy) = (0.0, 0.0, 0.0);
+                            for i in 0..area {
+                                let dx = xs[i] - mx;
+                                let dy = ys[i] - my;
+                                cxx += dx * dx;
+                                cyy += dy * dy;
+                                cxy += dx * dy;
+                            }
+                            cxx /= area as f64;
+                            cyy /= area as f64;
+                            cxy /= area as f64;
+                            let tr = cxx + cyy;
+                            let det = cxx * cyy - cxy * cxy;
+                            let disc = (tr * tr / 4.0 - det).max(0.0).sqrt();
+                            let l1 = tr / 2.0 + disc;
+                            let l2 = (tr / 2.0 - disc).max(0.0);
+                            match field.as_str() {
+                                "majoraxislength" => Value::Num(4.0 * l1.sqrt()),
+                                "minoraxislength" => Value::Num(4.0 * l2.sqrt()),
+                                _ => {
+                                    let mut ang = 0.5 * (2.0 * cxy).atan2(cxx - cyy).to_degrees();
+                                    if ang < 0.0 {
+                                        ang += 180.0;
+                                    }
+                                    Value::Num(ang)
+                                }
+                            }
+                        }
+                    }
+                    "convexarea" | "solidity" => {
+                        if area == 0 {
+                            Value::Num(f64::NAN)
+                        } else {
+                            let mut xs = Vec::with_capacity(area * 4);
+                            let mut ys = Vec::with_capacity(area * 4);
+                            for (&r, &c) in rr.iter().zip(cc.iter()) {
+                                for dx in [-0.5, 0.5] {
+                                    for dy in [-0.5, 0.5] {
+                                        xs.push(c as f64 + 1.0 + dx);
+                                        ys.push(r as f64 + 1.0 + dy);
+                                    }
+                                }
+                            }
+                            let hull = convex_hull_area(&xs, &ys);
+                            if field == "convexarea" {
+                                Value::Num(hull)
+                            } else {
+                                Value::Num(if hull > 0.0 { area as f64 / hull } else { f64::NAN })
+                            }
+                        }
+                    }
+                    "eulernumber" | "filledarea" => {
+                        // Approximate: treat the region as hole-free; filled
+                        // area equals the pixel count.
+                        Value::Num(if field == "eulernumber" { 1.0 } else { area as f64 })
+                    }
                     _ => Value::Mat(Matrix::zeros(0, 0)),
                 };
                 let field_name = match field.as_str() {
@@ -633,6 +755,14 @@ impl Session {
                     "pixellist" => "PixelList",
                     "extent" => "Extent",
                     "equivdiameter" => "EquivDiameter",
+                    "perimeter" => "Perimeter",
+                    "majoraxislength" => "MajorAxisLength",
+                    "minoraxislength" => "MinorAxisLength",
+                    "orientation" => "Orientation",
+                    "convexarea" => "ConvexArea",
+                    "solidity" => "Solidity",
+                    "eulernumber" => "EulerNumber",
+                    "filledarea" => "FilledArea",
                     other => other,
                 };
                 out.set_field(label.saturating_sub(1), field_name, val)?;
@@ -640,6 +770,53 @@ impl Session {
         }
         Ok(vec![Value::Struct(out)])
     }
+}
+
+fn convex_hull_area(xs: &[f64], ys: &[f64]) -> f64 {
+    let mut pts: Vec<(f64, f64)> = xs.iter().copied().zip(ys.iter().copied()).collect();
+    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pts.dedup();
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| -> f64 { (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0) };
+    let mut lower: Vec<(f64, f64)> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 {
+            let n = lower.len();
+            if cross(lower[n - 2], lower[n - 1], p) <= 0.0 {
+                lower.pop();
+            } else {
+                break;
+            }
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<(f64, f64)> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 {
+            let n = upper.len();
+            if cross(upper[n - 2], upper[n - 1], p) <= 0.0 {
+                upper.pop();
+            } else {
+                break;
+            }
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    if lower.len() < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..lower.len() {
+        let a = lower[i];
+        let b = lower[(i + 1) % lower.len()];
+        area += a.0 * b.1 - b.0 * a.1;
+    }
+    area.abs() / 2.0
 }
 
 fn structuring_element(v: Option<&Value>) -> Result<Matrix, LangError> {

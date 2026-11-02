@@ -2518,6 +2518,7 @@ dependencies = [
  "matplot",
  "regex",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

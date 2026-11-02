@@ -820,6 +820,410 @@ fn addvars_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
     Ok(Value::Object(MObject::owned("table".into(), out)))
 }
 
+fn group_keys(v: &Value) -> Vec<String> {
+    match v {
+        Value::Mat(m) => (0..m.rows()).map(|r| format!("n:{}", m.get(r, 0).unwrap_or(f64::NAN))).collect(),
+        Value::Cell(c) => (0..c.rows)
+            .map(|r| match c.get(r, 0) {
+                Some(Value::Str(s)) => format!("s:{s}"),
+                Some(Value::Num(x)) => format!("n:{x}"),
+                _ => String::new(),
+            })
+            .collect(),
+        Value::Str(s) => vec![format!("s:{s}")],
+        _ => Vec::new(),
+    }
+}
+
+fn unique_groups(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = keys.to_vec();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn id_for_group(v: &Value, key: &str, keys: &[String]) -> Value {
+    let rows: Vec<usize> = keys.iter().enumerate().filter(|(_, k)| *k == key).map(|(i, _)| i).collect();
+    match v {
+        Value::Mat(m) => Value::Num(m.get(rows.first().copied().unwrap_or(0), 0).unwrap_or(f64::NAN)),
+        Value::Cell(c) => c.get(rows.first().copied().unwrap_or(0), 0).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+        Value::Str(s) => Value::Str(s.clone()),
+        _ => Value::Str(key.to_string()),
+    }
+}
+
+fn findgroups_value(argv: &[Value], nout: usize) -> Result<Vec<Value>, LangError> {
+    if argv.is_empty() {
+        return Err(LangError::new("findgroups needs grouping variables", 0));
+    }
+    let first = &argv[0];
+    let keys = group_keys(first);
+    if keys.is_empty() {
+        return Err(LangError::new("findgroups: unsupported grouping variable", 0));
+    }
+    let groups = unique_groups(&keys);
+    let mut g = Matrix::zeros(keys.len(), 1);
+    for (r, k) in keys.iter().enumerate() {
+        let idx = groups.iter().position(|x| x == k).unwrap_or(0);
+        let _ = g.set(r, 0, (idx + 1) as f64);
+    }
+    let mut out = vec![Value::Mat(g)];
+    if nout > 1 {
+        let ids: Vec<Value> = groups.iter().map(|k| id_for_group(first, k, &keys)).collect();
+        let id = match first {
+            Value::Mat(_) => {
+                let mut m = Matrix::zeros(ids.len(), 1);
+                for (i, v) in ids.iter().enumerate() {
+                    let x = v.scalar().unwrap_or(f64::NAN);
+                    let _ = m.set(i, 0, x);
+                }
+                Value::Mat(m)
+            }
+            _ => Value::Cell(CellArray::col(ids)),
+        };
+        out.push(id);
+    }
+    Ok(out)
+}
+
+fn subset_matrix_rows(m: &Matrix, rows: &[usize]) -> Matrix {
+    let mut out = Matrix::zeros(rows.len(), m.cols());
+    for (i, &r) in rows.iter().enumerate() {
+        for c in 0..m.cols() {
+            let _ = out.set(i, c, m.get(r, c).unwrap_or(f64::NAN));
+        }
+    }
+    out
+}
+
+fn splitapply_value(s: &mut Session, argv: &[Value]) -> Result<Value, LangError> {
+    if argv.len() < 3 {
+        return Err(LangError::new("splitapply needs (func, X, G)", 0));
+    }
+    let func = &argv[0];
+    let x = &argv[1];
+    let g = argv[2].to_matrix()?;
+    let n = g.numel();
+    let maxg = g.data().iter().copied().filter(|v| v.is_finite()).fold(0.0f64, f64::max).max(0.0) as usize;
+    let mut results: Vec<Value> = Vec::new();
+    for group in 1..=maxg {
+        let rows: Vec<usize> = (0..n).filter(|&i| g.get_linear(i).unwrap_or(0.0) == group as f64).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let subset = match x {
+            Value::Mat(m) => Value::Mat(subset_matrix_rows(m, &rows)),
+            Value::Cell(c) => {
+                let mut out = CellArray::new(rows.len(), c.cols);
+                for (i, &r) in rows.iter().enumerate() {
+                    for col in 0..c.cols {
+                        if let Some(v) = c.get(r, col) {
+                            out.set(i, col, v.clone());
+                        }
+                    }
+                }
+                Value::Cell(out)
+            }
+            Value::Num(_) | Value::Str(_) => x.clone(),
+            _ => return Err(LangError::new("splitapply: unsupported data", 0)),
+        };
+        let mut got = s.call_feval_target(func, vec![subset], 1)?;
+        if let Some(v) = got.pop() {
+            results.push(v);
+        }
+    }
+    if results.iter().all(|v| matches!(v, Value::Num(_) | Value::Mat(_))) {
+        let total: usize = results.iter().map(|v| v.to_matrix().map(|m| m.rows()).unwrap_or(0)).sum();
+        let cols = results.iter().filter_map(|v| v.to_matrix().map(|m| m.cols()).ok()).max().unwrap_or(1);
+        let mut out = Matrix::zeros(total, cols);
+        let mut r0 = 0;
+        for v in &results {
+            if let Ok(m) = v.to_matrix() {
+                for r in 0..m.rows() {
+                    for c in 0..m.cols() {
+                        let _ = out.set(r0 + r, c, m.get(r, c).unwrap_or(0.0));
+                    }
+                }
+                r0 += m.rows();
+            }
+        }
+        Ok(mat_or_num(out))
+    } else {
+        Ok(Value::Cell(CellArray::col(results)))
+    }
+}
+
+fn varfun_value(s: &mut Session, argv: &[Value]) -> Result<Value, LangError> {
+    if argv.len() < 2 {
+        return Err(LangError::new("varfun needs (func, table)", 0));
+    }
+    let func = &argv[0];
+    let t = &argv[1];
+    let names = table_names_of(t);
+    let mut props = StructArray::new();
+    for name in &names {
+        let col = table_field(t, name).ok_or_else(|| LangError::new(format!("varfun: missing variable '{name}'"), 0))?;
+        let out = s.call_feval_target(func, vec![col], 1)?.into_iter().next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        props.set_field(0, name, out)?;
+    }
+    props.set_field(0, "Properties", table_properties(names, table_rows_of(t)?))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn rowfun_value(s: &mut Session, argv: &[Value]) -> Result<Value, LangError> {
+    if argv.len() < 2 {
+        return Err(LangError::new("rowfun needs (func, table)", 0));
+    }
+    let func = &argv[0];
+    let t = &argv[1];
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut vals = Vec::with_capacity(names.len());
+        for name in &names {
+            let col = table_field(t, name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            vals.push(variable_at(&col, r));
+        }
+        let row = if vals.iter().all(|v| matches!(v, Value::Num(_) | Value::Mat(_))) {
+            let mut m = Matrix::zeros(1, vals.len());
+            for (c, v) in vals.iter().enumerate() {
+                let _ = m.set(0, c, v.scalar().unwrap_or(f64::NAN));
+            }
+            Value::Mat(m)
+        } else {
+            Value::Cell(CellArray::row(vals))
+        };
+        let got = s.call_feval_target(func, vec![row], 1)?.into_iter().next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        out.push(got);
+    }
+    if out.iter().all(|v| matches!(v, Value::Num(_) | Value::Mat(_))) {
+        let mut m = Matrix::zeros(out.len(), 1);
+        for (i, v) in out.iter().enumerate() {
+            let _ = m.set(i, 0, v.scalar().unwrap_or(f64::NAN));
+        }
+        Ok(mat_or_num(m))
+    } else {
+        Ok(Value::Cell(CellArray::col(out)))
+    }
+}
+
+fn summary_value(t: &Value) -> Result<Value, LangError> {
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("NumRows".to_string(), Value::Num(rows as f64));
+    m.insert("NumVariables".to_string(), Value::Num(names.len() as f64));
+    m.insert("VariableNames".to_string(), Value::Cell(CellArray::row(names.into_iter().map(Value::Str).collect())));
+    Ok(Value::Struct(StructArray::from_map(m)))
+}
+
+fn removevars_value(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let Value::Object(o) = t else { return Err(LangError::new("removevars needs a table", 0)) };
+    let drop: Vec<String> = parse_name_list(argv.get(1));
+    let names: Vec<String> = table_names_of(t).into_iter().filter(|n| !drop.iter().any(|d| d == n)).collect();
+    let mut props = StructArray::new();
+    for name in &names {
+        props.set_field(0, name, o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+    }
+    props.set_field(0, "Properties", table_properties(names, table_rows_of(t)?))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn renamevars_value(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let Value::Object(o) = t else { return Err(LangError::new("renamevars needs a table", 0)) };
+    let old = parse_name_list(argv.get(1));
+    let new = parse_name_list(argv.get(2));
+    let orig = table_names_of(t);
+    let mut names = Vec::with_capacity(orig.len());
+    let mut props = StructArray::new();
+    for name in &orig {
+        let out_name = old.iter().position(|x| x == name).and_then(|i| new.get(i)).cloned().unwrap_or_else(|| name.clone());
+        props.set_field(0, &out_name, o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+        names.push(out_name);
+    }
+    props.set_field(0, "Properties", table_properties(names, table_rows_of(t)?))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn join_tables(t1: &Value, t2: &Value, key_opt: Option<String>) -> Result<Value, LangError> {
+    let n1 = table_names_of(t1);
+    let n2 = table_names_of(t2);
+    let key = key_opt.or_else(|| n1.iter().find(|x| n2.contains(x)).cloned()).ok_or_else(|| LangError::new("join: no common key variable", 0))?;
+    let k1 = table_field(t1, &key).ok_or_else(|| LangError::new(format!("join: missing key '{key}'"), 0))?;
+    let k2 = table_field(t2, &key).ok_or_else(|| LangError::new(format!("join: missing key '{key}'"), 0))?;
+    let r1 = table_rows_of(t1)?;
+    let r2 = table_rows_of(t2)?;
+    let canon = |v: Value| -> String {
+        match v {
+            Value::Str(s) => s,
+            Value::Num(x) => format!("{x}"),
+            Value::Mat(m) => format!("{}", m.data().first().copied().unwrap_or(f64::NAN)),
+            _ => String::new(),
+        }
+    };
+    let keys2: Vec<String> = (0..r2).map(|r| canon(variable_at(&k2, r))).collect();
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for r in 0..r1 {
+        let k = canon(variable_at(&k1, r));
+        if let Some(j) = keys2.iter().position(|x| x == &k) {
+            matches.push((r, j));
+        }
+    }
+    let mut names = Vec::new();
+    let mut props = StructArray::new();
+    for name in &n1 {
+        let col = table_field(t1, name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let vals: Vec<Value> = matches.iter().map(|(r, _)| variable_at(&col, *r)).collect();
+        props.set_field(0, name, column_from_cells(&vals, matches.len()))?;
+        names.push(name.clone());
+    }
+    for name in &n2 {
+        if name == &key {
+            continue;
+        }
+        let out_name = if names.contains(name) { format!("{name}_2") } else { name.clone() };
+        let col = table_field(t2, name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let vals: Vec<Value> = matches.iter().map(|(_, r)| variable_at(&col, *r)).collect();
+        props.set_field(0, &out_name, column_from_cells(&vals, matches.len()))?;
+        names.push(out_name);
+    }
+    props.set_field(0, "Properties", table_properties(names, matches.len()))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn groupsummary_value(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let group_name = parse_name_list(argv.get(1)).into_iter().next().ok_or_else(|| LangError::new("groupsummary needs a grouping variable", 0))?;
+    let method = match argv.get(2) {
+        Some(Value::Str(s)) => s.to_ascii_lowercase(),
+        _ => "mean".to_string(),
+    };
+    let group_col = table_field(t, &group_name).ok_or_else(|| LangError::new(format!("groupsummary: missing '{group_name}'"), 0))?;
+    let rows = table_rows_of(t)?;
+    let keys: Vec<String> = (0..rows)
+        .map(|r| match variable_at(&group_col, r) {
+            Value::Str(s) => s,
+            Value::Num(x) => format!("{x}"),
+            _ => String::new(),
+        })
+        .collect();
+    let mut groups: Vec<String> = keys.clone();
+    groups.sort();
+    groups.dedup();
+    let names = table_names_of(t);
+    let numeric: Vec<(String, Value)> = names
+        .iter()
+        .filter(|n| *n != &group_name)
+        .filter_map(|n| table_field(t, n).map(|v| (n.clone(), v)))
+        .filter(|(_, v)| matches!(v, Value::Mat(_)))
+        .collect();
+    let mut out_names = vec![group_name.clone(), "GroupCount".to_string()];
+    for (n, _) in &numeric {
+        out_names.push(format!("{method}_{n}"));
+    }
+    let mut props = StructArray::new();
+    let group_vals: Vec<Value> = groups
+        .iter()
+        .map(|g| match &group_col {
+            Value::Mat(_) => Value::Num(g.parse::<f64>().unwrap_or(f64::NAN)),
+            _ => Value::Str(g.clone()),
+        })
+        .collect();
+    props.set_field(0, &group_name, column_from_cells(&group_vals, groups.len()))?;
+    let mut counts = Matrix::zeros(groups.len(), 1);
+    for (gi, g) in groups.iter().enumerate() {
+        let idx: Vec<usize> = keys.iter().enumerate().filter(|(_, k)| *k == g).map(|(i, _)| i).collect();
+        let _ = counts.set(gi, 0, idx.len() as f64);
+        for (n, col) in &numeric {
+            let m = col.to_matrix()?;
+            let vals: Vec<f64> = idx.iter().map(|&r| m.get_linear(r).unwrap_or(f64::NAN)).collect();
+            let val = match method.as_str() {
+                "sum" => vals.iter().sum(),
+                "median" => {
+                    let mut v = vals.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+                }
+                "std" => {
+                    let mean = vals.iter().sum::<f64>() / vals.len().max(1) as f64;
+                    (vals.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (vals.len().saturating_sub(1)).max(1) as f64).sqrt()
+                }
+                "min" => vals.iter().copied().fold(f64::INFINITY, f64::min),
+                "max" => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                "nummissing" => vals.iter().filter(|x| x.is_nan()).count() as f64,
+                _ => vals.iter().filter(|x| x.is_finite()).sum::<f64>() / vals.iter().filter(|x| x.is_finite()).count().max(1) as f64,
+            };
+            let mut existing =
+                props.field_at(0, &format!("{method}_{n}")).and_then(|v| v.to_matrix().ok()).unwrap_or_else(|| Matrix::zeros(groups.len(), 1));
+            let _ = existing.set(gi, 0, val);
+            props.set_field(0, &format!("{method}_{n}"), Value::Mat(existing))?;
+        }
+    }
+    props.set_field(0, "GroupCount", Value::Mat(counts))?;
+    props.set_field(0, "Properties", table_properties(out_names, groups.len()))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn fillmissing_table(t: &Value, method: &str) -> Result<Value, LangError> {
+    let Value::Object(o) = t else { return Err(LangError::new("fillmissing needs a table or matrix", 0)) };
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let mut props = StructArray::new();
+    for name in &names {
+        let col = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let new = match &col {
+            Value::Mat(m) => {
+                let mut out = m.clone();
+                let mut last = f64::NAN;
+                for r in 0..out.numel() {
+                    let v = out.get_linear(r).unwrap_or(f64::NAN);
+                    if v.is_nan() {
+                        let fill = match method {
+                            "previous" => last,
+                            "next" => (r..out.numel()).find_map(|i| out.get_linear(i).filter(|x| x.is_finite())).unwrap_or(f64::NAN),
+                            "zero" | "constant" => 0.0,
+                            _ => {
+                                let vals: Vec<f64> = out.data().iter().copied().filter(|x| x.is_finite()).collect();
+                                vals.iter().sum::<f64>() / vals.len().max(1) as f64
+                            }
+                        };
+                        out.set_linear(r, fill);
+                    } else {
+                        last = v;
+                    }
+                }
+                Value::Mat(out)
+            }
+            _ => col,
+        };
+        props.set_field(0, name, new)?;
+    }
+    props.set_field(0, "Properties", table_properties(names, rows))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn rmmissing_table(t: &Value) -> Result<Value, LangError> {
+    let names = table_names_of(t);
+    let rows = table_rows_of(t)?;
+    let cols: Vec<Value> = names.iter().map(|n| table_field(t, n).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)))).collect();
+    let keep: Vec<usize> = (0..rows)
+        .filter(|&r| {
+            cols.iter().all(|c| match c {
+                Value::Mat(m) => m.get_linear(r).map(|x| x.is_finite()).unwrap_or(true),
+                Value::Cell(c) => c.get(r, 0).map(|v| !matches!(v, Value::Str(s) if s.is_empty())).unwrap_or(true),
+                _ => true,
+            })
+        })
+        .collect();
+    let mut props = StructArray::new();
+    for (name, col) in names.iter().zip(&cols) {
+        let vals: Vec<Value> = keep.iter().map(|&r| variable_at(col, r)).collect();
+        props.set_field(0, name, column_from_cells(&vals, keep.len()))?;
+    }
+    props.set_field(0, "Properties", table_properties(names, keep.len()))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
 fn setvartype_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
     let Value::Object(o) = t else { return Err(LangError::new("setvartype needs a table", 0)) };
     let selected = parse_name_list(argv.get(1));
@@ -909,7 +1313,122 @@ impl Session {
                 Ok(vec![cell2struct_value(c, &fields, dim)?])
             }
             "addvars" => Ok(vec![addvars_table(argv.first().ok_or_else(|| LangError::new("addvars needs a table", 0))?, &argv)?]),
-            "setvartype" => Ok(vec![setvartype_table(argv.first().ok_or_else(|| LangError::new("setvartype needs a table", 0))?, &argv)?]),
+            "setvartype" | "convertvars" => {
+                Ok(vec![setvartype_table(argv.first().ok_or_else(|| LangError::new("setvartype needs a table", 0))?, &argv)?])
+            }
+            "removevars" => Ok(vec![removevars_value(argv.first().ok_or_else(|| LangError::new("removevars needs a table", 0))?, &argv)?]),
+            "renamevars" => Ok(vec![renamevars_value(argv.first().ok_or_else(|| LangError::new("renamevars needs a table", 0))?, &argv)?]),
+            "summary" => Ok(vec![summary_value(argv.first().ok_or_else(|| LangError::new("summary needs a table", 0))?)?]),
+            "join" | "innerjoin" | "outerjoin" => {
+                let t1 = argv.first().ok_or_else(|| LangError::new("join needs two tables", 0))?;
+                let t2 = argv.get(1).ok_or_else(|| LangError::new("join needs two tables", 0))?;
+                let mut key = None;
+                if let Some(Value::Str(k)) = argv.get(2) {
+                    if k.eq_ignore_ascii_case("Keys") {
+                        key = parse_name_list(argv.get(3)).into_iter().next();
+                    }
+                }
+                Ok(vec![join_tables(t1, t2, key)?])
+            }
+            "groupsummary" => Ok(vec![groupsummary_value(argv.first().ok_or_else(|| LangError::new("groupsummary needs a table", 0))?, &argv)?]),
+            "fillmissing" => {
+                let method = match argv.get(1) {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    _ => "previous".to_string(),
+                };
+                let source = argv.first().ok_or_else(|| LangError::new("fillmissing needs data", 0))?;
+                match source {
+                    Value::Object(o) if o.class_name == "table" => Ok(vec![fillmissing_table(source, &method)?]),
+                    x => {
+                        let m = x.to_matrix()?;
+                        let mut out = m.clone();
+                        let mut last = f64::NAN;
+                        for r in 0..out.numel() {
+                            let v = out.get_linear(r).unwrap_or(f64::NAN);
+                            if v.is_nan() {
+                                let fill = match method.as_str() {
+                                    "previous" => last,
+                                    "next" => (r..out.numel()).find_map(|i| out.get_linear(i).filter(|x| x.is_finite())).unwrap_or(f64::NAN),
+                                    "zero" | "constant" => 0.0,
+                                    _ => {
+                                        let vals: Vec<f64> = out.data().iter().copied().filter(|x| x.is_finite()).collect();
+                                        vals.iter().sum::<f64>() / vals.len().max(1) as f64
+                                    }
+                                };
+                                out.set_linear(r, fill);
+                            } else {
+                                last = v;
+                            }
+                        }
+                        Ok(vec![mat_or_num(out)])
+                    }
+                }
+            }
+            "standardizeMissing" => {
+                let target = argv.get(1).cloned().unwrap_or(Value::Num(f64::NAN));
+                let source = argv.first().ok_or_else(|| LangError::new("standardizeMissing needs data", 0))?;
+                match source {
+                    Value::Object(o) if o.class_name == "table" => {
+                        let names = table_names_of(source);
+                        let rows = table_rows_of(source)?;
+                        let mut props = StructArray::new();
+                        for name in &names {
+                            let col = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                            let new = match (&col, &target) {
+                                (Value::Mat(m), Value::Num(x)) => {
+                                    let mut out = m.clone();
+                                    for i in 0..out.numel() {
+                                        if (out.get_linear(i).unwrap_or(f64::NAN) - x).abs() < 1e-12 {
+                                            out.set_linear(i, f64::NAN);
+                                        }
+                                    }
+                                    Value::Mat(out)
+                                }
+                                (Value::Cell(c), Value::Str(s)) => {
+                                    let mut out = c.clone();
+                                    for i in 0..out.numel() {
+                                        if matches!(out.get_linear(i), Some(Value::Str(x)) if x == s) {
+                                            out.set_linear(i, Value::Str(String::new()));
+                                        }
+                                    }
+                                    Value::Cell(out)
+                                }
+                                _ => col,
+                            };
+                            props.set_field(0, name, new)?;
+                        }
+                        props.set_field(0, "Properties", table_properties(names, rows))?;
+                        Ok(vec![Value::Object(MObject::owned("table".into(), props))])
+                    }
+                    x => {
+                        let m = x.to_matrix()?;
+                        let mut out = m.clone();
+                        let target = target.scalar().unwrap_or(f64::NAN);
+                        for i in 0..out.numel() {
+                            if (out.get_linear(i).unwrap_or(f64::NAN) - target).abs() < 1e-12 {
+                                out.set_linear(i, f64::NAN);
+                            }
+                        }
+                        Ok(vec![mat_or_num(out)])
+                    }
+                }
+            }
+            "rmmissing" => {
+                let source = argv.first().ok_or_else(|| LangError::new("rmmissing needs data", 0))?;
+                match source {
+                    Value::Object(o) if o.class_name == "table" => Ok(vec![rmmissing_table(source)?]),
+                    x => {
+                        let m = x.to_matrix()?;
+                        let keep: Vec<usize> =
+                            (0..m.rows()).filter(|&r| (0..m.cols()).all(|c| m.get(r, c).map(|x| x.is_finite()).unwrap_or(true))).collect();
+                        Ok(vec![mat_or_num(subset_matrix_rows(&m, &keep))])
+                    }
+                }
+            }
+            "findgroups" => findgroups_value(&argv, nout),
+            "splitapply" => Ok(vec![splitapply_value(self, &argv)?]),
+            "varfun" => Ok(vec![varfun_value(self, &argv)?]),
+            "rowfun" => Ok(vec![rowfun_value(self, &argv)?]),
             "height" => Ok(vec![Value::Num(height_of(argv.first())? as f64)]),
             "width" => Ok(vec![Value::Num(width_of(argv.first())? as f64)]),
             "istable" => Ok(vec![Value::Num(matches!(argv.first(), Some(Value::Object(o)) if o.class_name == "table") as u8 as f64)]),

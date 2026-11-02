@@ -62,17 +62,17 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "statistics",
-        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween",
+        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween fitlm optimalleaforder",
     ),
-    ("ode", "ode45 ode15s odeset odeget"),
+    ("ode", "ode45 ode15s odeset odeget deval"),
     (
         "corpus classes",
-        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count",
+        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count parpool parfeval fetchOutputs onCleanup categorical reordercats categories countcats addcats removecats mergecats renamecats isundefined isdatetime isduration istimetable datetime duration seconds",
     ),
     ("anova", "anova1 anova2 multcompare friedman"),
     (
         "xlsx/table",
-        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing table2cell cell2table struct2table struct2cell cell2struct addvars setvartype fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace findstr jsondecode jsonencode importdata detectImportOptions extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines rethrow verLessThan inputname validateattributes validatestring mustBeNumeric mustBeNonempty mustBePositive mustBeInteger mustBeMember mustBeText mustBeA mustBeScalarOrEmpty mustBeFinite mustBeReal",
+        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing table2cell cell2table struct2table struct2cell cell2struct addvars setvartype convertvars removevars renamevars summary findgroups splitapply varfun rowfun join innerjoin outerjoin groupsummary fillmissing rmmissing standardizeMissing fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace findstr jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines rethrow verLessThan inputname validateattributes validatestring mustBeNumeric mustBeNonempty mustBePositive mustBeInteger mustBeMember mustBeText mustBeA mustBeScalarOrEmpty mustBeFinite mustBeReal",
     ),
     ("hdf5/netcdf", "h5read h5write h5create h5disp ncread ncwrite ncinfo ncdisp"),
     (
@@ -94,7 +94,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "files/path",
         "save load type addpath rmpath savepath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir",
     ),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf mesh vline xline saveas exportgraphics print"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf mesh vline xline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.

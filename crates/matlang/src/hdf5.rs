@@ -304,7 +304,7 @@ fn plan_chunks(ds: &H5Dataset) -> Result<ChunkPlan, LangError> {
     let mut chunk_dims: Vec<usize> = ds.dims.iter().map(|&d| d.clamp(1, 64)).collect();
     loop {
         let chunks = chunk_dims.iter().zip(&ds.dims).fold(1usize, |a, (&c, &d)| a.saturating_mul(d.div_ceil(c)));
-        if chunks <= 1024 {
+        if chunks <= 65_536 {
             break;
         }
         let mut grown = false;
@@ -320,7 +320,7 @@ fn plan_chunks(ds: &H5Dataset) -> Result<ChunkPlan, LangError> {
             }
         }
         if !grown {
-            return Err(LangError::new("hdf5: dataset needs more than 1024 chunks", 0));
+            return Err(LangError::new("hdf5: dataset needs more than 65536 chunks", 0));
         }
     }
     let chunk_elems = chunk_dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
@@ -395,7 +395,7 @@ fn dataset_oh_v2(ds: &H5Dataset, chunk_dims: &[usize], index_addr: u64) -> Resul
     }
     append_uint(&mut layout, 8, enc);
     layout.push(3); // fixed-array chunk index
-    layout.push(10); // max data-block page elements bits
+    layout.push(16); // max data-block page elements bits (one page up to 65536 entries)
     append_uint(&mut layout, index_addr, 8);
     build_oh_v2(&[(0x0001, dataspace), (0x0003, datatype), (0x000b, filter), (0x0008, layout)])
 }
@@ -479,7 +479,7 @@ pub(crate) fn write_bytes(file: &H5File) -> Result<Vec<u8>, LangError> {
         let fadb = fadb_addrs.get(i).copied().unwrap_or(0);
         let mut header = Vec::with_capacity(28);
         header.extend_from_slice(b"FAHD");
-        header.extend_from_slice(&[0, 1, 20, 10]);
+        header.extend_from_slice(&[0, 1, 20, 16]);
         append_uint(&mut header, plan.blobs.len() as u64, 8);
         append_uint(&mut header, fadb as u64, 8);
         let sum = lookup3(&header);
@@ -1479,6 +1479,23 @@ mod tests {
         assert_eq!(back.datasets.len(), 1);
         assert_eq!(back.datasets[0].dims, vec![100, 100]);
         assert_eq!(back.datasets[0].data, data);
+    }
+
+    #[test]
+    fn roundtrip_large_chunk_grid() {
+        // 2049x2049 with 64x64 chunks needs 1089 fixed-array entries, more
+        // than the old 1024-entry single-page limit.
+        let n = 2049usize;
+        let data: Vec<f64> = (0..n * n).map(|i| (i % 997) as f64).collect();
+        let mut f = H5File::default();
+        f.datasets.push(H5Dataset { name: "large".into(), dims: vec![n, n], data: data.clone() });
+        let bytes = write_bytes(&f).unwrap();
+        let back = read_bytes(&bytes).unwrap();
+        assert_eq!(back.datasets.len(), 1);
+        assert_eq!(back.datasets[0].dims, vec![n, n]);
+        assert_eq!(back.datasets[0].data.len(), data.len());
+        assert_eq!(back.datasets[0].data.first(), data.first());
+        assert_eq!(back.datasets[0].data.last(), data.last());
     }
 
     #[test]

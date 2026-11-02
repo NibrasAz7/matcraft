@@ -265,6 +265,12 @@
   (row `out*m+inp`) using `C(jwI-A)^-1B+D`; SISO shapes are unchanged.
   Cross-checked against analytic diagonal and shared-input state-space
   responses. `examples/control.m` demonstrates it.
+- Final compatibility sweep (2026-11): table grouping/joining/cleanup,
+  categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
+  web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,
+  Lanczos/anti-aliased resize, expanded `regionprops`, and HDF5 fixed-array
+  indexes beyond 1024 chunks. Tests use synthetic/random data and
+  representative external workflows.
 - Graphics/table/math compatibility wave (2026-11): explicit axes
   tick/label/angle controls, `sgtitle`, `tiledlayout`/`nexttile`, `barh`,
   `yline`, graphics-handle helpers and `savefig`; table conversion/editing

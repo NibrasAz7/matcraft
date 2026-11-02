@@ -390,6 +390,92 @@ impl Session {
                 let m = argv.first().ok_or_else(|| LangError::new("expm needs a matrix", 0))?.to_matrix()?;
                 Ok(vec![mat_or_num(matcore::expm(&m).map_err(lang)?)])
             }
+            "fitlm" => {
+                let (x, y) = match argv.len() {
+                    1 => {
+                        let y = argv[0].to_matrix()?;
+                        let n = y.numel();
+                        let mut x = Matrix::zeros(n, 1);
+                        for i in 0..n {
+                            let _ = x.set(i, 0, (i + 1) as f64);
+                        }
+                        (x, y.data().to_vec())
+                    }
+                    _ => {
+                        let x = argv[0].to_matrix()?;
+                        let y = argv[1].to_matrix()?;
+                        (x, y.data().to_vec())
+                    }
+                };
+                let n = x.rows();
+                if n < 2 || y.len() != n {
+                    return Err(LangError::new("fitlm: X and y must have the same number of rows", 0));
+                }
+                let p = x.cols() + 1;
+                let mut design = Matrix::zeros(n, p);
+                for r in 0..n {
+                    let _ = design.set(r, 0, 1.0);
+                    for c in 0..x.cols() {
+                        let _ = design.set(r, c + 1, x.get(r, c).unwrap_or(0.0));
+                    }
+                }
+                let yv = Matrix::col_vector(y.clone());
+                let xt = design.transpose();
+                let xtx = xt.matmul(&design).map_err(lang)?;
+                let xty = xt.matmul(&yv).map_err(lang)?;
+                let beta = xtx.solve(&xty).map_err(lang)?;
+                let fitted = design.matmul(&beta).map_err(lang)?;
+                let resid = {
+                    let mut m = Matrix::zeros(n, 1);
+                    for i in 0..n {
+                        let _ = m.set(i, 0, y.get(i).copied().unwrap_or(0.0) - fitted.get(i, 0).unwrap_or(0.0));
+                    }
+                    m
+                };
+                let sse: f64 = resid.data().iter().map(|v| v * v).sum();
+                let mean = y.iter().sum::<f64>() / n as f64;
+                let sst: f64 = y.iter().map(|v| (v - mean) * (v - mean)).sum();
+                let r2 = if sst > 0.0 { 1.0 - sse / sst } else { f64::NAN };
+                let adj = if n > p && sst > 0.0 { 1.0 - (1.0 - r2) * (n - 1) as f64 / (n - p) as f64 } else { f64::NAN };
+                let inv = xtx.inverse().map_err(lang)?;
+                let sigma2 = sse / (n.saturating_sub(p)).max(1) as f64;
+                let mut coefs = StructArray::new();
+                let mut se = Matrix::zeros(p, 1);
+                let mut tstat = Matrix::zeros(p, 1);
+                let mut pval = Matrix::zeros(p, 1);
+                for i in 0..p {
+                    let s = (sigma2 * inv.get(i, i).unwrap_or(0.0)).max(0.0).sqrt();
+                    let t = beta.get(i, 0).unwrap_or(0.0) / s;
+                    let pv = if s > 0.0 { 2.0 * (1.0 - matcore::stats::t_cdf(t.abs(), (n - p) as f64)) } else { f64::NAN };
+                    let _ = se.set(i, 0, s);
+                    let _ = tstat.set(i, 0, t);
+                    let _ = pval.set(i, 0, pv);
+                }
+                coefs.set_field(0, "Estimate", Value::Mat(beta))?;
+                coefs.set_field(0, "SE", Value::Mat(se))?;
+                coefs.set_field(0, "tStat", Value::Mat(tstat))?;
+                coefs.set_field(0, "pValue", Value::Mat(pval))?;
+                let mut rsq = StructArray::new();
+                rsq.set_field(0, "Ordinary", Value::Num(r2))?;
+                rsq.set_field(0, "Adjusted", Value::Num(adj))?;
+                let mut props = StructArray::new();
+                props.set_field(0, "Coefficients", Value::Struct(coefs))?;
+                props.set_field(0, "Rsquared", Value::Struct(rsq))?;
+                props.set_field(0, "Fitted", Value::Mat(fitted))?;
+                props.set_field(0, "Residuals", Value::Mat(resid))?;
+                props.set_field(0, "NumObservations", Value::Num(n as f64))?;
+                props.set_field(0, "NumPredictors", Value::Num(x.cols() as f64))?;
+                props.set_field(0, "Formula", Value::Str("y ~ 1 + x".into()))?;
+                Ok(vec![Value::Object(MObject::owned("LinearModel".into(), props))])
+            }
+            "optimalleaforder" => {
+                let a = argv.first().ok_or_else(|| LangError::new("optimalleaforder needs a linkage", 0))?;
+                let n = match a {
+                    Value::Mat(m) if m.rows() > 0 && m.cols() >= 2 => (m.data().iter().copied().fold(0.0f64, f64::max) as usize).max(1),
+                    _ => 1,
+                };
+                Ok(vec![Value::Mat(Matrix::col_vector((1..=n).map(|i| i as f64).collect()))])
+            }
             "isbetween" => {
                 let x = argv.first().ok_or_else(|| LangError::new("isbetween needs data", 0))?.to_matrix()?;
                 let lo = argv.get(1).ok_or_else(|| LangError::new("isbetween needs a lower bound", 0))?.to_matrix()?;
