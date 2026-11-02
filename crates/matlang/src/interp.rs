@@ -6868,8 +6868,8 @@ impl Session {
                 Ok(out.into_iter().next())
             }
             "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
-            | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable" | "damp"
-            | "bandwidth" => {
+            | "pidtune" | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable"
+            | "damp" | "bandwidth" => {
                 let v = self.eval_args(args)?;
                 let out = self.control_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -10812,8 +10812,8 @@ impl Session {
                 self.optimize_builtin(name, v, nout)?
             }
             "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
-            | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable" | "damp"
-            | "bandwidth" => {
+            | "pidtune" | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable"
+            | "damp" | "bandwidth" => {
                 let v = self.eval_args(args)?;
                 self.control_builtin(name, v, nout)?
             }
@@ -16784,6 +16784,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "bode",
     "freqresp",
     "pid",
+    "pidtune",
     "margin",
     "nyquist",
     "isstable",
@@ -22608,6 +22609,85 @@ end",
             assert!(m.contains("conjugate pairs"), "complex zpk error = {m}");
         } else {
             panic!("unpaired complex zero did not error");
+        }
+    }
+
+    #[test]
+    fn control_pidtune() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // PI design at an explicit crossover: the open loop crosses 0 dB at
+        // wc with the 60 degree target phase margin.
+        s.run(
+            "G = tf(1, [1 1]); [C, info] = pidtune(G, 'PI', 2); [n, d] = tfdata(C); \
+             [m, p] = bode(series(G, C), 2); kp = info.Kp; ki = info.Ki; kd = info.Kd; \
+             pm = info.PhaseMargin; wc = info.wc; typ = info.Type; cclass = class(info.C);",
+        )
+        .unwrap();
+        let n = vec(&s, "n");
+        assert_eq!(n.len(), 2);
+        assert!((n[0] - 1.2320508075688772).abs() < 1e-12, "n = {n:?}");
+        assert!((n[1] - 3.732050807568877).abs() < 1e-12, "n = {n:?}");
+        assert_eq!(vec(&s, "d"), vec![1.0, 0.0]);
+        assert!((scalar(&s, "kp") - 1.2320508075688772).abs() < 1e-12);
+        assert!((scalar(&s, "ki") - 3.732050807568877).abs() < 1e-12);
+        assert_eq!(scalar(&s, "kd"), 0.0);
+        assert!((scalar(&s, "pm") - 60.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "wc"), 2.0);
+        assert_eq!(s.get("typ"), Some(&Value::Str("PI".into())));
+        assert_eq!(s.get("cclass"), Some(&Value::Str("tf".into())));
+        assert!((scalar(&s, "m") - 1.0).abs() < 1e-9, "open-loop magnitude = {}", scalar(&s, "m"));
+        assert!((scalar(&s, "p") + 120.0).abs() < 1e-9, "open-loop phase = {}", scalar(&s, "p"));
+
+        // Default crossover uses the plant pole and still hits 60 degrees.
+        s.run("G = tf(1, [1 1]); [C, info] = pidtune(G); wcd = info.wc; pmd = info.PhaseMargin; [m, p] = bode(series(G, C), wcd);").unwrap();
+        assert_eq!(scalar(&s, "wcd"), 1.0);
+        assert!((scalar(&s, "pmd") - 60.0).abs() < 1e-9);
+        assert!((scalar(&s, "m") - 1.0).abs() < 1e-9);
+        assert!((scalar(&s, "p") + 120.0).abs() < 1e-9);
+
+        // PIDF adds a derivative filter.
+        s.run("G = tf(1, [1 1]); [Cf, fi] = pidtune(G, 'PIDF', 3); tfv = fi.Tf; pmf = fi.PhaseMargin; [mf, pf] = bode(series(G, Cf), 3);").unwrap();
+        assert!(scalar(&s, "tfv") > 0.0);
+        assert!((scalar(&s, "pmf") - 60.0).abs() < 1e-6, "PIDF phase margin = {}", scalar(&s, "pmf"));
+        assert!((scalar(&s, "mf") - 1.0).abs() < 0.02, "PIDF open-loop magnitude = {}", scalar(&s, "mf"));
+        assert!((scalar(&s, "pf") + 120.0).abs() < 0.1, "PIDF open-loop phase = {}", scalar(&s, "pf"));
+
+        // PID on a plant with extra lag needs all three terms.
+        s.run(
+            "G2 = tf(1, [1 2 1]); [Cp, pi] = pidtune(G2, 'PID', 2); pkp = pi.Kp; pki = pi.Ki; pkd = pi.Kd; \
+             pmp = pi.PhaseMargin; [mp, pp] = bode(series(G2, Cp), 2);",
+        )
+        .unwrap();
+        assert!(scalar(&s, "pkp") > 0.0);
+        assert!(scalar(&s, "pki") > 0.0);
+        assert!(scalar(&s, "pkd") > 0.0);
+        assert!((scalar(&s, "pmp") - 60.0).abs() < 1e-6);
+        assert!((scalar(&s, "mp") - 1.0).abs() < 1e-6);
+        assert!((scalar(&s, "pp") + 120.0).abs() < 1e-6);
+
+        // P control has no integral or derivative action.
+        s.run(
+            "G = tf(1, [1 1]); [Cone, one] = pidtune(G, 'P', 2); okp = one.Kp; oki = one.Ki; okd = one.Kd; \
+             opm = one.PhaseMargin; [mo, po] = bode(series(G, Cone), 2);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "okp") - 2.23606797749979).abs() < 1e-9);
+        assert_eq!(scalar(&s, "oki"), 0.0);
+        assert_eq!(scalar(&s, "okd"), 0.0);
+        assert!((scalar(&s, "mo") - 1.0).abs() < 1e-9);
+        // P control cannot add phase, so the achieved margin is the plant's own.
+        assert!((scalar(&s, "po") + 63.43494882292201).abs() < 1e-9, "P open-loop phase = {}", scalar(&s, "po"));
+        assert!((scalar(&s, "opm") - 116.56505117707799).abs() < 1e-9, "P phase margin = {}", scalar(&s, "opm"));
+
+        // Unknown controller types are rejected.
+        s.run("try, pidtune(tf(1, [1 1]), 'bogus', 1); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unknown controller type"), "pidtune error = {m}");
+        } else {
+            panic!("unknown pidtune controller type did not error");
         }
     }
 

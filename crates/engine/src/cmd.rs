@@ -58,7 +58,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "control",
-        "tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid margin nyquist isstable damp bandwidth",
+        "tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid pidtune margin nyquist isstable damp bandwidth",
     ),
     (
         "statistics",

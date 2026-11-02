@@ -71,6 +71,60 @@ fn make_ss(a: Matrix, b: Matrix, c: Matrix, d: Matrix, ts: f64) -> Result<Value,
     make_object("ss", vec![("A", Value::Mat(a)), ("B", Value::Mat(b)), ("C", Value::Mat(c)), ("D", Value::Mat(d)), ("Ts", Value::Num(ts))])
 }
 
+fn wrap_degrees(mut x: f64) -> f64 {
+    while x > 180.0 {
+        x -= 360.0;
+    }
+    while x < -180.0 {
+        x += 360.0;
+    }
+    x
+}
+
+/// Frequency response of `Kp + Ki/s + Kd*s/(Tf*s + 1)` at `s = j*wc`.
+fn pid_response(wc: f64, kp: f64, ki: f64, kd: f64, tf: f64) -> CNum {
+    let s = CNum::new(0.0, wc);
+    let one = CNum::real(1.0);
+    let mut out = CNum::real(kp) + CNum::real(ki).div(s);
+    if kd != 0.0 {
+        out = out + CNum::real(kd) * s.div(one + CNum::real(tf) * s);
+    }
+    out
+}
+
+/// Pick the derivative time that gives the requested controller phase with a
+/// first-order derivative filter. Bisection is monotone here: more derivative
+/// action adds phase until the filter roll-off dominates.
+fn solve_filtered_derivative(wc: f64, ki0: f64, tf: f64, target: f64) -> f64 {
+    let phase = |td: f64| {
+        let c = pid_response(wc, 1.0, ki0, td, tf);
+        c.im.atan2(c.re)
+    };
+    if phase(0.0) >= target {
+        return 0.0;
+    }
+    let mut hi = 1.0 / wc;
+    for _ in 0..60 {
+        if phase(hi) >= target {
+            break;
+        }
+        hi *= 2.0;
+        if hi > 1.0e6 / wc {
+            break;
+        }
+    }
+    let mut lo = 0.0;
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if phase(mid) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
 fn roots_value(r: &[CNum]) -> Result<Value, LangError> {
     if r.iter().all(|z| z.im.abs() <= 1e-12) {
         Ok(mat_or_num(Matrix::col_vector(r.iter().map(|z| z.re).collect())))
@@ -509,6 +563,7 @@ impl Session {
             "bode" => self.bode_call(&argv),
             "freqresp" => self.freqresp_call(&argv),
             "pid" => self.pid_call(&argv),
+            "pidtune" => self.pidtune_call(&argv, nout),
             "margin" => self.margin_call(&argv),
             "nyquist" => self.nyquist_call(&argv),
             "isstable" => Ok(vec![Value::Num(is_stable(argv.first())? as u8 as f64)]),
@@ -853,6 +908,23 @@ impl Session {
         Ok(vec![cmat_or_value(cm)])
     }
 
+    fn default_crossover(den: &[f64]) -> f64 {
+        let mut best = f64::INFINITY;
+        if let Ok(roots) = roots(&row(den)) {
+            for z in roots {
+                let m = (z.re * z.re + z.im * z.im).sqrt();
+                if m > 1e-9 && m < best {
+                    best = m;
+                }
+            }
+        }
+        if best.is_finite() {
+            best.clamp(1e-3, 1e4)
+        } else {
+            1.0
+        }
+    }
+
     fn pid_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
         let kp = argv.first().map(|v| scalar_arg(v, "Kp")).transpose()?.unwrap_or(0.0);
         let ki = argv.get(1).map(|v| scalar_arg(v, "Ki")).transpose()?.unwrap_or(0.0);
@@ -860,6 +932,107 @@ impl Session {
         let tf = argv.get(3).map(|v| scalar_arg(v, "Tf")).transpose()?.unwrap_or(0.0).max(0.0);
         let (num, den) = if tf > 0.0 { (vec![kp * tf + kd, kp + ki * tf, ki], vec![tf, 1.0, 0.0]) } else { (vec![kd, kp, ki], vec![1.0, 0.0]) };
         Ok(vec![make_tf(num, den, "s", 0.0)?])
+    }
+
+    /// `pidtune(sys, type, wc)` — shape a PI/PID/PD controller so the open
+    /// loop crosses 0 dB at `wc` with a 60 degree phase margin. The plant is
+    /// evaluated at `j*wc`; integral/derivative breakpoints are chosen from
+    /// the required controller phase, then `Kp` normalises the magnitude.
+    fn pidtune_call(&mut self, argv: &[Value], nout: usize) -> Result<Vec<Value>, LangError> {
+        let sys = argv.first().ok_or_else(|| LangError::new("pidtune needs a plant model", 0))?;
+        let (num, den) = tf_parts(sys)?;
+        if num.is_empty() || den.is_empty() {
+            return Err(LangError::new("pidtune: plant transfer function is empty", 0));
+        }
+        let mut kind = "pid".to_string();
+        let mut requested_wc: Option<f64> = None;
+        for arg in argv.iter().skip(1) {
+            match arg {
+                Value::Str(s) => kind = s.to_ascii_lowercase(),
+                other => requested_wc = Some(scalar_arg(other, "wc")?),
+            }
+        }
+        if !matches!(kind.as_str(), "p" | "pi" | "pd" | "pid" | "pidf" | "pid2") {
+            return Err(LangError::new(format!("pidtune: unknown controller type '{kind}'"), 0));
+        }
+        let wc = requested_wc.unwrap_or_else(|| Self::default_crossover(&den));
+        if !wc.is_finite() || wc <= 0.0 {
+            return Err(LangError::new("pidtune: wc must be positive and finite", 0));
+        }
+        let g = freq_response(&num, &den, &[wc]).into_iter().next().ok_or_else(|| LangError::new("pidtune: cannot evaluate the plant", 0))?;
+        let mg = (g.re * g.re + g.im * g.im).sqrt();
+        if !mg.is_finite() || mg <= 0.0 {
+            return Err(LangError::new("pidtune: plant response is zero or infinite at wc", 0));
+        }
+        let pg = g.im.atan2(g.re);
+        // Controller phase needed to leave the open loop at the 60 degree target.
+        let target = -std::f64::consts::PI + 60.0f64.to_radians() - pg;
+        let tf = if kind == "pidf" { 1.0 / (10.0 * wc) } else { 0.0 };
+        let (ti0, td0) = match kind.as_str() {
+            "p" => (0.0, 0.0),
+            "pi" => {
+                if target < 0.0 && target.tan() < 0.0 {
+                    (-1.0 / (wc * target.tan()), 0.0)
+                } else {
+                    (10.0 / wc, 0.0)
+                }
+            }
+            "pd" => (0.0, (target.tan() / wc).max(0.0)),
+            "pid" | "pid2" => {
+                let ti = 10.0 / wc;
+                if tf > 0.0 {
+                    let td = solve_filtered_derivative(wc, 1.0 / ti, tf, target);
+                    (ti, td)
+                } else {
+                    let td = (target.tan() + 1.0 / (ti * wc)) / wc;
+                    if td > 0.0 {
+                        (ti, td)
+                    } else if target < 0.0 && target.tan() < 0.0 {
+                        (-1.0 / (wc * target.tan()), 0.0)
+                    } else {
+                        (ti, 0.0)
+                    }
+                }
+            }
+            _ => {
+                let ti = 10.0 / wc;
+                let td = solve_filtered_derivative(wc, 1.0 / ti, tf, target);
+                if td > 0.0 {
+                    (ti, td)
+                } else if target < 0.0 && target.tan() < 0.0 {
+                    (-1.0 / (wc * target.tan()), 0.0)
+                } else {
+                    (ti, 0.0)
+                }
+            }
+        };
+        let ki0 = if kind == "p" || kind == "pd" || ti0 <= 0.0 { 0.0 } else { 1.0 / ti0 };
+        let kd0 = if kind == "p" || kind == "pi" { 0.0 } else { td0 };
+        let c0 = pid_response(wc, 1.0, ki0, kd0, tf);
+        let mc = (c0.re * c0.re + c0.im * c0.im).sqrt();
+        let pc = c0.im.atan2(c0.re);
+        if !mc.is_finite() || mc <= 0.0 {
+            return Err(LangError::new("pidtune: controller response is degenerate at wc", 0));
+        }
+        let kp = 1.0 / (mg * mc);
+        let ki = kp * ki0;
+        let kd = kp * kd0;
+        let (cnum, cden) = if tf > 0.0 { (vec![kp * tf + kd, kp + ki * tf, ki], vec![tf, 1.0, 0.0]) } else { (vec![kd, kp, ki], vec![1.0, 0.0]) };
+        let c = make_tf(cnum, cden, "s", 0.0)?;
+        let pm = wrap_degrees(180.0 + (pg + pc).to_degrees());
+        let mut info = StructArray::new();
+        info.set_field(0, "C", c.clone())?;
+        info.set_field(0, "Kp", Value::Num(kp))?;
+        info.set_field(0, "Ki", Value::Num(ki))?;
+        info.set_field(0, "Kd", Value::Num(kd))?;
+        info.set_field(0, "Tf", Value::Num(tf))?;
+        info.set_field(0, "wc", Value::Num(wc))?;
+        info.set_field(0, "PhaseMargin", Value::Num(pm))?;
+        info.set_field(0, "GainMargin", Value::Num(f64::INFINITY))?;
+        info.set_field(0, "Stable", Value::Num((pm > 0.0) as u8 as f64))?;
+        info.set_field(0, "Type", Value::Str(kind.to_ascii_uppercase()))?;
+        let out = vec![c, Value::Struct(info)];
+        Ok(out.into_iter().take(nout.max(1)).collect())
     }
 
     fn margin_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
