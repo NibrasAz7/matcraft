@@ -146,13 +146,20 @@ impl Access {
             _ => Access::Public,
         }
     }
-
     fn allows(self, owner: &str, caller: Option<&str>, is_subclass: bool) -> bool {
         match self {
             Access::Public => true,
             Access::Private => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)),
             Access::Protected => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)) || is_subclass,
         }
+    }
+}
+
+fn access_name(a: Access) -> &'static str {
+    match a {
+        Access::Public => "public",
+        Access::Protected => "protected",
+        Access::Private => "private",
     }
 }
 
@@ -177,6 +184,25 @@ struct EventListener {
     event: String,
     callback: Value,
     enabled: bool,
+}
+
+/// Hidden property field carrying dynamic-property metadata. The leading
+/// control character makes the name unspellable in M-code and easy to filter
+/// from introspection/display while still serializing with the object.
+const DYNPROPS_FIELD: &str = "\u{1}dynamic_props";
+
+#[derive(Debug, Clone)]
+struct DynPropMeta {
+    name: String,
+    get: Access,
+    set: Access,
+    constant: bool,
+    dependent: bool,
+    hidden: bool,
+}
+
+fn is_internal_prop(name: &str) -> bool {
+    name.starts_with('\u{1}')
 }
 
 /// A `classdef` (or an `@dir` class shell) known to the session.
@@ -438,6 +464,123 @@ impl MObject {
         }
     }
 
+    fn is_handle(&self) -> bool {
+        self.listeners.is_some()
+    }
+
+    /// Dynamic-property metadata stored in the hidden field.
+    fn dyn_props(&self) -> Vec<DynPropMeta> {
+        let Some(Value::Struct(s)) = self.prop(DYNPROPS_FIELD) else { return Vec::new() };
+        let mut out = Vec::with_capacity(s.numel());
+        for i in 0..s.numel() {
+            let name = match s.field_at(i, "Name") {
+                Some(Value::Str(v)) => v.clone(),
+                _ => continue,
+            };
+            let attr = |field: &str| match s.field_at(i, field) {
+                Some(Value::Str(v)) => Access::parse(v),
+                _ => Access::Public,
+            };
+            let flag = |field: &str| match s.field_at(i, field) {
+                Some(Value::Num(v)) => *v != 0.0,
+                _ => false,
+            };
+            out.push(DynPropMeta {
+                name,
+                get: attr("GetAccess"),
+                set: attr("SetAccess"),
+                constant: flag("Constant"),
+                dependent: flag("Dependent"),
+                hidden: flag("Hidden"),
+            });
+        }
+        out
+    }
+
+    fn store_dyn_props(&mut self, props: &[DynPropMeta]) {
+        if props.is_empty() {
+            self.remove_prop(DYNPROPS_FIELD);
+            return;
+        }
+        let mut s = StructArray::with_dims(1, props.len());
+        s.add_field("Name");
+        s.add_field("GetAccess");
+        s.add_field("SetAccess");
+        s.add_field("Constant");
+        s.add_field("Dependent");
+        s.add_field("Hidden");
+        for (i, p) in props.iter().enumerate() {
+            let _ = s.set_field(i, "Name", Value::Str(p.name.clone()));
+            let _ = s.set_field(i, "GetAccess", Value::Str(access_name(p.get).into()));
+            let _ = s.set_field(i, "SetAccess", Value::Str(access_name(p.set).into()));
+            let _ = s.set_field(i, "Constant", Value::Num(p.constant as u8 as f64));
+            let _ = s.set_field(i, "Dependent", Value::Num(p.dependent as u8 as f64));
+            let _ = s.set_field(i, "Hidden", Value::Num(p.hidden as u8 as f64));
+        }
+        self.set_prop(DYNPROPS_FIELD, Value::Struct(s));
+    }
+
+    fn dyn_prop(&self, name: &str) -> Option<DynPropMeta> {
+        self.dyn_props().into_iter().find(|p| p.name == name)
+    }
+
+    fn add_dyn_prop(&mut self, name: &str) {
+        if !self.has_prop(name) {
+            self.set_prop(name, Value::Mat(Matrix::zeros(0, 0)));
+        }
+        let mut props = self.dyn_props();
+        if !props.iter().any(|p| p.name == name) {
+            props.push(DynPropMeta {
+                name: name.to_string(),
+                get: Access::Public,
+                set: Access::Public,
+                constant: false,
+                dependent: false,
+                hidden: false,
+            });
+        }
+        self.store_dyn_props(&props);
+    }
+
+    fn remove_dyn_prop(&mut self, name: &str) -> bool {
+        let mut props = self.dyn_props();
+        let before = props.len();
+        props.retain(|p| p.name != name);
+        if props.len() == before {
+            return false;
+        }
+        self.store_dyn_props(&props);
+        self.remove_prop(name);
+        true
+    }
+
+    fn update_dyn_prop_attr(&mut self, name: &str, attr: &str, value: &Value) -> bool {
+        let mut props = self.dyn_props();
+        let Some(p) = props.iter_mut().find(|p| p.name == name) else { return false };
+        match attr {
+            "GetAccess" | "SetAccess" => {
+                let Value::Str(s) = value else { return false };
+                let access = Access::parse(s);
+                if attr == "GetAccess" {
+                    p.get = access;
+                } else {
+                    p.set = access;
+                }
+            }
+            "Constant" | "Dependent" | "Hidden" => {
+                let value = value.scalar().unwrap_or(0.0) != 0.0;
+                match attr {
+                    "Constant" => p.constant = value,
+                    "Dependent" => p.dependent = value,
+                    _ => p.hidden = value,
+                }
+            }
+            _ => return false,
+        }
+        self.store_dyn_props(&props);
+        true
+    }
+
     fn set_prop(&mut self, name: &str, v: Value) {
         match &mut self.props {
             ObjStore::Owned(s) => {
@@ -454,7 +597,7 @@ impl MObject {
         if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
             return first.prop_names();
         }
-        self.props_map().field_names()
+        self.props_map().field_names().into_iter().filter(|n| !is_internal_prop(n)).collect()
     }
 
     /// Snapshot of the property struct (display, `fieldnames`, `get`).
@@ -3094,6 +3237,9 @@ impl Session {
                     self.check_prop_access(&o, field, true)?;
                     let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                     let new = self.path_set(sub, rest, v, root)?;
+                    if self.sync_dynamic_meta(&mut o, field, &new)? {
+                        return Ok(Value::Object(o));
+                    }
                     if o.class_name == "table" && field != "Properties" {
                         // Dot-assignment adds/updates a table variable and
                         // keeps `Properties.VariableNames`/`NumRows` in sync.
@@ -4605,7 +4751,7 @@ impl Session {
                 match v.first() {
                     Some(Value::Object(o)) => {
                         // `fieldnames(obj)` lists the object's props.
-                        let names = o.props_map().field_names();
+                        let names = o.prop_names();
                         let mut c = CellArray::new(names.len(), 1);
                         for (i, k) in names.iter().enumerate() {
                             c.set_linear(i, Value::Str(k.clone()));
@@ -4623,6 +4769,83 @@ impl Session {
                     }
                     _ => Err(LangError::new("fieldnames needs a struct", 0)),
                 }
+            }
+            "addprop" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("addprop needs an object", 0)),
+                };
+                if o.is_array() {
+                    return Err(LangError::new("addprop needs a scalar object", 0));
+                }
+                if !o.is_handle() {
+                    return Err(LangError::new("addprop requires a handle object (add 'dynamicprops' or 'handle' to the superclass list)", 0));
+                }
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("addprop needs a property name", 0)),
+                };
+                if prop.is_empty()
+                    || !prop.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    || !prop.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return Err(LangError::new(format!("addprop: '{prop}' is not a valid property name"), 0));
+                }
+                if o.has_prop(&prop) && o.dyn_prop(&prop).is_none() {
+                    return Err(LangError::new(format!("addprop: property '{prop}' already exists"), 0));
+                }
+                let mut target = o.clone();
+                target.add_dyn_prop(&prop);
+                let meta = target.dyn_prop(&prop).unwrap_or(DynPropMeta {
+                    name: prop.clone(),
+                    get: Access::Public,
+                    set: Access::Public,
+                    constant: false,
+                    dependent: false,
+                    hidden: false,
+                });
+                let mut p = StructArray::new();
+                p.set_field(0, "Name", Value::Str(prop))?;
+                p.set_field(0, "GetAccess", Value::Str(access_name(meta.get).into()))?;
+                p.set_field(0, "SetAccess", Value::Str(access_name(meta.set).into()))?;
+                p.set_field(0, "Constant", Value::Num(meta.constant as u8 as f64))?;
+                p.set_field(0, "Dependent", Value::Num(meta.dependent as u8 as f64))?;
+                p.set_field(0, "Hidden", Value::Num(meta.hidden as u8 as f64))?;
+                p.set_field(0, "Source", Value::Object(target))?;
+                Ok(Some(Value::Object(MObject::new("dynamicprops".into(), p, true))))
+            }
+            "dynamicprops" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("dynamicprops needs an object", 0)),
+                };
+                let names: Vec<Value> = o.dyn_props().into_iter().map(|p| Value::Str(p.name)).collect();
+                Ok(Some(Value::Cell(CellArray::col(names))))
+            }
+            "removeprop" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("removeprop needs an object", 0)),
+                };
+                if !o.is_handle() {
+                    return Err(LangError::new("removeprop requires a handle object", 0));
+                }
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    Some(Value::Object(p)) if p.class_name == "dynamicprops" => match p.prop("Name") {
+                        Some(Value::Str(s)) => s,
+                        _ => return Err(LangError::new("removeprop: dynamic property has no name", 0)),
+                    },
+                    _ => return Err(LangError::new("removeprop needs a property name or dynamicprops handle", 0)),
+                };
+                let mut target = o;
+                if !target.remove_dyn_prop(&prop) {
+                    return Err(LangError::new(format!("removeprop: '{prop}' is not a dynamic property"), 0));
+                }
+                Ok(Some(Value::Object(target)))
             }
             "properties" | "methods" => {
                 // `properties(obj|'Class')` / `methods(…)` — a column
@@ -5588,7 +5811,15 @@ impl Session {
                             self.check_prop_access(&o, s, false)?;
                             o.prop(s).map(Some).ok_or_else(|| LangError::new(format!("get: no property '{s}' on class '{}'", o.class_name), 0))
                         }
-                        None => Ok(Some(Value::Struct(o.props_map()))),
+                        None => {
+                            let mut s = o.props_map();
+                            for n in s.field_names() {
+                                if is_internal_prop(&n) {
+                                    s.remove_field(&n);
+                                }
+                            }
+                            Ok(Some(Value::Struct(s)))
+                        }
                         Some(_) => Err(LangError::new("get: property name must be a string", 0)),
                     };
                 }
@@ -5671,6 +5902,10 @@ impl Session {
                             _ => return Err(LangError::new("set: property name must be a string", 0)),
                         };
                         let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
+                        if self.sync_dynamic_meta(&mut o, &pname, val)? {
+                            i += 2;
+                            continue;
+                        }
                         if o.class_name == "COM" {
                             if let Some(session) = o.com_session() {
                                 session.borrow_mut().set(&pname, val)?;
@@ -9755,7 +9990,44 @@ impl Session {
         Ok(access.allows(owner, Some(&caller), subclass))
     }
 
+    /// Mirror an access-attribute assignment on a `dynamicprops` handle
+    /// into the source object's hidden metadata. Returns whether the field
+    /// was a dynamic-property attribute.
+    fn sync_dynamic_meta(&mut self, handle: &mut MObject, field: &str, value: &Value) -> Result<bool, LangError> {
+        if handle.class_name != "dynamicprops" || !matches!(field, "GetAccess" | "SetAccess" | "Constant" | "Dependent" | "Hidden") {
+            return Ok(false);
+        }
+        let name = match handle.prop("Name") {
+            Some(Value::Str(s)) => s,
+            _ => return Err(LangError::new("dynamicprops handle has no Name", 0)),
+        };
+        let Some(Value::Object(mut source)) = handle.prop("Source") else {
+            return Err(LangError::new("dynamicprops handle has no Source", 0));
+        };
+        if !source.update_dyn_prop_attr(&name, field, value) {
+            return Err(LangError::new(format!("dynamicprops: '{name}' is no longer a dynamic property"), 0));
+        }
+        handle.set_prop(field, value.clone());
+        Ok(true)
+    }
+
     fn check_prop_access(&mut self, o: &MObject, name: &str, write: bool) -> Result<(), LangError> {
+        if let Some(meta) = o.dyn_prop(name) {
+            if write && meta.constant {
+                return Err(LangError::new(format!("cannot set Constant property '{name}' of class '{}'", o.class_name), 0));
+            }
+            if write && meta.dependent {
+                return Err(LangError::new(format!("cannot set Dependent property '{name}' of class '{}'", o.class_name), 0));
+            }
+            let access = if write { meta.set } else { meta.get };
+            if !self.access_allowed(&o.class_name, access)? {
+                return Err(LangError::new(
+                    format!("'{name}' has {} access in class '{}'", if access == Access::Private { "private" } else { "protected" }, o.class_name),
+                    0,
+                ));
+            }
+            return Ok(());
+        }
         let Some((attr, owner)) = self.prop_attr_for(&o.class_name, name)? else { return Ok(()) };
         if write && attr.constant {
             return Err(LangError::new(format!("cannot set Constant property '{name}' of class '{}'", o.class_name), 0));
@@ -16351,6 +16623,9 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "isprop",
     "addlistener",
     "notify",
+    "addprop",
+    "dynamicprops",
+    "removeprop",
     "fieldnames",
     "isfield",
     "rmfield",
@@ -18255,7 +18530,8 @@ pub fn fmt_value(v: &Value, long: bool) -> impl fmt::Display + '_ {
                     // `Foo` object with properties: — class tag + field list.
                     let props = o.props_map();
                     writeln!(f, "   {} object with properties:", o.class_name)?;
-                    for name in props.field_names() {
+                    let hidden: Vec<String> = o.dyn_props().into_iter().filter(|p| p.hidden).map(|p| p.name).collect();
+                    for name in props.field_names().into_iter().filter(|n| !is_internal_prop(n) && !hidden.contains(n)) {
                         let val = props.field_at(0, &name).cloned().unwrap_or(Value::Mat(Matrix::zeros(0, 0)));
                         writeln!(f, "       {name}: {}", fmt_cell_item(&val, self.1))?;
                     }
@@ -22397,6 +22673,73 @@ end",
         assert_eq!(s.get("nv"), Some(&Value::Num(4.0)));
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.get(0..4), Some(b"CDF\x01".as_slice()));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dynamic_properties_add_access_save_load() {
+        let dir = m_dir("dynprop");
+        let file = dir.join("dyn.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef Dyn < handle\n\
+             properties\n a = 1\n end\n\
+             methods\n\
+               function v = readfoo(obj)\n v = obj.foo;\n end\n\
+             end\n\
+             end",
+        )
+        .unwrap();
+        s.run(
+            "o = Dyn(); p = addprop(o, 'foo'); o.foo = 5; v = o.foo; names = dynamicprops(o); \
+             p.GetAccess = 'private'; inside = o.readfoo();",
+        )
+        .unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(5.0)));
+        assert_eq!(s.get("inside"), Some(&Value::Num(5.0)));
+        if let Some(Value::Cell(n)) = s.get("names") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("dynamicprops did not return a cellstr");
+        }
+        s.run("try, outside = o.foo; catch ae, amsg = ae.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("private access"), "dynamic access error = {m}");
+        } else {
+            panic!("private dynamic property was readable outside the class");
+        }
+
+        // Access attributes survive save/load along with the value.
+        s.run(&format!("save('{path}', 'o'); clear o p; load('{path}'); saved = o.readfoo(); names2 = dynamicprops(o);")).unwrap();
+        assert_eq!(s.get("saved"), Some(&Value::Num(5.0)));
+        if let Some(Value::Cell(n)) = s.get("names2") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("loaded dynamicprops did not return a cellstr");
+        }
+        s.run("try, hidden = o.foo; catch le, lmsg = le.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("lmsg") {
+            assert!(m.contains("private access"), "loaded access error = {m}");
+        } else {
+            panic!("saved private access was not restored");
+        }
+        s.run("p = addprop(o, 'bar'); o.bar = 7; removeprop(o, p); names3 = dynamicprops(o);").unwrap();
+        if let Some(Value::Cell(n)) = s.get("names3") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("dynamicprops after removal did not return a cellstr");
+        }
+
+        s.run("classdef ValueDyn\n end\nv = ValueDyn(); try, addprop(v, 'x'); catch ve, vmsg = ve.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("vmsg") {
+            assert!(m.contains("handle object"), "value-class addprop error = {m}");
+        } else {
+            panic!("addprop on a value class did not error");
+        }
         rm_dir(&dir);
     }
 

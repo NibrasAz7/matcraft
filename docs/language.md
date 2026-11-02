@@ -240,8 +240,14 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   class defines the method, else a clear "not defined for class" error.
 - `Class.member` evaluates an `enumeration` member's backing value, now
   returning a class instance.
-  Not in (parse harmlessly or error clearly): dynamic props beyond declared
-  fields, and `.mat` files containing MATLAB `mcOS`/opaque objects.
+  Dynamic properties: `addprop(obj, name)` adds a property to a handle
+  object and returns a `dynamicprops` metadata handle; `dynamicprops(obj)`
+  lists the names and `removeprop(obj, name|handle)` removes one. Dynamic
+  properties support `GetAccess`/`SetAccess`/`Constant`/`Dependent`/`Hidden`
+  (set through the returned handle) and are serialized with the object, so
+  access metadata and values survive `save`/`load`.
+  Not in (parse harmlessly or error clearly): `.mat` files containing MATLAB
+  `mcOS`/opaque objects.
 - `builtin('name', …)` calls a raw built-in implementation, bypassing
   user functions and class overloads. It supports multi-output builtins
   (`[r,c] = builtin('size', x)`) and numeric operator aliases such as

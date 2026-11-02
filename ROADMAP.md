@@ -336,6 +336,9 @@
 - `builtin` wave (2026-11): raw built-in dispatch that bypasses user
   functions and class overloads, including multi-output forms and numeric
   operator aliases.
+- Dynamic-property wave (2026-11): `addprop`/`dynamicprops`/`removeprop`
+  on handle objects, access-attribute enforcement and persistence through
+  `.mat` v5 save/load.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,

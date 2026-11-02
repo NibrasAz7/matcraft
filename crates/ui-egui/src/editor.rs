@@ -611,6 +611,8 @@ const SIGNATURES: &[(&str, &str, &str)] = &[
     ("eval", "eval(Expression)", "Evaluate an M-code expression string."),
     ("feval", "feval(Fun, A, ...)", "Evaluate a function handle or function name."),
     ("builtin", "builtin(Name, A, ...)", "Call a built-in function directly, bypassing user functions and class overloads."),
+    ("addprop", "addprop(Obj, Name)", "Add a dynamic property to a handle object."),
+    ("dynamicprops", "dynamicprops(Obj)", "List dynamic property names."),
     ("cellfun", "cellfun(Fun, C, UniformOutput)", "Apply a function to every cell."),
     ("arrayfun", "arrayfun(Fun, A, UniformOutput)", "Apply a function element-wise to an array."),
     ("struct", "struct(Field, Value, ...)", "Create a structure array."),
