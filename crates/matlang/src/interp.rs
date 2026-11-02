@@ -15,6 +15,19 @@ use matcore::{CMatrix, CNum, MatError, Matrix};
 use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::LangError;
 
+mod anova;
+mod control;
+mod corpus;
+mod ga;
+mod hdf5;
+mod image;
+mod netcdf;
+mod ode;
+mod optim;
+mod stats;
+mod umap;
+mod xlsx;
+
 /// Hard caps so hostile or buggy scripts terminate.
 const MAX_LOOP_ITERS: usize = 1_000_000;
 const MAX_RANGE_LEN: usize = 1_000_000;
@@ -848,6 +861,55 @@ impl Value {
 }
 
 /// A live workspace: variables, RNG state, pending printed output.
+/// Where `savepath` stores the persistent search path. `MATCRAFT_PATH_FILE`
+/// overrides the platform default (useful for tests and portable installs).
+fn path_store_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("MATCRAFT_PATH_FILE") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(app) = std::env::var("APPDATA") {
+            return std::path::PathBuf::from(app).join("MatCraft").join("path.txt");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(".config").join("matcraft").join("path.txt");
+        }
+    }
+    std::path::PathBuf::from(".matcraft_path")
+}
+
+fn load_paths_from(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(file) {
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                let p = std::path::PathBuf::from(line);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn initial_paths() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::env::current_dir().map(|d| vec![d]).unwrap_or_default();
+    for p in load_paths_from(&path_store_file()) {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
 /// `Clone` so the engine's panic guard can snapshot/restore a session.
 #[derive(Clone)]
 pub struct Session {
@@ -921,7 +983,7 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Self {
-        let paths = std::env::current_dir().map(|d| vec![d]).unwrap_or_default();
+        let paths = initial_paths();
         Session {
             vars: HashMap::new(),
             rng: 0x9E3779B97F4A7C15,
@@ -2118,7 +2180,17 @@ impl Session {
                 // argument list, not subscripts (MATLAB resolves by
                 // declaration).
                 if let Expr::Field(b, fname) = base.as_ref() {
-                    if let Value::Object(o) = self.eval(b)? {
+                    let base_val = self.eval(b)?;
+                    // Figure handles are numeric here, but M-code uses the
+                    // graphics-object method form (`f.findobj('Type','text')`).
+                    if fname == "findobj" {
+                        if let Value::Num(_) = base_val {
+                            let mut argv = vec![base_val];
+                            argv.extend(self.eval_args(args)?);
+                            return Ok(self.call_named("findobj", argv, 1)?.into_iter().next());
+                        }
+                    }
+                    if let Value::Object(o) = base_val {
                         if o.has_prop(fname) {
                             let v = o.prop(fname).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                             if let Value::Func(h) = v {
@@ -2335,7 +2407,7 @@ impl Session {
         if let Some(Value::Str(s)) = self.vars.get(name).cloned() {
             let len = s.chars().count();
             let mut target = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, target.dims(), target.numel().max(1))?;
+            let specs = self.index_specs(index, target.dims(), target.numel())?;
             pages_in_bounds(&specs)?;
             let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
@@ -2362,7 +2434,7 @@ impl Session {
         // them; writing past the end grows the sparse dims (MATLAB rule).
         if let Some(Value::Sparse(mut s)) = self.vars.get(name).cloned() {
             let rhs = v.to_matrix()?;
-            let specs = self.index_specs(index, &[s.rows(), s.cols()], s.numel().max(1))?;
+            let specs = self.index_specs(index, &[s.rows(), s.cols()], s.numel())?;
             pages_in_bounds(&specs)?;
             if rhs.numel() == 0 {
                 // `S(idx) = []` clears the addressed entries.
@@ -2401,7 +2473,7 @@ impl Session {
                 None => CMatrix::zeros(0, 0),
             };
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, &[target.rows(), target.cols()], target.numel().max(1))?;
+            let specs = self.index_specs(index, &[target.rows(), target.cols()], target.numel())?;
             if rhs.numel() == 0 {
                 let kept = cmatrix_delete(&target, &specs)?;
                 self.vars.insert(name.to_string(), cmat_or_value(kept));
@@ -2435,7 +2507,12 @@ impl Session {
     /// Fetch the contents selected by `c{…}` as a list — the building
     /// block of comma-separated-list expansion.
     fn cell_pick(&mut self, ca: &CellArray, args: &[Expr]) -> Result<Vec<Value>, LangError> {
-        let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        // `c{:}` over an empty cell is an empty comma-separated list (this is
+        // how `varargin{:}` forwards "no arguments"), not an index error.
+        if ca.numel() == 0 && matches!(args, [Expr::Colon]) {
+            return Ok(Vec::new());
+        }
+        let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         if specs.linear {
             specs
@@ -2546,7 +2623,24 @@ impl Session {
                 if let Value::Object(mut o) = cur {
                     let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                     let new = self.path_set(sub, rest, v, root)?;
-                    o.set_prop(field, new);
+                    if o.class_name == "table" && field != "Properties" {
+                        // Dot-assignment adds/updates a table variable and
+                        // keeps `Properties.VariableNames`/`NumRows` in sync.
+                        o.set_prop(field, new.clone());
+                        let mut names = table_var_names(&o);
+                        if !names.iter().any(|n| n == field) {
+                            names.push(field.clone());
+                        }
+                        let mut p = match o.prop("Properties") {
+                            Some(Value::Struct(s)) => s,
+                            _ => StructArray::new(),
+                        };
+                        p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.into_iter().map(Value::Str).collect())))?;
+                        p.set_field(0, "NumRows", Value::Num(value_row_count(&new) as f64))?;
+                        o.set_prop("Properties", Value::Struct(p));
+                    } else {
+                        o.set_prop(field, new);
+                    }
                     return Ok(Value::Object(o));
                 }
                 let mut sa = match cur {
@@ -2605,7 +2699,7 @@ impl Session {
     fn paren_apply(&mut self, target: Value, index: &[Expr], v: Value) -> Result<Value, LangError> {
         if let Value::Struct(sa) = target {
             let mut sa = sa;
-            let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel())?;
             pages_in_bounds(&specs)?;
             // Linear indices into the element list (1-based).
             let idx: Vec<usize> = if specs.linear {
@@ -2655,7 +2749,7 @@ impl Session {
             // Char-array write through a chain (`s.f(2) = 'x'`).
             let len = s.chars().count();
             let mut m = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, m.dims(), m.numel().max(1))?;
+            let specs = self.index_specs(index, m.dims(), m.numel())?;
             pages_in_bounds(&specs)?;
             let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
@@ -2678,7 +2772,7 @@ impl Session {
         if matches!(target, Value::Cplx(_)) || matches!(v, Value::Cplx(_)) {
             let mut m = target.to_cmatrix()?;
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, &[m.rows(), m.cols()], m.numel().max(1))?;
+            let specs = self.index_specs(index, &[m.rows(), m.cols()], m.numel())?;
             if rhs.numel() == 0 {
                 return Ok(cmat_or_value(cmatrix_delete(&m, &specs)?));
             }
@@ -2698,7 +2792,7 @@ impl Session {
     /// `c{i} = v` — content assignment into an owned cell array; creates and
     /// grows the cell. Shared by variable and field assignment.
     fn cell_brace_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         if specs.linear {
             let max_i = specs.rows().iter().copied().max().unwrap_or(0);
@@ -2745,7 +2839,7 @@ impl Session {
     /// The `c(i) = v` operation on an owned cell array — shared by variable
     /// assignment and `s.f(i) = …` field assignment.
     fn cell_paren_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         match v {
             Value::Cell(rhs) => {
@@ -2806,12 +2900,93 @@ impl Session {
                 }
                 Ok(ca)
             }
+            // `string` arrays are represented as cellstr, so parenthesised
+            // assignment of a scalar string stores the element itself
+            // (`s(i) = string(x)` in corpus code).
+            Value::Str(s) => {
+                let idxs: Vec<usize> = if specs.linear {
+                    specs.rows().to_vec()
+                } else {
+                    let mut lin = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+                    for &c in specs.cols() {
+                        for &r in specs.rows() {
+                            lin.push((c - 1) * ca.rows + r);
+                        }
+                    }
+                    lin
+                };
+                let (gr, gc) = if specs.linear {
+                    let max_i = idxs.iter().copied().max().unwrap_or(0);
+                    if ca.cols == 1 && ca.rows > 1 {
+                        (max_i, 1)
+                    } else if ca.rows <= 1 {
+                        (1, max_i)
+                    } else {
+                        (max_i.div_ceil(ca.cols.max(1)), ca.cols)
+                    }
+                } else {
+                    (specs.rows().iter().copied().max().unwrap_or(0), specs.cols().iter().copied().max().unwrap_or(0))
+                };
+                ca.grow_capped(gr, gc)?;
+                for &i in &idxs {
+                    ca.set_linear(i.saturating_sub(1), Value::Str(s.clone()));
+                }
+                Ok(ca)
+            }
             _ => Err(LangError::new("conversion to cell from a non-cell value — write c{i} = value instead", 0)),
         }
     }
 
+    /// `T(rows, cols)` for `table` objects: select rows and variables.
+    /// Supported subscripts are numeric indices, logical masks, `:` and
+    /// variable-name cellstrs/strings for the column position.
+    fn table_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let names = table_var_names(o);
+        let nrows = table_num_rows(o);
+        let ncols = names.len();
+        if args.is_empty() || args.len() > 2 {
+            return Err(LangError::new("table indexing needs T(rows, cols)", 0));
+        }
+        let row_specs = self.index_specs(&args[..1], &[nrows], nrows)?;
+        let rows = row_specs.rows().to_vec();
+        let cols: Vec<usize> = if args.len() == 1 || matches!(args[1], Expr::Colon) {
+            (1..=ncols).collect()
+        } else {
+            let resolved = resolve_end(&args[1], ncols);
+            let value = self.eval(&resolved)?;
+            match value {
+                Value::Str(name) => {
+                    let p = names.iter().position(|n| n == &name).ok_or_else(|| LangError::new(format!("table: unknown variable '{name}'"), 0))?;
+                    vec![p + 1]
+                }
+                Value::Cell(c) => {
+                    let mut out = Vec::with_capacity(c.numel());
+                    for item in &c.items {
+                        let Value::Str(name) = item else {
+                            return Err(LangError::new("table: variable names must be strings", 0));
+                        };
+                        let p = names.iter().position(|n| n == name).ok_or_else(|| LangError::new(format!("table: unknown variable '{name}'"), 0))?;
+                        out.push(p + 1);
+                    }
+                    out
+                }
+                other => index_list(&other, ncols)?,
+            }
+        };
+        if rows.iter().any(|&r| r == 0 || r > nrows) {
+            return Err(LangError::new("table: row index out of bounds", 0));
+        }
+        if cols.iter().any(|&c| c == 0 || c > ncols) {
+            return Err(LangError::new("table: variable index out of bounds", 0));
+        }
+        table_subset(o, &rows, &cols)
+    }
+
     fn index_into(&mut self, target: &Value, args: &[Expr]) -> Result<Value, LangError> {
-        if let Value::Object(_) = target {
+        if let Value::Object(o) = target {
+            if o.class_name == "table" {
+                return self.table_index(o, args);
+            }
             return Err(LangError::new("indexing into an object is not supported (object arrays are not implemented)", 0));
         }
         if let Value::Cell(ca) = target {
@@ -2820,7 +2995,7 @@ impl Session {
                 return Ok(Value::Cell(CellArray::new(0, 0)));
             }
             // `c(i)` / `c(i, j)` — paren indexing keeps cells.
-            let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+            let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 let mut out = Vec::with_capacity(specs.rows().len());
@@ -2861,7 +3036,7 @@ impl Session {
         }
         if let Value::Sparse(s) = target {
             // `S(i,j)` reads sparse → a sparse result (or scalar Num).
-            let specs = self.index_specs(args, &[s.rows(), s.cols()], s.numel().max(1))?;
+            let specs = self.index_specs(args, &[s.rows(), s.cols()], s.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 // Single-element linear read returns a scalar double.
@@ -2911,7 +3086,7 @@ impl Session {
             return Ok(Value::Sparse(out));
         }
         if let Value::Struct(sa) = target {
-            let specs = self.index_specs(args, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            let specs = self.index_specs(args, &[sa.rows(), sa.cols()], sa.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 let idx: Vec<usize> = specs.rows().iter().map(|i| i.saturating_sub(1)).collect();
@@ -3006,8 +3181,12 @@ impl Session {
         // whole array linearly and the last subscript spans `dims[i..]`
         // collapsed.
         let extent = |i: usize, n: usize| -> usize {
+            if numel == 0 {
+                // `end` is 0 for an empty array, so `A(end+1)=v` starts at 1.
+                return 0;
+            }
             if n == 1 {
-                return numel.max(1);
+                return numel;
             }
             if i + 1 == n {
                 return dims.get(i..).unwrap_or(&[]).iter().fold(1usize, |a, &d| a.saturating_mul(d)).max(1);
@@ -3056,6 +3235,9 @@ impl Session {
         // Operator overloading: an object operand defers to its class's
         // `plus`/`mtimes`/`eq`/… method — MATLAB's dominant-argument rule.
         if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            if self.is_lti(&a) || self.is_lti(&b) {
+                return self.lti_binary(op, a, b);
+            }
             return self.object_binary(op, a, b);
         }
         // Either side complex → the whole op runs in complex arithmetic.
@@ -3238,7 +3420,7 @@ impl Session {
     /// Builtin functions. Returns `Ok(None)` for commands that only print.
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         match name {
-            "zeros" | "ones" | "eye" | "rand" | "randn" => {
+            "zeros" | "ones" | "eye" | "rand" | "randn" | "true" | "false" => {
                 // `rand('seed', v)` / `rand('state', v)` (and the
                 // `'twister'` alias) — the legacy seed-setting form,
                 // still common in older scripts alongside `rng`.
@@ -3262,8 +3444,9 @@ impl Session {
                     return Err(LangError::new("eye accepts at most two dimensions", 0));
                 }
                 let m = match name {
-                    "zeros" => Matrix::zeros_nd(&dims),
-                    "ones" => Matrix::ones_nd(&dims),
+                    "zeros" | "false" => Matrix::zeros_nd(&dims),
+                    // `true`/`false` with dimensions follow zeros/ones.
+                    "ones" | "true" => Matrix::ones_nd(&dims),
                     "eye" => Matrix::eye(dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1)),
                     "rand" => {
                         let n = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
@@ -3920,6 +4103,11 @@ impl Session {
                     return a.broadcast(&b, |x, y| if (x > y) == hi { x } else { y }).map(mat_or_num).map(Some).map_err(lang);
                 }
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                if let Value::Object(o) = v0 {
+                    if name == "mean" && o.class_name.starts_with("prob.") {
+                        return self.prob_moment(name, o).map(Some);
+                    }
+                }
                 if let Value::Cplx(cm) = v0 {
                     let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
@@ -3931,6 +4119,11 @@ impl Session {
             "std" | "var" | "median" => {
                 let v = self.eval_args(args)?;
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                if let Value::Object(o) = v0 {
+                    if o.class_name.starts_with("prob.") {
+                        return self.prob_moment(name, o).map(Some);
+                    }
+                }
                 if let Value::Cplx(cm) = v0 {
                     let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
@@ -4510,6 +4703,10 @@ impl Session {
                 // `set(h,'prop',v,...)` — h=0 stores root `Default*` props,
                 // a figure number writes the props `get` reports.
                 let v = self.eval_args(args)?;
+                // `set([], …)` on an empty graphics array is a no-op.
+                if matches!(v.first(), Some(Value::Mat(m)) if m.numel() == 0) || matches!(v.first(), Some(Value::Cell(c)) if c.numel() == 0) {
+                    return Ok(None);
+                }
                 // `set(obj,'prop',v,…)` — writes through on handle
                 // classes, returns the updated object on value classes.
                 if let Some(Value::Object(o)) = v.first() {
@@ -4844,6 +5041,16 @@ impl Session {
                 let c = if v.len() > 2 { v.scalar_at(2)? as usize } else { r };
                 match v.first() {
                     Some(Value::Cell(ca)) => ca.repmat(r, c).map(Value::Cell).map(Some),
+                    // Character/string data is scalar `Str` here, so tiling it
+                    // yields a cellstr-like array (matching `string` array
+                    // element access without a distinct string type).
+                    Some(Value::Str(s)) => {
+                        let mut ca = CellArray::new(r, c);
+                        for i in 0..r.saturating_mul(c) {
+                            ca.set_linear(i, Value::Str(s.clone()));
+                        }
+                        Ok(Some(Value::Cell(ca)))
+                    }
                     Some(Value::Cplx(cm)) => cplanes(cm, |m| repmat(m, r, c)).map(cmat_or_value).map(Some),
                     Some(x) => {
                         let m = x.to_matrix()?;
@@ -5235,6 +5442,7 @@ impl Session {
             "isempty" => {
                 let v = self.eval_args(args)?;
                 let e = match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "table" => table_num_rows(o) == 0,
                     Some(x) => x.dims_vec().iter().product::<usize>() == 0,
                     None => true,
                 };
@@ -5448,7 +5656,77 @@ impl Session {
                 };
                 Ok(Some(Value::Num(trapz(&x, &y))))
             }
-            "fzero" | "fminsearch" | "integral" | "quad" => self.solve_scalar(name, args),
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "fmincon" | "patternsearch" => {
+                let v = self.eval_args(args)?;
+                let out = self.optimize_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
+            | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable" | "damp"
+            | "bandwidth" => {
+                let v = self.eval_args(args)?;
+                let out = self.control_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "exprnd" | "unifrnd" | "poissrnd" | "binornd" | "iqr" | "corrcoef" | "regress"
+            | "kmeans" | "ttest" | "ttest2" | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv"
+            | "chi2pdf" | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf"
+            | "random" | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum"
+            | "kruskalwallis" => {
+                let v = self.eval_args(args)?;
+                let out = self.stats_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" => {
+                let v = self.eval_args(args)?;
+                let out = self.xlsx_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "rgb2gray" | "imresize" | "imfilter" | "medfilt2" | "edge" | "bwlabel" | "regionprops" | "graythresh" | "imbinarize" | "imdilate"
+            | "imerode" | "imopen" | "imclose" | "imrotate" | "imcrop" | "strel" => {
+                let v = self.eval_args(args)?;
+                let out = self.image_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ga" => {
+                let v = self.eval_args(args)?;
+                let out = self.ga_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "h5read" | "h5write" | "h5create" | "h5disp" => {
+                let v = self.eval_args(args)?;
+                let out = self.hdf5_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "umap" => {
+                let v = self.eval_args(args)?;
+                let out = self.umap_call(&v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ode45" | "ode15s" | "odeset" | "odeget" => {
+                let v = self.eval_args(args)?;
+                let out = self.ode_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "inputParser" | "addRequired" | "addOptional" | "addParameter" | "addParamValue" | "addparameter" | "parse" | "string" | "strings"
+            | "isstring" | "table2array" => {
+                let v = self.eval_args(args)?;
+                let out = self.corpus_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "table" => self.table_call(args),
+            "anova1" | "anova2" | "multcompare" | "friedman" => {
+                let v = self.eval_args(args)?;
+                let out = self.anova_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ncread" | "ncwrite" | "ncinfo" | "ncdisp" => {
+                let v = self.eval_args(args)?;
+                let out = self.netcdf_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "fzero" | "integral" | "quad" => self.solve_scalar(name, args),
             // --- linear algebra ---------------------------------------------
             "eig" | "svd" | "qr" | "lu" | "chol" | "rref" | "pinv" | "rank" | "cond" | "trace" | "null" | "orth" => self.linalg(name, args),
             // --- strings -----------------------------------------------------
@@ -5463,25 +5741,72 @@ impl Session {
                 let v = self.eval_args(args)?;
                 match v.first() {
                     Some(Value::Str(s)) => Ok(Some(Value::Num(s.trim().parse::<f64>().unwrap_or(f64::NAN)))),
+                    // Cellstr/string arrays convert elementwise to a numeric
+                    // array of the same shape (MATLAB `str2double`).
+                    Some(Value::Cell(c)) => {
+                        let mut data = Vec::with_capacity(c.numel());
+                        for i in 0..c.numel() {
+                            let x = match c.get_linear(i) {
+                                Some(Value::Str(s)) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
+                                _ => f64::NAN,
+                            };
+                            data.push(x);
+                        }
+                        let m = Matrix::from_col_major(c.rows, c.cols, data).map_err(lang)?;
+                        Ok(Some(mat_or_num(m)))
+                    }
                     Some(x) => Ok(Some(Value::Num(x.scalar()?))),
                     None => Err(LangError::new("str2double needs a string", 0)),
                 }
             }
             "strcmp" | "strcmpi" => {
                 let v = self.eval_args(args)?;
-                let (a, b) = (v.first(), v.get(1));
-                let eq = match (a, b) {
-                    (Some(Value::Str(x)), Some(Value::Str(y))) => {
-                        if name == "strcmpi" {
-                            x.eq_ignore_ascii_case(y)
-                        } else {
-                            x == y
-                        }
+                let ci = name == "strcmpi";
+                let eq_str = |x: &str, y: &str| if ci { x.eq_ignore_ascii_case(y) } else { x == y };
+                let other_at = |other: &Value, i: usize| -> Option<String> {
+                    match other {
+                        Value::Str(s) => Some(s.clone()),
+                        Value::Cell(c) => match c.get_linear(if c.numel() == 1 { 0 } else { i }) {
+                            Some(Value::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
                     }
-                    (Some(x), Some(y)) => values_equal(x, y),
-                    _ => false,
                 };
-                Ok(Some(Value::Num(if eq { 1.0 } else { 0.0 })))
+                match (v.first(), v.get(1)) {
+                    // Cellstr/string-array comparisons return a logical array
+                    // the same shape as the cell input (MATLAB rule).
+                    (Some(Value::Cell(ca)), Some(other)) => {
+                        let mut data = Vec::with_capacity(ca.numel());
+                        for i in 0..ca.numel() {
+                            let hit = match (ca.get_linear(i), other_at(other, i)) {
+                                (Some(Value::Str(a)), Some(b)) => eq_str(a, &b),
+                                _ => false,
+                            };
+                            data.push(if hit { 1.0 } else { 0.0 });
+                        }
+                        let m = Matrix::from_col_major(ca.rows, ca.cols, data).map_err(lang)?;
+                        Ok(Some(Value::Mat(m)))
+                    }
+                    (Some(Value::Str(a)), Some(Value::Cell(cb))) => {
+                        let mut data = Vec::with_capacity(cb.numel());
+                        for i in 0..cb.numel() {
+                            let hit = match cb.get_linear(i) {
+                                Some(Value::Str(b)) => eq_str(a, b),
+                                _ => false,
+                            };
+                            data.push(if hit { 1.0 } else { 0.0 });
+                        }
+                        let m = Matrix::from_col_major(cb.rows, cb.cols, data).map_err(lang)?;
+                        Ok(Some(Value::Mat(m)))
+                    }
+                    (Some(Value::Str(x)), Some(Value::Str(y))) => Ok(Some(Value::Num(if eq_str(x, y) { 1.0 } else { 0.0 }))),
+                    (Some(x), Some(y)) => {
+                        let eq = values_equal(x, y);
+                        Ok(Some(Value::Num(if eq { 1.0 } else { 0.0 })))
+                    }
+                    _ => Ok(Some(Value::Num(0.0))),
+                }
             }
             "strcat" => {
                 let v = self.eval_args(args)?;
@@ -5499,6 +5824,190 @@ impl Session {
                 match v.first() {
                     Some(Value::Str(s)) => Ok(Some(Value::Str(if name == "upper" { s.to_uppercase() } else { s.to_lowercase() }))),
                     _ => Err(LangError::new(format!("{name} needs a string"), 0)),
+                }
+            }
+            "contains" | "startswith" | "endswith" | "startsWith" | "endsWith" => {
+                let v = self.eval_args(args)?;
+                let pat = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string pattern"), 0)),
+                };
+                let test = |s: &str| -> bool {
+                    match name {
+                        "contains" => s.contains(&pat),
+                        "startswith" | "startsWith" => s.starts_with(&pat),
+                        _ => s.ends_with(&pat),
+                    }
+                };
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(if test(s) { 1.0 } else { 0.0 }))),
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let flag = match item {
+                                Value::Str(s) => test(s),
+                                _ => false,
+                            };
+                            out.set_linear(i, if flag { 1.0 } else { 0.0 });
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    _ => Err(LangError::new(format!("{name} needs a string or cell array of strings"), 0)),
+                }
+            }
+            "strsplit" => {
+                let v = self.eval_args(args)?;
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("strsplit needs a string", 0)),
+                };
+                let delim = match v.get(1) {
+                    Some(Value::Str(d)) => d.clone(),
+                    _ => " ".to_string(),
+                };
+                let parts: Vec<Value> = s.split(delim.as_str()).filter(|p| !p.is_empty()).map(|p| Value::Str(p.to_string())).collect();
+                Ok(Some(Value::Cell(CellArray::row(parts))))
+            }
+            "strjoin" => {
+                let v = self.eval_args(args)?;
+                let delim = match v.get(1) {
+                    Some(Value::Str(d)) => d.clone(),
+                    _ => " ".to_string(),
+                };
+                let items = match v.first() {
+                    Some(Value::Cell(c)) => &c.items,
+                    _ => return Err(LangError::new("strjoin needs a cell array of strings", 0)),
+                };
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Str(s) => parts.push(s.clone()),
+                        _ => return Err(LangError::new("strjoin needs a cell array of strings", 0)),
+                    }
+                }
+                Ok(Some(Value::Str(parts.join(&delim))))
+            }
+            "strlength" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(s.chars().count() as f64))),
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let n = match item {
+                                Value::Str(s) => s.chars().count() as f64,
+                                _ => 0.0,
+                            };
+                            out.set_linear(i, n);
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    _ => Err(LangError::new("strlength needs a string or cell array", 0)),
+                }
+            }
+            "fileread" => {
+                let v = self.eval_args(args)?;
+                let path = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("fileread needs a file name", 0)),
+                };
+                let bytes = std::fs::read(&path).map_err(|e| LangError::new(format!("fileread: {path}: {e}"), 0))?;
+                Ok(Some(Value::Str(String::from_utf8_lossy(&bytes).to_string())))
+            }
+            "isfolder" => {
+                let v = self.eval_args(args)?;
+                let path = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isfolder needs a path", 0)),
+                };
+                Ok(Some(Value::Num(if std::path::Path::new(&path).is_dir() { 1.0 } else { 0.0 })))
+            }
+            "rows" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "table" => {
+                        let n = o
+                            .prop("Properties")
+                            .and_then(|p| match p {
+                                Value::Struct(s) => s.field_at(0, "NumRows").cloned(),
+                                _ => None,
+                            })
+                            .and_then(|x| x.scalar().ok())
+                            .unwrap_or(0.0);
+                        Ok(Some(Value::Num(n)))
+                    }
+                    Some(Value::Cell(c)) => Ok(Some(Value::Num(c.rows as f64))),
+                    Some(Value::Mat(m)) => Ok(Some(Value::Num(m.rows() as f64))),
+                    Some(Value::Struct(s)) => Ok(Some(Value::Num(s.rows as f64))),
+                    _ => Ok(Some(Value::Num(1.0))),
+                }
+            }
+            "array2table" => {
+                let v = self.eval_args(args)?;
+                let m = match v.first() {
+                    Some(x) => x.to_numeric()?,
+                    None => return Err(LangError::new("array2table needs a matrix", 0)),
+                };
+                let mut names = Vec::new();
+                let mut i = 1usize;
+                while i < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        if key.eq_ignore_ascii_case("VariableNames") {
+                            if let Some(Value::Cell(c)) = v.get(i + 1) {
+                                for item in &c.items {
+                                    if let Value::Str(s) = item {
+                                        names.push(s.clone());
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                if names.len() != m.cols() {
+                    names = (1..=m.cols()).map(|c| format!("Var{c}")).collect();
+                }
+                let mut props = StructArray::new();
+                for (c, name) in names.iter().enumerate() {
+                    let col: Vec<f64> = (0..m.rows()).map(|r| m.get(r, c).unwrap_or(0.0)).collect();
+                    props.set_field(0, name, Value::Mat(Matrix::col_vector(col)))?;
+                }
+                let mut p = StructArray::new();
+                p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.iter().cloned().map(Value::Str).collect())))?;
+                p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+                p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+                p.set_field(0, "NumRows", Value::Num(m.rows() as f64))?;
+                props.set_field(0, "Properties", Value::Struct(p))?;
+                Ok(Some(Value::Object(MObject::owned("table".to_string(), props))))
+            }
+            "ismissing" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Mat(m)) => {
+                        let mut out = Matrix::zeros(m.rows(), m.cols());
+                        for r in 0..m.rows() {
+                            for c in 0..m.cols() {
+                                let _ = out.set(r, c, if m.get(r, c).map(|x| x.is_nan()).unwrap_or(true) { 1.0 } else { 0.0 });
+                            }
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let flag = match item {
+                                Value::Str(s) => s.is_empty(),
+                                Value::Mat(m) => m.numel() == 0,
+                                _ => false,
+                            };
+                            out.set_linear(i, if flag { 1.0 } else { 0.0 });
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(if s.is_empty() { 1.0 } else { 0.0 }))),
+                    _ => Ok(Some(Value::Num(1.0))),
                 }
             }
             "strtrim" => {
@@ -5730,23 +6239,38 @@ impl Session {
             "clc" | "home" => Ok(None),
             "addpath" | "rmpath" => {
                 let v = self.eval_args(args)?;
+                let mut at_end = false;
+                let mut dirs: Vec<std::path::PathBuf> = Vec::new();
                 for x in &v {
                     if let Value::Str(s) = x {
+                        if s.eq_ignore_ascii_case("-end") {
+                            at_end = true;
+                            continue;
+                        }
+                        if s.eq_ignore_ascii_case("-begin") {
+                            at_end = false;
+                            continue;
+                        }
                         // `addpath(genpath(pwd))` passes a `;`-separated list
                         // (MATLAB pathsep on all platforms here).
                         for part in s.split(';') {
-                            if part.is_empty() {
-                                continue;
-                            }
-                            let dir = std::path::PathBuf::from(part);
-                            if name == "addpath" {
-                                if !self.paths.contains(&dir) {
-                                    self.paths.push(dir);
-                                }
-                            } else {
-                                self.paths.retain(|p| p != &dir);
+                            if !part.is_empty() {
+                                dirs.push(std::path::PathBuf::from(part));
                             }
                         }
+                    }
+                }
+                for dir in dirs {
+                    if name == "addpath" {
+                        if !self.paths.contains(&dir) {
+                            if at_end {
+                                self.paths.push(dir);
+                            } else {
+                                self.paths.insert(0, dir);
+                            }
+                        }
+                    } else {
+                        self.paths.retain(|p| p != &dir);
                     }
                 }
                 Ok(None)
@@ -5816,10 +6340,36 @@ impl Session {
                 Ok(Some(Value::Mat(Matrix::from_col_major(r, c, data).map_err(lang)?)))
             }
             "path" => {
-                for d in &self.paths {
-                    self.print_buf.push_str(&format!("{}\n", d.display()));
+                let v = self.eval_args(args)?;
+                if let Some(first) = v.first() {
+                    let mut new_paths: Vec<std::path::PathBuf> = Vec::new();
+                    let mut add = |s: &str| {
+                        for part in s.split(';') {
+                            if !part.trim().is_empty() {
+                                let p = std::path::PathBuf::from(part.trim());
+                                if !new_paths.contains(&p) {
+                                    new_paths.push(p);
+                                }
+                            }
+                        }
+                    };
+                    match first {
+                        Value::Str(s) => add(s),
+                        Value::Cell(c) => {
+                            for item in &c.items {
+                                if let Value::Str(s) = item {
+                                    add(s);
+                                }
+                            }
+                        }
+                        _ => return Err(LangError::new("path needs a string or cellstr", 0)),
+                    }
+                    self.paths = new_paths;
+                    Ok(Some(Value::Num(0.0)))
+                } else {
+                    let joined = self.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(";");
+                    Ok(Some(Value::Str(joined)))
                 }
-                Ok(None)
             }
             "pwd" => Ok(Some(Value::Str(std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default()))),
             "cd" => {
@@ -5966,15 +6516,15 @@ impl Session {
             }
             // --- extra strings --------------------------------------------------
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
-            | "regexpi" | "regexprep" => {
+            | "regexpi" | "regexprep" | "erase" | "replace" => {
                 let outs = self.str_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
             // --- environment / system -------------------------------------------
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
-            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
-            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
-            | "inline" | "optimset" | "optimget" | "nargchk" => {
+            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "dos" | "unix" | "savepath" | "fileparts"
+            | "copyfile" | "movefile" | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename"
+            | "license" | "ver" | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help"
+            | "doc" | "class" | "inline" | "optimset" | "optimoptions" | "optimget" | "nargchk" => {
                 let outs = self.sys_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
@@ -6081,9 +6631,11 @@ impl Session {
         match name {
             "figure" => {
                 let v = self.eval_args(args)?;
+                // `figure(n)` selects/creates figure n; property/value pairs
+                // (`figure('Position', …, 'Color', 'w')`) just create one.
                 let n = match v.first() {
+                    Some(Value::Str(_)) | None => self.figs.len() + 1,
                     Some(val) => val.scalar()? as usize,
-                    None => self.figs.len() + 1,
                 };
                 if n > MAX_FIGURES {
                     return Err(LangError::new("figure number exceeds limit", 0));
@@ -6218,8 +6770,8 @@ impl Session {
                 self.figure_mut().push_err(SeriesKind::ErrorBar, x.data().to_vec(), y.data().to_vec(), Some(e.data().to_vec()), spec);
                 Ok(None)
             }
-            "vline" => {
-                // vline(x [, spec]) — a vertical line at each x, spanning
+            "vline" | "xline" => {
+                // vline(x [, spec]) / xline - a vertical line at each x, spanning
                 // the current y limits (auto when unset). Always appends,
                 // like hold on; name/value pairs beyond the spec are
                 // accepted but ignored. Returns the line count.
@@ -6783,6 +7335,164 @@ impl Session {
                 }
                 self.figure_mut().push_grid(kind, xf, yf, zm.data().to_vec(), rows, cols, Vec::new(), matplot::LineSpec::new());
                 Ok(None)
+            }
+            "daspect" => {
+                let v = self.eval_args(args)?;
+                if let Some(val) = v.first() {
+                    let _ = val;
+                    Ok(None)
+                } else {
+                    Ok(Some(Value::Mat(Matrix::row_vector(vec![1.0, 1.0, 1.0]))))
+                }
+            }
+            "rectangle" => {
+                // rectangle('Position',[x y w h], 'Curvature',c, …) - draw the
+                // outline as a closed polyline (curved corners are not filled).
+                let v = self.eval_args(args)?;
+                let mut pos = [0.0f64, 0.0, 1.0, 1.0];
+                let mut curvature = [0.0f64, 0.0];
+                let mut spec = matplot::LineSpec::new();
+                let mut i = 0;
+                while i < v.len() {
+                    let Value::Str(key) = &v[i] else {
+                        i += 1;
+                        continue;
+                    };
+                    let Some(val) = v.get(i + 1) else {
+                        return Err(LangError::new(format!("rectangle: '{key}' needs a value"), 0));
+                    };
+                    match key.trim().to_ascii_lowercase().as_str() {
+                        "position" => {
+                            let m = val.to_matrix()?;
+                            let d = m.data();
+                            if d.len() < 4 {
+                                return Err(LangError::new("rectangle: Position needs [x y w h]", 0));
+                            }
+                            pos.copy_from_slice(&d[..4]);
+                        }
+                        "curvature" => {
+                            let m = val.to_matrix()?;
+                            let d = m.data();
+                            curvature[0] = d.first().copied().unwrap_or(0.0).abs();
+                            curvature[1] = d.get(1).copied().unwrap_or(curvature[1]).abs();
+                        }
+                        "facecolor" | "edgecolor" => {
+                            if let Value::Str(s) = val {
+                                if s.eq_ignore_ascii_case("none") {
+                                    i += 2;
+                                    continue;
+                                }
+                                spec.color = named_rgb(s);
+                            } else {
+                                let m = val.to_matrix()?;
+                                let d = m.data();
+                                if d.len() >= 3 {
+                                    spec.color = Some(matplot::Rgb(
+                                        (d[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (d[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (d[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    ));
+                                }
+                            }
+                        }
+                        other => apply_plot_prop(&mut spec, other, val)?,
+                    }
+                    i += 2;
+                }
+                let [x, y, w, h] = pos;
+                let (mut xs, mut ys) = (Vec::new(), Vec::new());
+                if curvature[0] > 0.0 || curvature[1] > 0.0 {
+                    let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                    let steps = 64;
+                    for k in 0..=steps {
+                        let t = std::f64::consts::TAU * k as f64 / steps as f64;
+                        xs.push(cx + w / 2.0 * t.cos());
+                        ys.push(cy + h / 2.0 * t.sin());
+                    }
+                } else {
+                    xs = vec![x, x + w, x + w, x, x];
+                    ys = vec![y, y, y + h, y + h, y];
+                }
+                spec.dash = matplot::DashStyle::Solid;
+                self.figure_mut().push_err(matplot::SeriesKind::Line, xs, ys, None, spec);
+                Ok(None)
+            }
+            "patch" => {
+                // patch(X, Y, colour, …) - outlined polygon through the points.
+                let v = self.eval_args(args)?;
+                if v.len() < 2 {
+                    return Err(LangError::new("patch needs X and Y", 0));
+                }
+                let xm = v[0].to_matrix()?;
+                let ym = v[1].to_matrix()?;
+                if xm.numel() != ym.numel() || xm.numel() < 3 {
+                    return Err(LangError::new("patch: X and Y must be equal-length vectors", 0));
+                }
+                let mut spec = matplot::LineSpec::new();
+                if let Some(c) = v.get(2) {
+                    match c {
+                        Value::Str(s) => spec.color = named_rgb(s),
+                        _ => {
+                            let m = c.to_matrix()?;
+                            let d = m.data();
+                            if d.len() >= 3 {
+                                spec.color = Some(matplot::Rgb(
+                                    (d[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (d[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (d[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let mut i = 3;
+                while i + 1 < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        apply_plot_prop(&mut spec, key, &v[i + 1])?;
+                    }
+                    i += 2;
+                }
+                let mut xs: Vec<f64> = (0..xm.numel()).map(|k| xm.get_linear(k).unwrap_or(0.0)).collect();
+                let mut ys: Vec<f64> = (0..ym.numel()).map(|k| ym.get_linear(k).unwrap_or(0.0)).collect();
+                if let (Some(&x0), Some(&y0)) = (xs.first(), ys.first()) {
+                    xs.push(x0);
+                    ys.push(y0);
+                }
+                spec.dash = matplot::DashStyle::Solid;
+                self.figure_mut().push_err(matplot::SeriesKind::Line, xs, ys, None, spec);
+                Ok(None)
+            }
+            #[allow(clippy::approx_constant)] // documented colour values, not log10(2)
+            "lines" => {
+                // lines(n): n rows of the MATLAB default colour order,
+                // repeating the documented seven-colour cycle.
+                let v = self.eval_args(args)?;
+                let n = match v.first() {
+                    Some(val) => val.scalar()?.max(0.0) as usize,
+                    None => 7,
+                };
+                let cycle = [
+                    [0.0000, 0.4470, 0.7410],
+                    [0.8500, 0.3250, 0.0980],
+                    [0.9290, 0.6940, 0.1250],
+                    [0.4940, 0.1840, 0.5560],
+                    [0.4660, 0.6740, 0.1880],
+                    [0.3010, 0.7450, 0.9330],
+                    [0.6350, 0.0780, 0.1840],
+                ];
+                let mut out = Matrix::zeros(n, 3);
+                for i in 0..n {
+                    for (j, &val) in cycle[i % cycle.len()].iter().enumerate() {
+                        let _ = out.set(i, j, val);
+                    }
+                }
+                Ok(Some(Value::Mat(out)))
+            }
+            "validatecolor" => {
+                let v = self.eval_args(args)?;
+                let multiple = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("multiple")));
+                let out = validate_color(v.first(), multiple)?;
+                Ok(Some(Value::Mat(out)))
             }
             "saveas" | "exportgraphics" => {
                 let v = self.eval_args(args)?;
@@ -7714,15 +8424,67 @@ impl Session {
                 self.index_call(name, args)?
             }
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
-            | "regexpi" | "regexprep" => self.str_call(name, args)?,
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
-            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
-            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
-            | "inline" | "optimset" | "optimget" | "nargchk" => self.sys_call(name, args)?,
+            | "regexpi" | "regexprep" | "erase" | "replace" => self.str_call(name, args)?,
+            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "dos" | "unix" | "savepath" | "fileparts"
+            | "copyfile" | "movefile" | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename"
+            | "license" | "ver" | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help"
+            | "doc" | "class" | "inline" | "optimset" | "optimoptions" | "optimget" | "nargchk" => self.sys_call(name, args)?,
             "cov" | "prctile" | "quantile" | "hist" | "histc" => self.stat_call(name, args)?,
             "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
             "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "fmincon" | "patternsearch" => {
+                let v = self.eval_args(args)?;
+                self.optimize_builtin(name, v, nout)?
+            }
+            "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
+            | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable" | "damp"
+            | "bandwidth" => {
+                let v = self.eval_args(args)?;
+                self.control_builtin(name, v, nout)?
+            }
+            "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "exprnd" | "unifrnd" | "poissrnd" | "binornd" | "iqr" | "corrcoef" | "regress"
+            | "kmeans" | "ttest" | "ttest2" | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv"
+            | "chi2pdf" | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf"
+            | "random" | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum"
+            | "kruskalwallis" => {
+                let v = self.eval_args(args)?;
+                self.stats_builtin(name, v, nout)?
+            }
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" => {
+                let v = self.eval_args(args)?;
+                self.xlsx_builtin(name, v, nout)?
+            }
+            "rgb2gray" | "imresize" | "imfilter" | "medfilt2" | "edge" | "bwlabel" | "regionprops" | "graythresh" | "imbinarize" | "imdilate"
+            | "imerode" | "imopen" | "imclose" | "imrotate" | "imcrop" | "strel" => {
+                let v = self.eval_args(args)?;
+                self.image_builtin(name, v, nout)?
+            }
+            "ga" => {
+                let v = self.eval_args(args)?;
+                self.ga_builtin(name, v, nout)?
+            }
+            "h5read" | "h5write" | "h5create" | "h5disp" => {
+                let v = self.eval_args(args)?;
+                self.hdf5_builtin(name, v, nout)?
+            }
+            "umap" => {
+                let v = self.eval_args(args)?;
+                self.umap_call(&v, nout)?
+            }
+            "ode45" | "ode15s" | "odeset" | "odeget" => {
+                let v = self.eval_args(args)?;
+                self.ode_builtin(name, v, nout)?
+            }
+            "anova1" | "anova2" | "multcompare" | "friedman" => {
+                let v = self.eval_args(args)?;
+                self.anova_builtin(name, v, nout)?
+            }
+            "ncread" | "ncwrite" | "ncinfo" | "ncdisp" => {
+                let v = self.eval_args(args)?;
+                self.netcdf_builtin(name, v, nout)?
+            }
             "log2" => {
                 // [F,E] = log2(X): X = F .* 2.^E with |F| in [0.5,1).
                 let v = self.eval_args(args)?;
@@ -8643,6 +9405,72 @@ impl Session {
             }
             "sortrows" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "table" {
+                        let names = table_var_names(o);
+                        let nrows = table_num_rows(o);
+                        let mut key_col = 0usize;
+                        let mut desc = false;
+                        for item in v.iter().skip(1) {
+                            match item {
+                                Value::Str(s) if s.eq_ignore_ascii_case("ascend") => desc = false,
+                                Value::Str(s) if s.eq_ignore_ascii_case("descend") => desc = true,
+                                Value::Str(s) => {
+                                    key_col = names
+                                        .iter()
+                                        .position(|n| n == s)
+                                        .ok_or_else(|| LangError::new(format!("sortrows: unknown variable '{s}'"), 0))?;
+                                }
+                                other => {
+                                    let k = other.scalar()? as i64;
+                                    let c = k.unsigned_abs().saturating_sub(1) as usize;
+                                    if k == 0 || c >= names.len() {
+                                        return Err(LangError::new("sortrows: variable index out of range", 0));
+                                    }
+                                    key_col = c;
+                                    desc = k < 0;
+                                }
+                            }
+                        }
+                        let key = names.get(key_col).and_then(|name| o.prop(name)).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                        let mut order: Vec<usize> = (0..nrows).collect();
+                        order.sort_by(|&r1, &r2| {
+                            let ord = match &key {
+                                Value::Mat(m) => {
+                                    let a = m.get(r1, 0).unwrap_or(f64::NAN);
+                                    let b = m.get(r2, 0).unwrap_or(f64::NAN);
+                                    match (a.is_nan(), b.is_nan()) {
+                                        (true, true) => std::cmp::Ordering::Equal,
+                                        (true, false) => std::cmp::Ordering::Greater,
+                                        (false, true) => std::cmp::Ordering::Less,
+                                        _ => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                                    }
+                                }
+                                Value::Cell(c) => {
+                                    let a = match c.get(r1, 0) {
+                                        Some(Value::Str(s)) => s.as_str(),
+                                        _ => "",
+                                    };
+                                    let b = match c.get(r2, 0) {
+                                        Some(Value::Str(s)) => s.as_str(),
+                                        _ => "",
+                                    };
+                                    a.cmp(b)
+                                }
+                                _ => std::cmp::Ordering::Equal,
+                            };
+                            if desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
+                        });
+                        let rows: Vec<usize> = order.iter().map(|&r| r.saturating_add(1)).collect();
+                        let table = table_subset(o, &rows, &(1..=names.len()).collect::<Vec<_>>())?;
+                        let idx: Vec<f64> = rows.iter().map(|&r| r as f64).collect();
+                        return Ok(vec![table, Value::Mat(Matrix::col_vector(idx))]);
+                    }
+                }
                 let m = v.first().ok_or_else(|| LangError::new("sortrows needs a matrix", 0))?.to_numeric()?;
                 need_2d(&m, name)?;
                 let (rows, cols) = m.shape();
@@ -8803,6 +9631,38 @@ impl Session {
                         Ok(vec![Value::Mat(Matrix::from_col_major(r, c2, out).map_err(lang)?)])
                     }
                     _ => Ok(vec![Value::Num(0.0)]),
+                }
+            }
+            "erase" | "replace" => {
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string pattern"), 0)),
+                };
+                let apply = |s: &str| -> String {
+                    if name == "erase" {
+                        s.replace(&pat, "")
+                    } else {
+                        match v.get(2) {
+                            Some(Value::Str(r)) => s.replace(&pat, r),
+                            _ => s.to_string(),
+                        }
+                    }
+                };
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(vec![Value::Str(apply(s))]),
+                    Some(Value::Cell(c)) => {
+                        let mut out = CellArray::new(c.rows, c.cols);
+                        for i in 0..c.numel() {
+                            let text = match c.get_linear(i) {
+                                Some(Value::Str(s)) => apply(s),
+                                Some(other) => fmt_value(other, false).to_string(),
+                                None => String::new(),
+                            };
+                            out.set_linear(i, Value::Str(text));
+                        }
+                        Ok(vec![Value::Cell(out)])
+                    }
+                    _ => Err(LangError::new(format!("{name} needs a string or cellstr"), 0)),
                 }
             }
             "strtok" => {
@@ -9078,10 +9938,10 @@ impl Session {
                 std::env::set_var(&n, &val);
                 Ok(vec![Value::Num(0.0)])
             }
-            "system" => {
+            "system" | "dos" | "unix" => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let cmd = sarg(0).ok_or_else(|| LangError::new("system needs a command string", 0))?;
+                    let cmd = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a command string"), 0))?;
                     let shell = if cfg!(target_os = "windows") { ("cmd", "/c") } else { ("sh", "-c") };
                     match std::process::Command::new(shell.0).args([shell.1, cmd]).output() {
                         Ok(o) => {
@@ -9092,7 +9952,20 @@ impl Session {
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
-                    Err(LangError::new("system is not available on wasm", 0))
+                    Err(LangError::new(format!("{name} is not available on wasm"), 0))
+                }
+            }
+            "savepath" => {
+                let file = sarg(0).map(std::path::PathBuf::from).unwrap_or_else(path_store_file);
+                if let Some(parent) = file.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                let text = self.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                match std::fs::write(&file, text) {
+                    Ok(()) => Ok(vec![Value::Num(0.0), Value::Str(String::new())]),
+                    Err(e) => Ok(vec![Value::Num(1.0), Value::Str(e.to_string())]),
                 }
             }
             "fileparts" => {
@@ -9163,6 +10036,10 @@ impl Session {
             }
             "mfilename" => {
                 let cur = self.file_stack.last().cloned().unwrap_or_default();
+                let full = matches!(v.first(), Some(Value::Str(s)) if s.eq_ignore_ascii_case("fullpath"));
+                if full {
+                    return Ok(vec![Value::Str(cur)]);
+                }
                 let stem = std::path::Path::new(&cur).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
                 Ok(vec![Value::Str(stem)])
             }
@@ -9334,6 +10211,20 @@ impl Session {
                     }
                     _ => StructArray::new(),
                 };
+                while let (Some(Value::Str(k)), Some(val)) = (iter.next(), iter.next()) {
+                    if !s.has_field(k) {
+                        s.add_field(k);
+                    }
+                    s.set_field(0, k, val.clone())?;
+                }
+                Ok(vec![Value::Struct(s)])
+            }
+            "optimoptions" => {
+                // optimoptions('solver','Name',value,…) — the modern
+                // options builder; the solver name is accepted and the
+                // name/value pairs become a struct the solvers read.
+                let mut s = StructArray::new();
+                let mut iter = v.iter().skip(if matches!(v.first(), Some(Value::Str(_))) { 1 } else { 0 });
                 while let (Some(Value::Str(k)), Some(val)) = (iter.next(), iter.next()) {
                     if !s.has_field(k) {
                         s.add_field(k);
@@ -10132,6 +11023,23 @@ impl Session {
                 _ => None,
             }
         };
+        if name == "readmatrix" {
+            if let Some(Value::Str(fname)) = v.first() {
+                if fname.to_ascii_lowercase().ends_with(".xlsx") {
+                    let mut xv = vec![Value::Str(fname.clone())];
+                    xv.extend(v.iter().skip(1).cloned());
+                    return self.xlsx_builtin("xlsread", xv, 1);
+                }
+            }
+        } else if name == "writematrix" {
+            if let Some(Value::Str(fname)) = v.get(1) {
+                if fname.to_ascii_lowercase().ends_with(".xlsx") {
+                    let mut xv = vec![Value::Str(fname.clone()), v.first().cloned().unwrap_or(Value::Num(0.0))];
+                    xv.extend(v.iter().skip(2).cloned());
+                    return self.xlsx_builtin("xlswrite", xv, 1);
+                }
+            }
+        }
         match name {
             "dlmread" | "readmatrix" => {
                 let fname = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a filename"), 0))?.to_string();
@@ -11081,45 +11989,6 @@ impl Session {
                 // False position may pin one endpoint — return the tighter one.
                 Ok(Some(Value::Num(if fa.abs() <= fb.abs() { a } else { b })))
             }
-            "fminsearch" => {
-                // Nelder–Mead on a scalar parameter.
-                let x0 = v.scalar_at(1).unwrap_or(0.0);
-                let (mut lo, mut hi) = (x0, if x0 == 0.0 { 1.0 } else { x0 * 1.05 + 0.00025 });
-                if hi == lo {
-                    hi = lo + 1.0;
-                }
-                let (mut flo, mut fhi) = (f(self, lo)?, f(self, hi)?);
-                for _ in 0..500 {
-                    if flo > fhi {
-                        std::mem::swap(&mut lo, &mut hi);
-                        std::mem::swap(&mut flo, &mut fhi);
-                    }
-                    if (hi - lo).abs() < 1e-12 {
-                        break;
-                    }
-                    let mid = (lo + hi) / 2.0;
-                    let reflect = mid + (mid - hi); // reflect worst
-                    let fr = f(self, reflect)?;
-                    if fr < flo {
-                        let expand = mid + 2.0 * (mid - hi);
-                        let fe = f(self, expand)?;
-                        if fe < fr {
-                            hi = expand;
-                            fhi = fe;
-                        } else {
-                            hi = reflect;
-                            fhi = fr;
-                        }
-                    } else if fr < fhi {
-                        hi = reflect;
-                        fhi = fr;
-                    } else {
-                        hi = mid;
-                        fhi = f(self, mid)?;
-                    }
-                }
-                Ok(Some(Value::Num(if flo <= fhi { lo } else { hi })))
-            }
             _ => {
                 // integral / quad: adaptive Simpson.
                 let a = v.scalar_at(1)?;
@@ -11516,6 +12385,101 @@ impl IndexSpec {
 /// An evaluated index value → a list of 1-based indices into a dimension
 /// of `dim_len`. Carries the logical-mask heuristic and strict integer
 /// validation shared by every indexing path.
+fn table_var_names(o: &MObject) -> Vec<String> {
+    o.prop("Properties")
+        .and_then(|p| match p {
+            Value::Struct(s) => s.field_at(0, "VariableNames").cloned(),
+            _ => None,
+        })
+        .map(|v| match v {
+            Value::Cell(c) => c
+                .items
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Value::Str(s) => vec![s],
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+fn value_row_count(v: &Value) -> usize {
+    match v {
+        Value::Mat(m) => m.rows(),
+        Value::Cell(c) => c.rows,
+        Value::Struct(s) => s.rows(),
+        Value::Num(_) | Value::Str(_) => 1,
+        _ => 1,
+    }
+}
+
+fn table_num_rows(o: &MObject) -> usize {
+    o.prop("Properties")
+        .and_then(|p| match p {
+            Value::Struct(s) => s.field_at(0, "NumRows").cloned(),
+            _ => None,
+        })
+        .and_then(|v| v.scalar().ok())
+        .unwrap_or(0.0)
+        .max(0.0) as usize
+}
+
+/// Build a table from 1-based row and variable indices.
+fn table_subset(o: &MObject, rows: &[usize], cols: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let mut props = StructArray::new();
+    let mut out_names = Vec::with_capacity(cols.len());
+    for &c in cols {
+        let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+        let value = o.prop(&name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let sliced = slice_table_rows(&value, rows)?;
+        props.set_field(0, &name, sliced)?;
+        out_names.push(name);
+    }
+    let mut p = StructArray::new();
+    p.set_field(0, "VariableNames", Value::Cell(CellArray::row(out_names.iter().cloned().map(Value::Str).collect())))?;
+    p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+    p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+    p.set_field(0, "NumRows", Value::Num(rows.len() as f64))?;
+    props.set_field(0, "Properties", Value::Struct(p))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+/// Select rows (1-based indices) from one table variable, preserving its
+/// column layout.
+fn slice_table_rows(v: &Value, rows: &[usize]) -> Result<Value, LangError> {
+    match v {
+        Value::Mat(m) => {
+            if !m.is_matrix() {
+                return Err(LangError::new("table: matrix-valued variables are not supported", 0));
+            }
+            let cols = m.cols();
+            let mut out = Matrix::zeros(rows.len(), cols);
+            for (i, &r) in rows.iter().enumerate() {
+                for c in 0..cols {
+                    let _ = out.set(i, c, m.get(r.saturating_sub(1), c).unwrap_or(f64::NAN));
+                }
+            }
+            Ok(mat_or_num(out))
+        }
+        Value::Cell(c) => {
+            let mut out = CellArray::new(rows.len(), c.cols);
+            for (i, &r) in rows.iter().enumerate() {
+                for col in 0..c.cols {
+                    if let Some(x) = c.get(r.saturating_sub(1), col) {
+                        out.set(i, col, x.clone());
+                    }
+                }
+            }
+            Ok(Value::Cell(out))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
 fn index_list(v: &Value, dim_len: usize) -> Result<Vec<usize>, LangError> {
     let m = v.to_matrix()?;
     // Logical indexing: a 0/1 mask the length of the indexed dimension
@@ -12002,6 +12966,44 @@ fn named_rgb(s: &str) -> Option<matplot::Rgb> {
         _ => s.trim(),
     })
     .color
+}
+
+/// `validatecolor(c)` / `validatecolor(c,'multiple')`: turn a colour name or
+/// RGB triplet(s) into an n×3 matrix with components in [0,1].
+fn validate_color(v: Option<&Value>, multiple: bool) -> Result<Matrix, LangError> {
+    let value = v.ok_or_else(|| LangError::new("validatecolor needs a colour", 0))?;
+    let rows: Vec<[f64; 3]> = match value {
+        Value::Str(s) => {
+            let rgb = named_rgb(s).ok_or_else(|| LangError::new(format!("validatecolor: unknown colour '{s}'"), 0))?;
+            vec![[rgb.0 as f64 / 255.0, rgb.1 as f64 / 255.0, rgb.2 as f64 / 255.0]]
+        }
+        Value::Mat(m) if m.numel() == 0 => Vec::new(),
+        Value::Mat(m) => {
+            if m.cols() != 3 {
+                return Err(LangError::new("validatecolor: RGB values must have three columns", 0));
+            }
+            if m.rows() > 1 && !multiple {
+                return Err(LangError::new("validatecolor: expected a single colour (use 'multiple' for rows)", 0));
+            }
+            let mut out = Vec::with_capacity(m.rows());
+            for r in 0..m.rows() {
+                let rgb = [m.get(r, 0).unwrap_or(0.0), m.get(r, 1).unwrap_or(0.0), m.get(r, 2).unwrap_or(0.0)];
+                if rgb.iter().any(|x| x.is_nan() || !(0.0..=1.0).contains(x)) {
+                    return Err(LangError::new("validatecolor: RGB components must be between 0 and 1", 0));
+                }
+                out.push(rgb);
+            }
+            out
+        }
+        _ => return Err(LangError::new("validatecolor: expected a colour name or an RGB matrix", 0)),
+    };
+    let mut out = Matrix::zeros(rows.len(), 3);
+    for (r, rgb) in rows.iter().enumerate() {
+        for (c, &x) in rgb.iter().enumerate() {
+            let _ = out.set(r, c, x);
+        }
+    }
+    Ok(out)
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
@@ -12516,6 +13518,8 @@ fn histcounts(m: &Matrix, nb: usize) -> (Vec<f64>, Vec<f64>) {
 pub const BUILTIN_NAMES: &[&str] = &[
     "zeros",
     "ones",
+    "true",
+    "false",
     "eye",
     "magic",
     "rand",
@@ -12672,7 +13676,155 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "interp1",
     "trapz",
     "fzero",
+    "fminbnd",
     "fminsearch",
+    "fminunc",
+    "fsolve",
+    "lsqnonlin",
+    "lsqcurvefit",
+    "linprog",
+    "quadprog",
+    "fmincon",
+    "patternsearch",
+    "tf",
+    "ss",
+    "zpk",
+    "tfdata",
+    "ssdata",
+    "zpkdata",
+    "pole",
+    "zero",
+    "dcgain",
+    "series",
+    "parallel",
+    "feedback",
+    "tf2ss",
+    "ss2tf",
+    "step",
+    "impulse",
+    "initial",
+    "lsim",
+    "bode",
+    "freqresp",
+    "pid",
+    "margin",
+    "nyquist",
+    "isstable",
+    "damp",
+    "bandwidth",
+    "normpdf",
+    "normcdf",
+    "norminv",
+    "exppdf",
+    "expcdf",
+    "expinv",
+    "unifpdf",
+    "unifcdf",
+    "unifinv",
+    "poisspdf",
+    "poisscdf",
+    "poissinv",
+    "binopdf",
+    "binocdf",
+    "binoinv",
+    "exprnd",
+    "unifrnd",
+    "poissrnd",
+    "binornd",
+    "iqr",
+    "corrcoef",
+    "regress",
+    "kmeans",
+    "ttest",
+    "ttest2",
+    "kstest",
+    "adtest",
+    "pca",
+    "gampdf",
+    "gamcdf",
+    "gaminv",
+    "betapdf",
+    "betacdf",
+    "betainv",
+    "chi2pdf",
+    "chi2cdf",
+    "chi2inv",
+    "tpdf",
+    "tcdf",
+    "tinv",
+    "fpdf",
+    "fcdf",
+    "finv",
+    "fitdist",
+    "pdf",
+    "cdf",
+    "icdf",
+    "random",
+    "cmdscale",
+    "pcoa",
+    "bonferroni",
+    "holm",
+    "sidak",
+    "benjamini_hochberg",
+    "mafdr",
+    "signrank",
+    "ranksum",
+    "kruskalwallis",
+    "umap",
+    "ode45",
+    "ode15s",
+    "odeset",
+    "odeget",
+    "inputParser",
+    "addRequired",
+    "addOptional",
+    "addParameter",
+    "addParamValue",
+    "addparameter",
+    "parse",
+    "string",
+    "strings",
+    "isstring",
+    "table",
+    "table2array",
+    "anova1",
+    "anova2",
+    "multcompare",
+    "friedman",
+    "xlsread",
+    "xlswrite",
+    "readcell",
+    "writecell",
+    "readtable",
+    "writetable",
+    "height",
+    "width",
+    "istable",
+    "rgb2gray",
+    "imresize",
+    "imfilter",
+    "medfilt2",
+    "edge",
+    "bwlabel",
+    "regionprops",
+    "graythresh",
+    "imbinarize",
+    "imdilate",
+    "imerode",
+    "imopen",
+    "imclose",
+    "imrotate",
+    "imcrop",
+    "strel",
+    "ga",
+    "h5read",
+    "h5write",
+    "h5create",
+    "h5disp",
+    "ncread",
+    "ncwrite",
+    "ncinfo",
+    "ncdisp",
     "integral",
     "quad",
     "eig",
@@ -12698,6 +13850,19 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "strtrim",
     "strrep",
     "strfind",
+    "contains",
+    "startswith",
+    "endswith",
+    "startsWith",
+    "endsWith",
+    "strsplit",
+    "strjoin",
+    "strlength",
+    "fileread",
+    "isfolder",
+    "rows",
+    "array2table",
+    "ismissing",
     "double",
     "logical",
     "char",
@@ -12769,11 +13934,16 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "view",
     "colormap",
     "colorbar",
+    "lines",
+    "validatecolor",
     "caxis",
     "clim",
     "imagesc",
     "image",
     "text",
+    "rectangle",
+    "patch",
+    "daspect",
     "pie",
     "contour",
     "plot3",
@@ -12863,6 +14033,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "regexp",
     "regexpi",
     "regexprep",
+    "erase",
+    "replace",
     "version",
     "computer",
     "ispc",
@@ -12871,6 +14043,9 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "getenv",
     "setenv",
     "system",
+    "dos",
+    "unix",
+    "savepath",
     "fileparts",
     "copyfile",
     "movefile",
@@ -12899,6 +14074,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "class",
     "inline",
     "optimset",
+    "optimoptions",
     "optimget",
     "nargchk",
     "single",
@@ -12963,6 +14139,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "set",
     "argv",
     "vline",
+    "xline",
     "wmean",
 ];
 
@@ -17403,5 +18580,1284 @@ end",
         // Gray M×N: values > 1 read as 0–255; `[]` scales to the data range.
         s.run("clf; imshow(magic(4), [])").unwrap();
         assert_eq!(s.figs[0].series[0].kind, SeriesKind::ImageRgb);
+    }
+
+    #[test]
+    fn optimization_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // fminbnd: bounded quadratic minimum, multi-output form.
+        s.run("opts = optimset('Display','off','TolX',1e-10); [xb, fb] = fminbnd(@(t) (t-2).^2 + 1, 0, 5, opts);").unwrap();
+        assert!((scalar(&s, "xb") - 2.0).abs() < 1e-5);
+        assert!((scalar(&s, "fb") - 1.0).abs() < 1e-8);
+
+        // fminsearch: N-parameter Nelder–Mead.
+        s.run("p = fminsearch(@(v) (v(1)-1).^2 + (v(2)-3).^2, [0 0], optimset('MaxIter',2000,'TolX',1e-9,'TolFun',1e-12));").unwrap();
+        let p = vec(&s, "p");
+        assert!((p[0] - 1.0).abs() < 1e-4, "p(1) = {}", p[0]);
+        assert!((p[1] - 3.0).abs() < 1e-4, "p(2) = {}", p[1]);
+
+        // fminunc: BFGS on a separable quadratic.
+        s.run("q = fminunc(@(v) (v(1)-2).^2 + 3*(v(2)+1).^2, [0 0], optimoptions('fminunc','Display','off','MaxIterations',500));").unwrap();
+        let q = vec(&s, "q");
+        assert!((q[0] - 2.0).abs() < 1e-4, "q(1) = {}", q[0]);
+        assert!((q[1] + 1.0).abs() < 1e-4, "q(2) = {}", q[1]);
+
+        // fsolve: two nonlinear equations.
+        s.run("r = fsolve(@(v) [v(1).^2 + v(2).^2 - 4; v(1) - v(2)], [1; 1]);").unwrap();
+        let r = vec(&s, "r");
+        assert!((r[0] - 2f64.sqrt()).abs() < 1e-5, "r(1) = {}", r[0]);
+        assert!((r[1] - 2f64.sqrt()).abs() < 1e-5, "r(2) = {}", r[1]);
+
+        // lsqnonlin: linear residual, zero at [2; 1].
+        s.run("[xl, rn, rv] = lsqnonlin(@(v) [v(1)+v(2)-3; v(1)-v(2)-1], [0; 0]);").unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 2.0).abs() < 1e-6, "xl(1) = {}", xl[0]);
+        assert!((xl[1] - 1.0).abs() < 1e-6, "xl(2) = {}", xl[1]);
+        assert!(scalar(&s, "rn") < 1e-12);
+        assert_eq!(vec(&s, "rv").len(), 2);
+
+        // lsqcurvefit: exponential fit.
+        s.run("t = 0:0.25:2; y = 2.5*exp(-1.3*t); p = lsqcurvefit(@(p,t) p(1)*exp(-p(2)*t), [1 1], t, y);").unwrap();
+        let p = vec(&s, "p");
+        assert!((p[0] - 2.5).abs() < 1e-4, "amplitude = {}", p[0]);
+        assert!((p[1] - 1.3).abs() < 1e-4, "decay = {}", p[1]);
+    }
+
+    #[test]
+    fn optimization_lp_qp() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().as_scalar().unwrap()
+        };
+        let vec = |s: &Session, name: &str| -> Vec<f64> {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().data().to_vec()
+        };
+
+        // linprog: intersection of x1 + 2*x2 <= 4 and 4*x1 + 2*x2 <= 12.
+        s.run(
+            "[xl, fl, flagl, outl, laml] = linprog([-1;-1], [1 2; 4 2], [4;12], [], [], [0;0], []); \
+             oi = outl.iterations; li = laml.ineqlin; le = laml.eqlin; ll = laml.lower;",
+        )
+        .unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 8.0 / 3.0).abs() < 1e-5, "xl(1) = {}", xl[0]);
+        assert!((xl[1] - 2.0 / 3.0).abs() < 1e-5, "xl(2) = {}", xl[1]);
+        assert!((scalar(&s, "fl") + 10.0 / 3.0).abs() < 1e-6, "fl = {}", scalar(&s, "fl"));
+        assert_eq!(scalar(&s, "flagl"), 1.0);
+        assert!(scalar(&s, "oi") >= 1.0);
+        assert_eq!(vec(&s, "li").len(), 2);
+        assert_eq!(vec(&s, "le").len(), 0);
+        assert_eq!(vec(&s, "ll").len(), 2);
+
+        // The corpus `problem` struct form (Aineq/bineq/lb/ub).
+        s.run("p.f = [-1;-1]; p.Aineq = [1 2; 4 2]; p.bineq = [4;12]; p.lb = [0;0]; p.ub = []; [xp, fp, flagp] = linprog(p);").unwrap();
+        let xp = vec(&s, "xp");
+        assert!((xp[0] - 8.0 / 3.0).abs() < 1e-5);
+        assert!((xp[1] - 2.0 / 3.0).abs() < 1e-5);
+        assert_eq!(scalar(&s, "flagp"), 1.0);
+
+        // quadprog: separable QP with an upper bound on x2.
+        s.run("[xq, fq, flagq] = quadprog([2 0;0 2], [-2;-4], [], [], [], [], [0;0], [1;1]);").unwrap();
+        let xq = vec(&s, "xq");
+        assert!((xq[0] - 1.0).abs() < 1e-5, "xq(1) = {}", xq[0]);
+        assert!((xq[1] - 1.0).abs() < 1e-5, "xq(2) = {}", xq[1]);
+        assert!((scalar(&s, "fq") + 4.0).abs() < 1e-6, "fq = {}", scalar(&s, "fq"));
+        assert_eq!(scalar(&s, "flagq"), 1.0);
+
+        // Equality-constrained LP, options in the x0 slot (8-argument form).
+        s.run("[xe, fe, flage] = linprog([1;1], [], [], [1 1], 1, [0;0], [inf;inf], optimoptions('linprog','Display','off'));").unwrap();
+        let xe = vec(&s, "xe");
+        assert!((xe[0] + xe[1] - 1.0).abs() < 1e-6);
+        assert!((scalar(&s, "fe") - 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flage"), 1.0);
+
+        // quadprog problem struct with bounds only.
+        s.run("q.H = [2 0;0 2]; q.f = [-2;-4]; q.lb = [0;0]; q.ub = [1;1]; [xr, fr, flagr] = quadprog(q);").unwrap();
+        let xr = vec(&s, "xr");
+        assert!((xr[0] - 1.0).abs() < 1e-5);
+        assert!((xr[1] - 1.0).abs() < 1e-5);
+        assert!((scalar(&s, "fr") + 4.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagr"), 1.0);
+    }
+
+    #[test]
+    fn optimization_fmincon() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Unconstrained quadratic.
+        s.run("[xu, fu, flagu] = fmincon(@(v) (v(1)-2).^2 + (v(2)+1).^2, [0 0]);").unwrap();
+        let xu = vec(&s, "xu");
+        assert!((xu[0] - 2.0).abs() < 1e-5 && (xu[1] + 1.0).abs() < 1e-5, "xu = {xu:?}");
+        assert!(scalar(&s, "fu") < 1e-8);
+        assert_eq!(scalar(&s, "flagu"), 1.0);
+
+        // Box bounds pull both coordinates to their limits.
+        s.run("[xb, fb, flagb] = fmincon(@(v) (v(1)-2).^2 + (v(2)+1).^2, [0;0], [],[],[],[], [0;0], [2;2]);").unwrap();
+        let xb = vec(&s, "xb");
+        assert!((xb[0] - 2.0).abs() < 1e-5 && xb[1].abs() < 1e-5, "xb = {xb:?}");
+        assert!((scalar(&s, "fb") - 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagb"), 1.0);
+
+        // Linear inequality: x1 + x2 >= 1.
+        s.run("[xl2, fl2, flagl2] = fmincon(@(v) v(1).^2+v(2).^2, [1;1], [-1 -1], -1, [],[], [0;0], []);").unwrap();
+        let xl2 = vec(&s, "xl2");
+        assert!((xl2[0] - 0.5).abs() < 1e-5 && (xl2[1] - 0.5).abs() < 1e-5, "xl2 = {xl2:?}");
+        assert!((scalar(&s, "fl2") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagl2"), 1.0);
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("[xn, fn, flagn] = fmincon(@(v) v(1).^2+v(2).^2, [1;1], [],[],[],[], [0;0], [], @(v) [1 - v(1) - v(2)]);").unwrap();
+        let xn = vec(&s, "xn");
+        assert!((xn[0] - 0.5).abs() < 1e-5 && (xn[1] - 0.5).abs() < 1e-5, "xn = {xn:?}");
+        assert!((scalar(&s, "fn") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagn"), 1.0);
+
+        // Nonlinear equality, starting infeasible: the SQP merit function
+        // must move onto the unit circle, not stop at the KKT point of the
+        // linearised model.
+        s.run(
+            "function [c, ceq] = nleq(v)\n\
+             c = [];\n\
+             ceq = v(1)^2 + v(2)^2 - 1;\n\
+             end\n\
+             [xe, fe, flage, oute, lame] = fmincon(@(v) (v(1)-2).^2 + (v(2)-2).^2, [1;1], [],[],[],[],[],[], @nleq);\n\
+             leq = lame.eqnonlin;\n\
+             oiter = oute.iterations;",
+        )
+        .unwrap();
+        let xe = vec(&s, "xe");
+        assert!((xe[0] - 2f64.sqrt() / 2.0).abs() < 1e-4, "xe(1) = {}", xe[0]);
+        assert!((xe[1] - 2f64.sqrt() / 2.0).abs() < 1e-4, "xe(2) = {}", xe[1]);
+        assert!((scalar(&s, "fe") - 3.343_145_898_691_581).abs() < 1e-3, "fe = {}", scalar(&s, "fe"));
+        assert_eq!(scalar(&s, "flage"), 1.0);
+        assert!(scalar(&s, "oiter") >= 2.0);
+        assert!((scalar(&s, "leq") - 1.828_427_124_746_899).abs() < 1e-2, "lambda = {}", scalar(&s, "leq"));
+
+        // Problem-struct interface.
+        s.run("p.objective = @(v) v(1).^2+v(2).^2; p.x0 = [1;1]; p.Aineq = [-1 -1]; p.bineq = -1; p.lb = [0;0]; [xp2, fp2, flagp2] = fmincon(p);")
+            .unwrap();
+        let xp2 = vec(&s, "xp2");
+        assert!((xp2[0] - 0.5).abs() < 1e-5 && (xp2[1] - 0.5).abs() < 1e-5, "xp2 = {xp2:?}");
+        assert!((scalar(&s, "fp2") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagp2"), 1.0);
+    }
+
+    #[test]
+    fn optimization_patternsearch() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Unconstrained quadratic with a non-grid optimum.
+        s.run("[xp, fp, flagp] = patternsearch(@(v) (v(1)-1.3).^2 + (v(2)+0.7).^2, [0 0]);").unwrap();
+        let xp = vec(&s, "xp");
+        assert!((xp[0] - 1.3).abs() < 1e-4, "xp(1) = {}", xp[0]);
+        assert!((xp[1] + 0.7).abs() < 1e-4, "xp(2) = {}", xp[1]);
+        assert!(scalar(&s, "fp") < 1e-7);
+        assert_eq!(scalar(&s, "flagp"), 1.0);
+
+        // Linear inequality x1 + x2 >= 1.
+        s.run("[xl, fl, flagl] = patternsearch(@(v) v(1).^2+v(2).^2, [1;1], [-1 -1], -1, [],[], [0;0], []);").unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 0.5).abs() < 1e-4 && (xl[1] - 0.5).abs() < 1e-4, "xl = {xl:?}");
+        assert!((scalar(&s, "fl") - 0.5).abs() < 1e-4);
+        assert_eq!(scalar(&s, "flagl"), 1.0);
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("[xn, fn, flagn] = patternsearch(@(v) v(1).^2+v(2).^2, [1;1], [],[],[],[], [0;0], [], @(v) [1 - v(1) - v(2)]);").unwrap();
+        let xn = vec(&s, "xn");
+        assert!((xn[0] - 0.5).abs() < 1e-4 && (xn[1] - 0.5).abs() < 1e-4, "xn = {xn:?}");
+        assert!((scalar(&s, "fn") - 0.5).abs() < 1e-4);
+        assert_eq!(scalar(&s, "flagn"), 1.0);
+    }
+
+    #[test]
+    fn optimization_ga() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("rng(1); [x1, f1, flag1] = ga(@(v) (v-2).^2, 1, [],[],[],[], -5, 5);").unwrap();
+        assert!((scalar(&s, "x1") - 2.0).abs() < 0.05, "x1 = {}", scalar(&s, "x1"));
+        assert!(scalar(&s, "f1") < 0.01);
+        assert_eq!(scalar(&s, "flag1"), 1.0);
+
+        s.run("rng(2); opts = optimset('PopulationSize',60,'MaxGenerations',150); [x2, f2] = ga(@(v) (v(1)-2).^2+(v(2)+1).^2, 2, [],[],[],[], [-5;-5], [5;5], [], opts);")
+            .unwrap();
+        let x2 = vec(&s, "x2");
+        assert!((x2[0] - 2.0).abs() < 0.05 && (x2[1] + 1.0).abs() < 0.05, "x2 = {x2:?}");
+        assert!(scalar(&s, "f2") < 0.01);
+
+        // Linear inequality x1 + x2 >= 1 with box bounds.
+        s.run("rng(3); [x3, f3] = ga(@(v) v(1).^2+v(2).^2, 2, [-1 -1], -1, [],[], [0;0], [1;1]);").unwrap();
+        let x3 = vec(&s, "x3");
+        assert!((x3[0] + x3[1] - 1.0).abs() < 0.05, "x3 = {x3:?}");
+        assert!(scalar(&s, "f3") < 0.55, "f3 = {}", scalar(&s, "f3"));
+        assert!(x3.iter().all(|v| (0.0..=1.0).contains(v)));
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("rng(4); [x4, f4] = ga(@(v) v(1).^2+v(2).^2, 2, [],[],[],[], [0;0], [1;1], @(v) [1-v(1)-v(2)]);").unwrap();
+        let x4 = vec(&s, "x4");
+        assert!((x4[0] + x4[1] - 1.0).abs() < 0.05, "x4 = {x4:?}");
+        assert!(scalar(&s, "f4") < 0.55, "f4 = {}", scalar(&s, "f4"));
+
+        // Problem struct and multi-output form.
+        s.run("rng(5); p.fitnessfcn = @(v) (v(1)-2).^2+(v(2)+1).^2; p.nvars = 2; p.lb = [-5;-5]; p.ub = [5;5]; p.options = optimset('PopulationSize',60,'MaxGenerations',150); [x5, f5, flag5, out5, pop5, scores5] = ga(p); g5 = out5.generations;")
+            .unwrap();
+        assert_eq!(s.get("pop5").unwrap().dims(), (60, 2));
+        assert_eq!(s.get("scores5").unwrap().dims(), (60, 1));
+        assert!(scalar(&s, "g5") >= 1.0);
+        assert_eq!(scalar(&s, "flag5"), 1.0);
+
+        // Same seed, same run.
+        s.run(
+            "rng(7); a1 = ga(@(v) (v-3).^2, 1, [],[],[],[], -5, 5); rng(7); a2 = ga(@(v) (v-3).^2, 1, [],[],[],[], -5, 5); same = isequal(a1, a2);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "same"), 1.0);
+    }
+
+    #[test]
+    fn control_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Transfer-function construction and properties.
+        s.run("G = tf([1], [1 1]); [n, d] = tfdata(G); p = pole(G); g = dcgain(G);").unwrap();
+        assert_eq!(vec(&s, "n"), vec![1.0]);
+        assert_eq!(vec(&s, "d"), vec![1.0, 1.0]);
+        assert!((scalar(&s, "p") + 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "g") - 1.0).abs() < 1e-12);
+
+        // Native LTI algebra: s = tf('s') then 1/(s+1).
+        s.run("s = tf('s'); H = 1/(s + 1); [nh, dh] = tfdata(H);").unwrap();
+        assert_eq!(vec(&s, "nh"), vec![1.0]);
+        assert_eq!(vec(&s, "dh"), vec![1.0, 1.0]);
+
+        // Unity negative feedback: 1/(s+2).
+        s.run("F = feedback(G, 1); [nf, df] = tfdata(F);").unwrap();
+        assert_eq!(vec(&s, "nf"), vec![1.0]);
+        assert_eq!(vec(&s, "df"), vec![1.0, 2.0]);
+
+        // Step response of 1/(s+1) at t = 2 is 1 - exp(-2).
+        s.run("t = 0:0.1:2; [y, ty] = step(G, t);").unwrap();
+        assert_eq!(vec(&s, "ty").len(), 21);
+        let y = vec(&s, "y");
+        assert!((y.last().copied().unwrap() - (1.0 - (-2.0f64).exp())).abs() < 1e-3, "y(2) = {}", y.last().copied().unwrap());
+
+        // lsim with a constant input matches the step response.
+        s.run("u = ones(1, 21); yl = lsim(G, u, t);").unwrap();
+        let yl = vec(&s, "yl");
+        assert!((yl.last().copied().unwrap() - y.last().copied().unwrap()).abs() < 1e-10);
+
+        // Impulse response starts at C*B = 1 for this system.
+        s.run("[yi, ti] = impulse(G, 0:0.1:1);").unwrap();
+        assert!((vec(&s, "yi")[0] - 1.0).abs() < 1e-9);
+        assert_eq!(vec(&s, "ti").len(), 11);
+
+        // tf2ss / ss / ss2tf round-trip.
+        s.run("[A, B, C, D] = tf2ss([1], [1 1]); S = ss(A, B, C, D); [ns, ds] = tfdata(S);").unwrap();
+        assert_eq!(vec(&s, "ns"), vec![1.0]);
+        assert_eq!(vec(&s, "ds"), vec![1.0, 1.0]);
+
+        // Frequency response of 1/(s+1): 1/sqrt(2) at 1 rad/s.
+        s.run("Hf = freqresp(G, [0.1 1 10]); m = abs(Hf);").unwrap();
+        let m = vec(&s, "m");
+        assert!((m[0] - 0.995_037_462_608_352).abs() < 1e-6);
+        assert!((m[1] - 2f64.sqrt() / 2.0).abs() < 1e-6);
+        s.run("[mag, phase, w] = bode(G, [0.1 1 10]);").unwrap();
+        assert_eq!(vec(&s, "mag"), m);
+        assert_eq!(vec(&s, "phase").len(), 3);
+
+        // zpk -> tf.
+        s.run("Z = zpk([], [-1], 1); [nz, dz] = tfdata(Z);").unwrap();
+        assert_eq!(vec(&s, "nz"), vec![1.0]);
+        assert_eq!(vec(&s, "dz"), vec![1.0, 1.0]);
+
+        // Second-order complex poles are reported as a conjugate pair.
+        s.run("O = tf([1], [1 0 1]); po = pole(O); np = numel(po);").unwrap();
+        assert_eq!(scalar(&s, "np"), 2.0);
+    }
+
+    #[test]
+    fn control_depth() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // PID = Kp + Ki/s + Kd*s (Tf = 0).
+        s.run("C = pid(2, 1, 0.5); [nc, dc] = tfdata(C);").unwrap();
+        assert_eq!(vec(&s, "nc"), vec![0.5, 2.0, 1.0]);
+        assert_eq!(vec(&s, "dc"), vec![1.0, 0.0]);
+
+        // 2/(s+1): gain crossover sqrt(3), phase margin 120 deg.
+        s.run("G = tf([2], [1 1]); [Gm, Pm, Wcg, Wcp] = margin(G);").unwrap();
+        assert!(scalar(&s, "Gm").is_infinite());
+        assert!((scalar(&s, "Pm") - 120.0).abs() < 1e-3, "Pm = {}", scalar(&s, "Pm"));
+        assert!(scalar(&s, "Wcg").is_nan());
+        assert!((scalar(&s, "Wcp") - 3f64.sqrt()).abs() < 1e-3, "Wcp = {}", scalar(&s, "Wcp"));
+
+        // 1/(s+1)^3: phase crossover sqrt(3), gain margin 8.
+        s.run("G3 = tf([1], [1 3 3 1]); [Gm3, ~, Wcg3, ~] = margin(G3);").unwrap();
+        assert!((scalar(&s, "Gm3") - 8.0).abs() < 1e-3, "Gm = {}", scalar(&s, "Gm3"));
+        assert!((scalar(&s, "Wcg3") - 3f64.sqrt()).abs() < 1e-3, "Wcg = {}", scalar(&s, "Wcg3"));
+
+        s.run("a = isstable(tf([1], [1 1])); b = isstable(tf([1], [1 -1])); c = isstable(tf([1], [1 -0.5], 0.1));").unwrap();
+        assert_eq!(scalar(&s, "a"), 1.0);
+        assert_eq!(scalar(&s, "b"), 0.0);
+        assert_eq!(scalar(&s, "c"), 1.0);
+
+        s.run("[wn, zeta, p] = damp(tf([1], [1 2 1]));").unwrap();
+        assert!(vec(&s, "wn").iter().all(|v| (*v - 1.0).abs() < 1e-6));
+        assert!(vec(&s, "zeta").iter().all(|v| (*v - 1.0).abs() < 1e-6));
+
+        s.run("bw = bandwidth(tf([1], [1 1]));").unwrap();
+        assert!((scalar(&s, "bw") - 1.0).abs() < 1e-3, "bw = {}", scalar(&s, "bw"));
+
+        s.run("[re, im, w] = nyquist(tf([1], [1 1]), [0.1 1 10]);").unwrap();
+        assert_eq!(vec(&s, "re").len(), 3);
+        assert!((vec(&s, "re")[1] - 0.5).abs() < 1e-9);
+        assert!((vec(&s, "im")[1] + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn control_mimo_and_discrete() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+        let dims = |s: &Session, name: &str| -> Vec<usize> { s.get(name).unwrap().dims_vec() };
+
+        s.run(
+            "A = [-1 0; 0 -2]; B = eye(2); C = [1 1; 0 1]; D = zeros(2,2); sys = ss(A,B,C,D); \
+             t = 0:0.1:1; [ys, ts] = step(sys, t); [yi, ti] = impulse(sys, t); [yn, tn] = initial(sys, [1;1], t);",
+        )
+        .unwrap();
+        assert_eq!(dims(&s, "ys"), vec![11, 2, 2]);
+        assert_eq!(dims(&s, "yi"), vec![11, 2, 2]);
+        assert_eq!(dims(&s, "yn"), vec![11, 2]);
+        s.run("a = ys(end,1,1); b = ys(end,2,1); c = ys(end,1,2); d = ys(end,2,2); e = yn(1,1); f = yn(1,2);").unwrap();
+        assert!((scalar(&s, "a") - (1.0 - (-1f64).exp())).abs() < 1e-4);
+        assert!(scalar(&s, "b").abs() < 1e-4);
+        assert!((scalar(&s, "c") - 0.5 * (1.0 - (-2f64).exp())).abs() < 1e-4);
+        assert!((scalar(&s, "d") - 0.5 * (1.0 - (-2f64).exp())).abs() < 1e-4);
+        assert!((scalar(&s, "e") - 2.0).abs() < 1e-9);
+        assert!((scalar(&s, "f") - 1.0).abs() < 1e-9);
+
+        s.run("u = [ones(11,1) zeros(11,1)]; yl = lsim(sys, u, t);").unwrap();
+        assert_eq!(s.get("yl").unwrap().dims(), (11, 2));
+        s.run("v1 = yl(end,1); v2 = yl(end,2);").unwrap();
+        assert!((scalar(&s, "v1") - (1.0 - (-1f64).exp())).abs() < 1e-4);
+        assert!(scalar(&s, "v2").abs() < 1e-4);
+
+        // Discrete-time state-space: no matrix exponential, direct recurrence.
+        s.run("sd = ss([0.5 0; 0 0.25], [1;1], [1 0.5], 0, 0.1); [yd, td] = step(sd, 0:0.1:1);").unwrap();
+        assert_eq!(s.get("yd").unwrap().dims(), (11, 1));
+        s.run("y0 = yd(1); y1 = yd(2); yend = yd(end);").unwrap();
+        assert_eq!(scalar(&s, "y0"), 0.0);
+        assert!((scalar(&s, "y1") - 1.5).abs() < 1e-12);
+        let x1 = 2.0 * (1.0 - 0.5f64.powi(10));
+        let x2 = (1.0 - 0.25f64.powi(10)) / 0.75;
+        assert!((scalar(&s, "yend") - (x1 + 0.5 * x2)).abs() < 1e-9);
+
+        s.run("ud = ones(11,1); yd2 = lsim(sd, ud, 0:0.1:1); stable = isstable(sd);").unwrap();
+        assert_eq!(vec(&s, "yd2"), vec(&s, "yd"));
+        assert_eq!(scalar(&s, "stable"), 1.0);
+    }
+
+    #[test]
+    fn hdf5_netcdf_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let h5 = dir.join(format!("matcraft_h5_{}_{}.h5", std::process::id(), n));
+        let nc = dir.join(format!("matcraft_nc_{}_{}.nc", std::process::id(), n));
+        let h5s = h5.to_string_lossy().replace('\\', "/");
+        let ncs = nc.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+
+        s.run(&format!(
+            "h5write('{h5s}', '/a', [1 2 3; 4 5 6]); a = h5read('{h5s}', '/a'); \
+             h5write('{h5s}', '/b', [9;8;7]); b = h5read('{h5s}', '/b'); \
+             c = h5read('{h5s}', '/a', [2 2], [1 2], [1 1]); \
+             h5write('{h5s}', '/a', [99], [2 3], [1 1], [1 1]); d = h5read('{h5s}', '/a'); \
+             h5create('{h5s}', '/e', [2 2]); e = h5read('{h5s}', '/e');"
+        ))
+        .unwrap();
+        assert_eq!(s.get("a").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("b").unwrap().dims(), (3, 1));
+        assert_eq!(s.get("c"), Some(&Value::Mat(Matrix::from_row_major(1, 2, &[5.0, 6.0]).unwrap())));
+        assert_eq!(s.get("d").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 99.0]));
+        assert_eq!(s.get("e").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0; 4]));
+
+        s.run(&format!(
+            "ncwrite('{ncs}', 'temp', [1 2 3; 4 5 6]); nt = ncread('{ncs}', 'temp'); \
+             ns = ncread('{ncs}', 'temp', [2 2], [1 2], [1 1]); \
+             ncwrite('{ncs}', 'temp', [99], [2 3], [1 1], [1 1]); nt2 = ncread('{ncs}', 'temp'); \
+             info = ncinfo('{ncs}'); vname = info.Variables.Name; vsize = info.Variables.Size;"
+        ))
+        .unwrap();
+        assert_eq!(s.get("nt").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+        assert_eq!(s.get("ns"), Some(&Value::Mat(Matrix::from_row_major(1, 2, &[5.0, 6.0]).unwrap())));
+        assert_eq!(s.get("nt2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 99.0]));
+        assert_eq!(s.get("vname"), Some(&Value::Str("temp".into())));
+        assert_eq!(s.get("vsize").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+
+        let _ = std::fs::remove_file(&h5);
+        let _ = std::fs::remove_file(&nc);
+    }
+
+    #[test]
+    fn statistics_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("a = normpdf(0); b = normcdf(0); c = normcdf(1.96); d = norminv(0.975);").unwrap();
+        assert!((scalar(&s, "a") - 0.398_942_280_401_432_7).abs() < 1e-12);
+        assert!((scalar(&s, "b") - 0.5).abs() < 1e-8);
+        assert!((scalar(&s, "c") - 0.975_002_104_851_780_1).abs() < 1e-6);
+        assert!((scalar(&s, "d") - 1.959_963_984_540_054).abs() < 1e-7);
+
+        s.run("e = exppdf(0, 1); f = expcdf(1, 1); g = unifcdf(0.5, 0, 1); h = expinv(1-exp(-1), 1);").unwrap();
+        assert!((scalar(&s, "e") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "f") - (1.0 - (-1f64).exp())).abs() < 1e-12);
+        assert!((scalar(&s, "g") - 0.5).abs() < 1e-12);
+        assert!((scalar(&s, "h") - 1.0).abs() < 1e-10);
+
+        s.run("p1 = poisspdf(3,2); p2 = poisscdf(3,2); p3 = binopdf(3,10,0.5); p4 = binocdf(3,10,0.5); p5 = poissinv(0.857123460498547,2); p6 = binoinv(0.171875,10,0.5);")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.180_447_044_315_483_6).abs() < 1e-12);
+        assert!((scalar(&s, "p2") - 0.857_123_460_498_547).abs() < 1e-12);
+        assert!((scalar(&s, "p3") - 0.117_187_5).abs() < 1e-12);
+        assert!((scalar(&s, "p4") - 0.171_875).abs() < 1e-12);
+        assert_eq!(scalar(&s, "p5"), 3.0);
+        assert_eq!(scalar(&s, "p6"), 3.0);
+
+        s.run("q = iqr([1 2 3 4]); qm = iqr([1 1; 2 2; 3 3; 4 4]);").unwrap();
+        assert!((scalar(&s, "q") - 1.5).abs() < 1e-12);
+        assert_eq!(vec(&s, "qm"), vec![1.5, 1.5]);
+
+        s.run("[R, P] = corrcoef([1;2;3], [2;4;6]); Rv = corrcoef([1 2 3]);").unwrap();
+        assert_eq!(vec(&s, "R"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(vec(&s, "P"), vec![0.0, 0.0, 0.0, 0.0]);
+        assert!((scalar(&s, "Rv") - 1.0).abs() < 1e-12);
+
+        s.run("[b, bint, r, rint, st] = regress([1;2;3], [ones(3,1) [1;2;3]]);").unwrap();
+        let b = vec(&s, "b");
+        assert!(b[0].abs() < 1e-9 && (b[1] - 1.0).abs() < 1e-9, "b = {b:?}");
+        let st = vec(&s, "st");
+        assert!((st[0] - 1.0).abs() < 1e-12);
+        assert!(st[1].is_infinite());
+        assert_eq!(st[2], 0.0);
+        assert_eq!(vec(&s, "bint").len(), 4);
+        assert_eq!(vec(&s, "rint").len(), 6);
+
+        s.run("rng(1); [idx, C, sumd, D] = kmeans([0 0; 0.1 0; 5 5; 5.1 5], 2, 'Replicates', 3, 'Distance', 'sqeuclidean', 'Start', 'plus', 'EmptyAction', 'singleton');")
+            .unwrap();
+        let idx = vec(&s, "idx");
+        assert_eq!(idx[0], idx[1]);
+        assert_eq!(idx[2], idx[3]);
+        assert_ne!(idx[0], idx[2]);
+        assert_eq!(vec(&s, "C").len(), 4);
+        assert_eq!(vec(&s, "sumd").len(), 2);
+        assert_eq!(vec(&s, "D").len(), 8);
+
+        s.run("rng(2); X = exprnd(1, 2, 3); Y = unifrnd(0, 1, 2, 2); Z = poissrnd(2, 1, 5); W = binornd(10, 0.5, 2, 2);").unwrap();
+        assert_eq!(s.get("X").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("Y").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("Z").unwrap().dims(), (1, 5));
+        assert_eq!(s.get("W").unwrap().dims(), (2, 2));
+        assert!(vec(&s, "X").iter().all(|v| *v >= 0.0));
+        assert!(vec(&s, "Y").iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(vec(&s, "Z").iter().all(|v| *v >= 0.0 && v.fract() == 0.0));
+        assert!(vec(&s, "W").iter().all(|v| (0.0..=10.0).contains(v) && v.fract() == 0.0));
+    }
+
+    #[test]
+    fn hypothesis_tests_and_pca() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // One-sample t: mean 3, sd 1, n 3 -> t = 5.196, df = 2, two-sided p ~ 0.0351.
+        s.run("[h1, p1, ci1, st1] = ttest([2 3 4], 0); t1 = st1.tstat; d1 = st1.df; s1 = st1.sd;").unwrap();
+        assert_eq!(scalar(&s, "h1"), 1.0);
+        assert!((scalar(&s, "p1") - 0.035_096_8).abs() < 1e-5, "p1 = {}", scalar(&s, "p1"));
+        assert!((scalar(&s, "t1") - 5.196_152).abs() < 1e-4);
+        assert_eq!(scalar(&s, "d1"), 2.0);
+        assert!((scalar(&s, "s1") - 1.0).abs() < 1e-12);
+        let ci1 = vec(&s, "ci1");
+        assert!(ci1[0] < 3.0 && ci1[1] > 3.0 && ci1.len() == 2);
+
+        // One-sided and alpha options.
+        s.run("[hr, pr] = ttest([2 3 4], 0, 'Tail', 'right'); [hl, pl] = ttest([2 3 4], 0, 'Tail', 'left'); [ha, pa] = ttest([2 3 4], 0, 0.10);")
+            .unwrap();
+        assert_eq!(scalar(&s, "hr"), 1.0);
+        assert!((scalar(&s, "pr") - 0.017_548_4).abs() < 1e-5);
+        assert_eq!(scalar(&s, "hl"), 0.0);
+        assert!((scalar(&s, "pl") - 0.982_451_6).abs() < 1e-5);
+        assert_eq!(scalar(&s, "ha"), 1.0);
+        assert!((scalar(&s, "pa") - 0.035_096_8).abs() < 1e-5);
+
+        // Two-sample Welch t: t = -1, df = 8, p = 0.3466.
+        s.run("[h2, p2, ci2, st2] = ttest2([1 2 3 4 5], [2 3 4 5 6]); t2 = st2.tstat; d2 = st2.df;").unwrap();
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert!((scalar(&s, "p2") - 0.346_593_8).abs() < 1e-5, "p2 = {}", scalar(&s, "p2"));
+        assert!((scalar(&s, "t2") + 1.0).abs() < 1e-9);
+        assert!((scalar(&s, "d2") - 8.0).abs() < 1e-9);
+        let ci2 = vec(&s, "ci2");
+        assert!(ci2[0] < -1.0 && ci2[1] > -1.0);
+
+        // Equal-variance form has df = n1 + n2 - 2.
+        s.run("[he, pe, cie, ste] = ttest2([1 2 3 4 5], [2 3 4 5 6], 'Vartype', 'equal'); de = ste.df;").unwrap();
+        assert_eq!(scalar(&s, "he"), 0.0);
+        assert_eq!(scalar(&s, "de"), 8.0);
+        assert!((scalar(&s, "pe") - 0.346_593_8).abs() < 1e-5);
+
+        // KS against the standard normal: D = 0.1747 for [-1 0 1].
+        s.run("[hk, pk, dk, cvk] = kstest([-1 0 1]);").unwrap();
+        assert_eq!(scalar(&s, "hk"), 0.0);
+        assert!((scalar(&s, "dk") - 0.174_672).abs() < 1e-5, "dk = {}", scalar(&s, "dk"));
+        assert!((scalar(&s, "pk") - 1.0).abs() < 1e-3);
+        assert!(scalar(&s, "cvk") > 0.0);
+
+        // Custom CDF (normal with mean 0, sd 10) makes the same data unremarkable too.
+        s.run("cdf = @(x) normcdf(x, 0, 10); [hc, pc, dc] = kstest([-1 0 1], cdf);").unwrap();
+        assert_eq!(scalar(&s, "hc"), 0.0);
+        assert!(scalar(&s, "dc") > 0.0);
+
+        // Anderson-Darling on roughly normal data: low statistic, high p.
+        s.run("[haa, paa, aa, caa] = adtest([-1.2 -0.8 -0.5 -0.2 0.1 0.3 0.6 0.9 1.4 1.8]);").unwrap();
+        assert_eq!(scalar(&s, "haa"), 0.0);
+        assert!(scalar(&s, "paa") > 0.5, "paa = {}", scalar(&s, "paa"));
+        assert!(scalar(&s, "aa") > 0.0);
+        assert!((scalar(&s, "caa") - 0.752).abs() < 1e-12);
+
+        // PCA of perfectly correlated data: one nonzero component, 100% explained.
+        s.run("X = [1 2; 2 4; 3 6]; [co, sc, la, ts, ex, mu] = pca(X);").unwrap();
+        assert_eq!(s.get("co").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("sc").unwrap().dims(), (3, 2));
+        let co = vec(&s, "co");
+        assert!((co[0] - 0.447_213_6).abs() < 1e-6 && (co[1] - 0.894_427_2).abs() < 1e-6, "co = {co:?}");
+        let la = vec(&s, "la");
+        assert!((la[0] - 5.0).abs() < 1e-9 && la[1].abs() < 1e-9, "la = {la:?}");
+        let ex = vec(&s, "ex");
+        assert!((ex[0] - 100.0).abs() < 1e-9 && ex[1].abs() < 1e-9);
+        assert_eq!(vec(&s, "mu"), vec![2.0, 4.0]);
+        let sc = vec(&s, "sc");
+        assert!((sc[0] + 5f64.sqrt()).abs() < 1e-9 && sc[3].abs() < 1e-9, "sc = {sc:?}");
+
+        // NumComponents truncates scores, coefficients and latent roots.
+        s.run("[co1, sc1, la1, ts1, ex1] = pca(X, 'NumComponents', 1);").unwrap();
+        assert_eq!(s.get("co1").unwrap().dims(), (2, 1));
+        assert_eq!(s.get("sc1").unwrap().dims(), (3, 1));
+        assert_eq!(vec(&s, "la1"), vec![5.0]);
+        assert_eq!(vec(&s, "ex1"), vec![100.0]);
+    }
+
+    #[test]
+    fn distribution_fit_and_objects() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("g1 = gampdf(2,3,2); g2 = gamcdf(2,3,2); g3 = gaminv(0.3,3,2); b1 = betapdf(0.5,2,3); b2 = betacdf(0.5,2,3); b3 = betainv(0.3,2,3);")
+            .unwrap();
+        assert!((scalar(&s, "g1") - 0.091_969_860_292_860_57).abs() < 1e-10);
+        assert!((scalar(&s, "g2") - 0.080_301_397_071_394_18).abs() < 1e-10);
+        assert!((scalar(&s, "g3") - 3.827_551_588_254_124).abs() < 1e-6);
+        assert!((scalar(&s, "b1") - 1.5).abs() < 1e-10);
+        assert!((scalar(&s, "b2") - 0.6875).abs() < 1e-10);
+        assert!((scalar(&s, "b3") - 0.272_383_942_075_105_36).abs() < 1e-6);
+
+        s.run("c1 = chi2pdf(2,2); c2 = chi2cdf(2,2); c3 = chi2inv(0.95,3); t1 = tpdf(0,10); t2 = tinv(0.975,10); f1 = fpdf(1,5,5); f2 = finv(0.95,5,5);")
+            .unwrap();
+        assert!((scalar(&s, "c1") - 0.183_939_720_585_721_14).abs() < 1e-10);
+        assert!((scalar(&s, "c2") - 0.632_120_558_828_557_7).abs() < 1e-10);
+        assert!((scalar(&s, "c3") - 7.814_727_903_251_179).abs() < 1e-5);
+        assert!((scalar(&s, "t1") - 0.389_108_383_966_031_04).abs() < 1e-10);
+        assert!((scalar(&s, "t2") - 2.228_138_851_964_938_5).abs() < 1e-6);
+        assert!((scalar(&s, "f1") - 0.424_413_181_578_386_87).abs() < 1e-10);
+        assert!((scalar(&s, "f2") - 5.050_329_057_632_646).abs() < 1e-5);
+
+        // fitdist Normal (MLE, n divisor) and the distribution-object interface.
+        s.run("pd = fitdist([1 2 3 4], 'Normal'); pm = pd.mu; ps = pd.sigma; p1 = pdf(pd,1); p2 = cdf(pd,2.5); p3 = icdf(pd,0.975); mm = mean(pd); ss = std(pd); vv = var(pd); md = median(pd);")
+            .unwrap();
+        assert!((scalar(&s, "pm") - 2.5).abs() < 1e-12);
+        assert!((scalar(&s, "ps") - 5f64.sqrt() / 2.0).abs() < 1e-12);
+        assert!((scalar(&s, "p1") - 0.145_074_146_967_845_87).abs() < 1e-9, "p1 = {}", scalar(&s, "p1"));
+        assert!((scalar(&s, "p2") - 0.5).abs() < 1e-8, "p2 = {}", scalar(&s, "p2"));
+        assert!((scalar(&s, "p3") - (2.5 + 1.959_963_984_540_054 * 1.118_033_988_749_895)).abs() < 1e-6);
+        assert!((scalar(&s, "mm") - 2.5).abs() < 1e-12);
+        assert!((scalar(&s, "ss") - 1.118_033_988_749_895).abs() < 1e-12);
+        assert!((scalar(&s, "vv") - 1.25).abs() < 1e-12);
+        assert!((scalar(&s, "md") - 2.5).abs() < 1e-12);
+
+        // Gamma and Beta MLEs match SciPy's fit with location fixed at 0/scale 1.
+        s.run("gd = fitdist([0.5 0.8 1.1 1.4 2.0 2.7 3.5 5.0], 'Gamma'); gdist = gd.DistributionName; ga = gd.a; gb = gd.b; gm = mean(gd); gs = std(gd);")
+            .unwrap();
+        assert_eq!(s.get("gdist"), Some(&Value::Str("Gamma".into())));
+        assert!((scalar(&s, "ga") - 2.186_602_114_063_721_3).abs() < 1e-4, "ga = {}", scalar(&s, "ga"));
+        assert!((scalar(&s, "gb") - 0.971_827_469_813_776_1).abs() < 1e-4);
+        assert!((scalar(&s, "gm") - 2.125).abs() < 1e-6);
+        assert!((scalar(&s, "gs") - 1.437_057_192_095_803).abs() < 1e-5);
+
+        s.run("bd = fitdist([0.1 0.15 0.2 0.3 0.35 0.5 0.6 0.75 0.85], 'Beta'); ba = bd.a; bb = bd.b; bm = mean(bd); bs = std(bd);").unwrap();
+        assert!((scalar(&s, "ba") - 1.431_303_561_354_704_7).abs() < 1e-4, "ba = {}", scalar(&s, "ba"));
+        assert!((scalar(&s, "bb") - 1.911_715_283_469_614).abs() < 1e-4);
+        assert!((scalar(&s, "bm") - 0.428_147_021_537_332_1).abs() < 1e-5);
+        assert!((scalar(&s, "bs") - 0.237_433_940_598_533_46).abs() < 1e-5);
+
+        // Seeded random draws are reproducible and keep the requested shape.
+        s.run("rng(3); X = random(pd, 2, 3); rng(3); Y = random(pd, 2, 3); same = isequal(X, Y);").unwrap();
+        assert_eq!(s.get("X").unwrap().dims(), (2, 3));
+        assert_eq!(scalar(&s, "same"), 1.0);
+
+        // Poisson is fitted by its mean and reuses the discrete kernels.
+        s.run("pp = fitdist([0 1 1 2 2 2 3], 'Poisson'); pl = pp.lambda; ppdf = pdf(pp,2); pcdf = cdf(pp,2); pinv = icdf(pp,0.5);").unwrap();
+        assert!((scalar(&s, "pl") - 11.0 / 7.0).abs() < 1e-12);
+        assert!((scalar(&s, "ppdf") - 0.256_505_414_738_527_6).abs() < 1e-9);
+        assert!((scalar(&s, "pcdf") - 0.790_715_038_822_072_6).abs() < 1e-9);
+        assert_eq!(scalar(&s, "pinv"), 1.0);
+    }
+
+    #[test]
+    fn multivariate_and_multiple_testing() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("p = [0.01 0.02 0.03 0.04]; bf = bonferroni(p); hm = holm(p); bh = benjamini_hochberg(p); sd = sidak(p); [q, h] = mafdr(p);").unwrap();
+        assert_eq!(vec(&s, "bf"), vec![0.04, 0.08, 0.12, 0.16]);
+        assert_eq!(vec(&s, "hm"), vec![0.04, 0.06, 0.06, 0.06]);
+        assert_eq!(vec(&s, "bh"), vec![0.04, 0.04, 0.04, 0.04]);
+        assert_eq!(vec(&s, "q"), vec![0.04, 0.04, 0.04, 0.04]);
+        assert_eq!(vec(&s, "h"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert!((vec(&s, "sd")[0] - 0.039_403_99).abs() < 1e-6);
+        assert!(vec(&s, "sd").iter().zip(vec(&s, "bf").iter()).all(|(a, b)| a < b));
+
+        s.run("[p1, h1, st1] = signrank([1 2 3 4 10], 0); sr = st1.signedrank; [p2, h2, st2] = ranksum([1 2 3 4 5], [2 3 4 5 6]); rs = st2.ranksum;")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.0625).abs() < 1e-12);
+        assert_eq!(scalar(&s, "h1"), 0.0);
+        assert_eq!(scalar(&s, "sr"), 15.0);
+        assert!((scalar(&s, "p2") - 0.397_614_751_956_530_73).abs() < 1e-6);
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert_eq!(scalar(&s, "rs"), 23.0);
+
+        s.run("X = [1 4 7; 2 5 8; 3 6 9]; [pk, stk] = kruskalwallis(X); kc = stk.chi2; kd = stk.df; kmr = stk.meanranks; [pg, stg] = kruskalwallis([1 2 3 4 5 6 7 8 9], [1 1 1 2 2 2 3 3 3]);")
+            .unwrap();
+        assert!((scalar(&s, "pk") - 0.027_323_722_447_292_52).abs() < 1e-9);
+        assert!((scalar(&s, "kc") - 7.2).abs() < 1e-9);
+        assert_eq!(scalar(&s, "kd"), 2.0);
+        assert_eq!(vec(&s, "kmr"), vec![2.0, 5.0, 8.0]);
+        assert!((scalar(&s, "pg") - scalar(&s, "pk")).abs() < 1e-12);
+
+        // PCoA recovers a one-dimensional line from its distance matrix.
+        s.run("D = [0 1 2; 1 0 1; 2 1 0]; [Y, e, ex] = pcoa(D); [Y2, e2] = cmdscale(D, 2);").unwrap();
+        assert_eq!(s.get("Y").unwrap().dims(), (3, 1));
+        let y = vec(&s, "Y");
+        assert!((y[0] - 1.0).abs() < 1e-9 && y[1].abs() < 1e-9 && (y[2] + 1.0).abs() < 1e-9, "Y = {y:?}");
+        assert_eq!(vec(&s, "e").len(), 3);
+        assert!((vec(&s, "e")[0] - 2.0).abs() < 1e-12);
+        assert!(vec(&s, "e")[1].abs() < 1e-9 && vec(&s, "e")[2].abs() < 1e-9);
+        assert!((vec(&s, "ex")[0] - 100.0).abs() < 1e-9);
+        assert_eq!(s.get("Y2").unwrap().dims(), (3, 2));
+        assert_eq!(vec(&s, "e2").len(), 3);
+    }
+
+    #[test]
+    fn umap_embedding() {
+        let mut s = Session::new();
+        s.run("rng(4); X = [0 0; 0.1 0; 0 0.1; 0.1 0.1; 5 5; 5.1 5; 5 5.1; 5.1 5.1]; Y = umap(X, 'NumNeighbors', 3, 'NumEpochs', 300);").unwrap();
+        assert_eq!(s.get("Y").unwrap().dims(), (8, 2));
+        let y = s.get("Y").unwrap().to_matrix().unwrap();
+        let mut c = [[0.0f64; 2]; 2];
+        for i in 0..8 {
+            let g = i / 4;
+            for (d, slot) in c[g].iter_mut().enumerate() {
+                *slot += y.get(i, d).unwrap_or(0.0) / 4.0;
+            }
+        }
+        let mut within = 0.0f64;
+        for i in 0..8 {
+            let g = i / 4;
+            let mut r = 0.0;
+            for (d, cv) in c[g].iter().enumerate() {
+                r += (y.get(i, d).unwrap_or(0.0) - cv).powi(2);
+            }
+            within = within.max(r.sqrt());
+        }
+        let between = ((c[0][0] - c[1][0]).powi(2) + (c[0][1] - c[1][1]).powi(2)).sqrt();
+        assert!(between > within, "between {between} within {within}");
+
+        // The nearest neighbour of every point stays in its own cluster.
+        for i in 0..8 {
+            let mut best = f64::INFINITY;
+            let mut label = i / 4;
+            for j in 0..8 {
+                if i == j {
+                    continue;
+                }
+                let mut r = 0.0;
+                for d in 0..2 {
+                    r += (y.get(i, d).unwrap_or(0.0) - y.get(j, d).unwrap_or(0.0)).powi(2);
+                }
+                if r < best {
+                    best = r;
+                    label = j / 4;
+                }
+            }
+            assert_eq!(label, i / 4, "point {i} crosses clusters");
+        }
+
+        s.run("rng(7); A = umap(X, 'NumNeighbors', 3); rng(7); B = umap(X, 'NumNeighbors', 3); same = isequal(A, B);").unwrap();
+        assert_eq!(s.get("same"), Some(&Value::Num(1.0)));
+        s.run("Z = umap(X, 'NumNeighbors', 3, 'NumComponents', 3, 'NumEpochs', 40);").unwrap();
+        assert_eq!(s.get("Z").unwrap().dims(), (8, 3));
+    }
+
+    #[test]
+    fn corpus_string_and_table_helpers() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("c = {'alpha','beta','gamma'}; ca = contains(c,'et'); cs = startsWith(c,'a'); ce = endsWith(c,'a'); joined = strjoin(c,'-'); parts = strsplit('a,b,c',','); lens = strlength(c);")
+            .unwrap();
+        assert_eq!(vec(&s, "ca"), vec![0.0, 1.0, 0.0]);
+        assert_eq!(vec(&s, "cs"), vec![1.0, 0.0, 0.0]);
+        assert_eq!(vec(&s, "ce"), vec![1.0, 1.0, 1.0]);
+        assert_eq!(s.get("joined"), Some(&Value::Str("alpha-beta-gamma".into())));
+        assert_eq!(s.get("parts").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 3)), Some(true));
+        assert_eq!(vec(&s, "lens"), vec![5.0, 4.0, 5.0]);
+
+        s.run(
+            "T = array2table([1 2; 3 4], 'VariableNames', {'x','y'}); names = T.Properties.VariableNames; colx = T.x; nr = rows(T); nh = height(T);",
+        )
+        .unwrap();
+        assert_eq!(s.get("names").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 2)), Some(true));
+        assert_eq!(vec(&s, "colx"), vec![1.0, 3.0]);
+        assert_eq!(scalar(&s, "nr"), 2.0);
+        assert_eq!(scalar(&s, "nh"), 2.0);
+
+        s.run("miss = ismissing([1 NaN; 3 4]);").unwrap();
+        assert_eq!(vec(&s, "miss"), vec![0.0, 0.0, 1.0, 0.0]);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("matcraft_fileread_{}.txt", std::process::id()));
+        std::fs::write(&path, "hello\nworld").unwrap();
+        let p = path.to_string_lossy().replace('\\', "/");
+        s.run(&format!("txt = fileread('{p}'); here = isfolder('{}'); nope = isfolder('{p}');", dir.to_string_lossy().replace('\\', "/"))).unwrap();
+        assert_eq!(s.get("txt"), Some(&Value::Str("hello\nworld".into())));
+        assert_eq!(scalar(&s, "here"), 1.0);
+        assert_eq!(scalar(&s, "nope"), 0.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ode_integration() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Non-stiff scalar decay: y' = -2y, exact y(2) = exp(-4).
+        s.run("[t1, y1] = ode45(@(t,y) -2*y, [0 2], 1, odeset('RelTol',1e-8,'AbsTol',1e-10)); a1 = y1(end);").unwrap();
+        assert!((scalar(&s, "a1") - (-4f64).exp()).abs() < 1e-6, "a1 = {}", scalar(&s, "a1"));
+        assert!(vec(&s, "t1").windows(2).all(|w| w[1] > w[0]));
+
+        // Harmonic oscillator keeps unit amplitude and returns to [1, 0].
+        s.run("[t2, Y2] = ode45(@(t,y) [y(2); -y(1)], [0 2*pi], [1; 0]); e2 = Y2(end,1); f2 = Y2(end,2);").unwrap();
+        assert!((scalar(&s, "e2") - 1.0).abs() < 1e-3, "e2 = {}", scalar(&s, "e2"));
+        assert!(scalar(&s, "f2").abs() < 1e-3);
+
+        // Requested output grid is honoured exactly.
+        s.run("tout = 0:0.1:1; [t3, y3] = ode45(@(t,y) -2*y, tout, 1); n3 = numel(t3); a3 = y3(end); tend = t3(end);").unwrap();
+        assert_eq!(scalar(&s, "n3"), 11.0);
+        assert!((scalar(&s, "tend") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "a3") - (-2f64).exp()).abs() < 1e-6);
+
+        // Stiff linear problem: y' = -1000(y - cos t) - sin t, exact y = cos t.
+        s.run("[t4, y4] = ode15s(@(t,y) -1000*(y-cos(t))-sin(t), [0 1], 1, odeset('RelTol',1e-6,'AbsTol',1e-9)); a4 = y4(end); n4 = numel(t4);")
+            .unwrap();
+        assert!((scalar(&s, "a4") - 1f64.cos()).abs() < 1e-5, "a4 = {}", scalar(&s, "a4"));
+        assert!(scalar(&s, "n4") > 2.0);
+
+        // Robertson kinetics exercise the nonlinear Newton path.
+        s.run("rob = @(t,y) [-0.04*y(1)+1e4*y(2)*y(3); 0.04*y(1)-1e4*y(2)*y(3)-3e7*y(2)^2; 3e7*y(2)^2]; [t5, Y5] = ode15s(rob, [0 10], [1;0;0], odeset('RelTol',1e-4,'AbsTol',1e-6)); r1 = Y5(end,1); r3 = Y5(end,3);")
+            .unwrap();
+        assert!((scalar(&s, "r1") - 0.841_369_924).abs() < 1e-3, "r1 = {}", scalar(&s, "r1"));
+        assert!((scalar(&s, "r3") - 0.158_613_842).abs() < 1e-3);
+
+        // odeset/odeget round-trip and MaxStep is respected.
+        s.run("o = odeset('RelTol', 1e-7, 'MaxStep', 0.05); rt = odeget(o,'RelTol'); ms = odeget(o,'MaxStep'); default_rt = odeget(o,'NoSuchOption',1e-3); [t6, y6] = ode45(@(t,y) -y, [0 1], 1, o); hm = max(diff(t6)); a6 = y6(end);")
+            .unwrap();
+        assert_eq!(scalar(&s, "rt"), 1e-7);
+        assert_eq!(scalar(&s, "ms"), 0.05);
+        assert_eq!(scalar(&s, "default_rt"), 1e-3);
+        assert!(scalar(&s, "hm") <= 0.050_001, "max step = {}", scalar(&s, "hm"));
+        assert!((scalar(&s, "a6") - (-1f64).exp()).abs() < 1e-5);
+
+        // NonNegative clamps a crossing trajectory at zero.
+        s.run("[t7, y7] = ode45(@(t,y) -y, [0 1], -1, odeset('NonNegative', 1)); a7 = y7(end);").unwrap();
+        assert_eq!(scalar(&s, "a7"), 0.0);
+    }
+
+    #[test]
+    fn anova_and_multiple_comparisons() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("[p1, tbl1, st1] = anova1([1 4 7; 2 5 8; 3 6 9]); m1 = st1.means; n1 = st1.n; s1 = st1.s; d1 = st1.df; g1 = tbl1{2,1}; ssb = tbl1{2,2}; ssw = tbl1{3,2}; sst = tbl1{4,2};")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.001).abs() < 1e-9);
+        assert_eq!(vec(&s, "m1"), vec![2.0, 5.0, 8.0]);
+        assert_eq!(vec(&s, "n1"), vec![3.0, 3.0, 3.0]);
+        assert_eq!(scalar(&s, "s1"), 1.0);
+        assert_eq!(scalar(&s, "d1"), 6.0);
+        assert_eq!(s.get("g1"), Some(&Value::Str("Groups".into())));
+        assert_eq!(scalar(&s, "ssb"), 54.0);
+        assert_eq!(scalar(&s, "ssw"), 6.0);
+        assert_eq!(scalar(&s, "sst"), 60.0);
+
+        s.run("[p2, tbl2, st2] = anova2([1 2 4; 2 4 5; 3 5 7]); c2 = tbl2{2,1}; r2 = tbl2{3,1}; f2 = tbl2{2,5}; s2 = st2.s; d2 = st2.df;").unwrap();
+        assert!((scalar(&s, "p2") - 0.001_479_289_940_828_354_4).abs() < 1e-9);
+        assert_eq!(s.get("c2"), Some(&Value::Str("Columns".into())));
+        assert_eq!(s.get("r2"), Some(&Value::Str("Rows".into())));
+        assert!((scalar(&s, "f2") - 50.0).abs() < 1e-9);
+        assert!((scalar(&s, "s2") - 0.408_248_290_463_863_4).abs() < 1e-9);
+        assert_eq!(scalar(&s, "d2"), 4.0);
+
+        s.run("[p3, tbl3, st3] = anova2([1 2 3; 2 3 4; 4 5 6; 5 6 7], 2); i3 = tbl3{4,1}; s3 = st3.s; d3 = st3.df;").unwrap();
+        assert!((scalar(&s, "p3") - 0.020_285_499_624_342_562).abs() < 1e-9);
+        assert_eq!(s.get("i3"), Some(&Value::Str("Interaction".into())));
+        assert!((scalar(&s, "s3") - 1.0 / 2f64.sqrt()).abs() < 1e-9);
+        assert_eq!(scalar(&s, "d3"), 6.0);
+
+        // Bonferroni and LSD pairwise comparisons.
+        s.run("[p1, tbl1, st1] = anova1([1 4 7; 2 5 8; 3 6 9]); cb = multcompare(st1, 'CType', 'bonferroni'); cl = multcompare(st1, 'CType', 'lsd'); ct = multcompare(st1);")
+            .unwrap();
+        assert!((s.get("cb").unwrap().to_matrix().unwrap().get(0, 5).unwrap_or(0.0) - 0.031_205_162_806_392_295).abs() < 1e-9);
+        assert!((s.get("cb").unwrap().to_matrix().unwrap().get(1, 5).unwrap_or(0.0) - 0.000_974_924_037_813_185_2).abs() < 1e-9);
+        assert!((s.get("cl").unwrap().to_matrix().unwrap().get(0, 5).unwrap_or(0.0) - 0.010_401_720_935_464_098).abs() < 1e-9);
+        assert!((s.get("cl").unwrap().to_matrix().unwrap().get(0, 2).unwrap_or(0.0) + 4.997_9).abs() < 1e-3);
+        let tukey = s.get("ct").unwrap().to_matrix().unwrap();
+        let tukey_p = tukey.get(0, 5).unwrap_or(0.0);
+        assert!(tukey_p > 0.01 && tukey_p < 0.05, "tukey p = {tukey_p}");
+        assert!(tukey.get(0, 2).unwrap_or(0.0) < -3.0 && tukey.get(0, 4).unwrap_or(0.0) < 0.0);
+
+        // Friedman rank test: three identical row rankings.
+        s.run("[pf, tblf, stf] = friedman([1 2 3; 1 2 3; 1 2 3]); cf = stf.chi2; df = stf.df; mr = stf.meanranks;").unwrap();
+        assert!((scalar(&s, "pf") - 0.049_787_068_367_863_95).abs() < 1e-9);
+        assert!((scalar(&s, "cf") - 6.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "df"), 2.0);
+        assert_eq!(vec(&s, "mr"), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn control_mimo_frequency_response() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Diagonal 2x2 system: H11 = 1/(s+1), H22 = 1/(s+2).
+        s.run("sys = ss([-1 0; 0 -2], eye(2), eye(2), zeros(2,2)); [mag, ph, w] = bode(sys, [0 1]); H = freqresp(sys, [0 1]); m11 = mag(1,1,1); m22 = mag(2,2,1); m11b = mag(1,1,2); m22b = mag(2,2,2); p11b = ph(1,1,2); p22b = ph(2,2,2);")
+            .unwrap();
+        assert_eq!(s.get("mag").unwrap().dims_vec(), vec![2, 2, 2]);
+        assert_eq!(s.get("ph").unwrap().dims_vec(), vec![2, 2, 2]);
+        assert_eq!(s.get("H").unwrap().dims_vec(), vec![4, 2]);
+        assert_eq!(scalar(&s, "m11"), 1.0);
+        assert_eq!(scalar(&s, "m22"), 0.5);
+        assert!((scalar(&s, "m11b") - 0.5f64.sqrt()).abs() < 1e-9);
+        assert!((scalar(&s, "m22b") - 0.2f64.sqrt()).abs() < 1e-9);
+        assert!((scalar(&s, "p11b") + 45.0).abs() < 1e-9);
+        assert!((scalar(&s, "p22b") + 26.565_051_177_457_8).abs() < 1e-6);
+        s.run("h11r = real(H(1,1)); h11i = imag(H(1,1)); h12r = real(H(1,2)); h12i = imag(H(1,2)); h41 = real(H(4,1)); h42r = real(H(4,2)); h42i = imag(H(4,2));")
+            .unwrap();
+        assert_eq!(scalar(&s, "h11r"), 1.0);
+        assert_eq!(scalar(&s, "h11i"), 0.0);
+        assert!((scalar(&s, "h12r") - 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "h12i") + 0.5).abs() < 1e-9);
+        assert_eq!(scalar(&s, "h41"), 0.5);
+        assert!((scalar(&s, "h42r") - 0.4).abs() < 1e-9);
+        assert!((scalar(&s, "h42i") + 0.2).abs() < 1e-9);
+
+        // One input, two outputs, nonzero D: H1 = 1 + 1/(s+1), H2 = 2 + 2/(s+2).
+        s.run("sys2 = ss([-1 0; 0 -2], [1; 2], [1 0; 0 1], [1; 2]); [mag2, ph2] = bode(sys2, [0 1]); H2 = freqresp(sys2, 1); a = mag2(1,1,1); b = mag2(2,1,1); hr1 = real(H2(1,1)); hi1 = imag(H2(1,1)); hr2 = real(H2(2,1)); hi2 = imag(H2(2,1));")
+            .unwrap();
+        assert_eq!(s.get("mag2").unwrap().dims_vec(), vec![2, 1, 2]);
+        assert_eq!(s.get("H2").unwrap().dims_vec(), vec![2, 1]);
+        assert_eq!(scalar(&s, "a"), 2.0);
+        assert_eq!(scalar(&s, "b"), 3.0);
+        assert!((scalar(&s, "hr1") - 1.5).abs() < 1e-9);
+        assert!((scalar(&s, "hi1") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "hr2") - 2.8).abs() < 1e-9);
+        assert!((scalar(&s, "hi2") + 0.4).abs() < 1e-9);
+
+        // SISO output shapes are unchanged.
+        s.run("[ms, ps] = bode(tf([1], [1 1]), [0.1 1 10]); Hs = freqresp(tf([1], [1 1]), [0.1 1 10]);").unwrap();
+        assert_eq!(s.get("ms").unwrap().dims_vec(), vec![1, 3]);
+        assert_eq!(s.get("Hs").unwrap().dims_vec(), vec![1, 3]);
+    }
+
+    #[test]
+    fn filesystem_path_shell_and_globals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_fs_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("p0 = path;").unwrap();
+        s.run(&format!("addpath('{ds}', '-end'); p1 = path; has1 = contains(p1, '{ds}'); rmpath('{ds}'); p2 = path; has2 = contains(p2, '{ds}');"))
+            .unwrap();
+        assert_eq!(scalar(&s, "has1"), 1.0);
+        assert_eq!(scalar(&s, "has2"), 0.0);
+
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        s.run(&format!("gp = genpath('{ds}'); gsub = contains(gp, 'sub');")).unwrap();
+        assert_eq!(scalar(&s, "gsub"), 1.0);
+
+        let made = dir.join("made");
+        let made_s = made.to_string_lossy().replace('\\', "/");
+        s.run(&format!("md = mkdir('{made_s}'); mf = isfolder('{made_s}'); rd = rmdir('{made_s}');")).unwrap();
+        assert_eq!(scalar(&s, "md"), 1.0);
+        assert_eq!(scalar(&s, "mf"), 1.0);
+        assert_eq!(scalar(&s, "rd"), 1.0);
+
+        s.run("[st, out] = system('echo matcraft_shell_ok'); [sd, od] = dos('echo dos_ok'); [su, ou] = unix('echo unix_ok');").unwrap();
+        assert_eq!(scalar(&s, "st"), 0.0);
+        assert_eq!(scalar(&s, "sd"), 0.0);
+        assert_eq!(scalar(&s, "su"), 0.0);
+        for (name, needle) in [("out", "matcraft_shell_ok"), ("od", "dos_ok"), ("ou", "unix_ok")] {
+            match s.get(name) {
+                Some(Value::Str(text)) => assert!(text.contains(needle), "{name} = {text:?}"),
+                other => panic!("{name} was not a string: {other:?}"),
+            }
+        }
+
+        let path_file = dir.join("path.txt");
+        let pf = path_file.to_string_lossy().replace('\\', "/");
+        s.run(&format!("sp = savepath('{pf}');")).unwrap();
+        assert_eq!(scalar(&s, "sp"), 0.0);
+        let loaded = load_paths_from(&path_file);
+        let cwd = std::env::current_dir().unwrap();
+        assert!(loaded.contains(&cwd), "saved path did not contain cwd: {loaded:?}");
+
+        std::fs::write(dir.join("setg.m"), "function setg(v)\nglobal gv\ngv = v;\nend\n").unwrap();
+        std::fs::write(dir.join("getg.m"), "function y = getg()\nglobal gv\ny = gv;\nend\n").unwrap();
+        s.run(&format!("addpath('{ds}'); setg(42); gval = getg(); rmpath('{ds}');")).unwrap();
+        assert_eq!(scalar(&s, "gval"), 42.0);
+
+        s.run("path(p0);").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_class_helpers() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("p = inputParser; addRequired(p, 'x', @isnumeric); addOptional(p, 'y', 10); addParameter(p, 'Method', 'fast', @ischar); parse(p, 3, 'method', 'slow'); x = p.Results.x; y = p.Results.y; method = p.Results.Method;")
+            .unwrap();
+        assert_eq!(scalar(&s, "x"), 3.0);
+        assert_eq!(scalar(&s, "y"), 10.0);
+        assert_eq!(s.get("method"), Some(&Value::Str("slow".into())));
+
+        s.run("q = inputParser; q.KeepUnmatched = true; addParameter(q, 'Alpha', 0.05); addParamValue(q, 'Beta', 2); parse(q, 'Alph', 0.1, 'Gamma', 7); qa = q.Results.Alpha; qb = q.Results.Beta; qu = numel(q.Unmatched);")
+            .unwrap();
+        assert_eq!(scalar(&s, "qa"), 0.1);
+        assert_eq!(scalar(&s, "qb"), 2.0);
+        assert_eq!(scalar(&s, "qu"), 2.0);
+
+        s.run("r = inputParser; addRequired(r, 'x'); parse(r, 1); rx = r.Results.x;").unwrap();
+        assert_eq!(scalar(&s, "rx"), 1.0);
+
+        assert!(s.run("bad = inputParser; addRequired(bad, 'x'); parse(bad);").is_err());
+        assert!(s.run("bad2 = inputParser; addRequired(bad2, 'x', @ischar); parse(bad2, 3);").is_err());
+
+        s.run("a = [1;2;3]; b = [4;5;6]; T = table(a, b); names = T.Properties.VariableNames; ta = T.a; ht = height(T); wt = width(T);").unwrap();
+        assert_eq!(s.get("names").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 2)), Some(true));
+        assert_eq!(s.get("ta").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(scalar(&s, "ht"), 3.0);
+        assert_eq!(scalar(&s, "wt"), 2.0);
+
+        s.run("T2 = table([1;2], [3;4], 'VariableNames', {'x','y'}); t2x = T2.x; arr = table2array(T2);").unwrap();
+        assert_eq!(s.get("t2x").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("arr").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0]));
+
+        s.run("ss = string('abc'); sc = strings(2,3); is1 = isstring(ss); is2 = isstring(sc); sl = strlength(ss); sn = string(5);").unwrap();
+        assert_eq!(scalar(&s, "is1"), 1.0);
+        assert_eq!(scalar(&s, "is2"), 1.0);
+        assert_eq!(scalar(&s, "sl"), 3.0);
+        assert_eq!(s.get("sn"), Some(&Value::Str("5".into())));
+        assert_eq!(s.get("sc").unwrap().dims(), (2, 3));
+    }
+
+    #[test]
+    fn corpus_compatibility_fixes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_corpus_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Empty-cell growth and varargin forwarding.
+        s.run("v = {}; nv = numel(v); c = {}; c{end+1,1} = 'a'; c{end+1,1} = 'b';").unwrap();
+        assert_eq!(scalar(&s, "nv"), 0.0);
+        assert_eq!(s.get("c").unwrap().dims(), (2, 1));
+        std::fs::write(dir.join("fwd.m"), "function y = fwd(varargin)\ny = numel(varargin);\nend\n").unwrap();
+        s.run(&format!("addpath('{ds}'); y0 = fwd(); y2 = fwd(1,2);")).unwrap();
+        assert_eq!(scalar(&s, "y0"), 0.0);
+        assert_eq!(scalar(&s, "y2"), 2.0);
+
+        // String repmat and parenthesised string assignment into cellstr.
+        s.run("r = repmat(' ', 3, 1); r(2) = string('x'); rv = r{2}; rsz = size(r);").unwrap();
+        assert_eq!(s.get("rv"), Some(&Value::Str("x".into())));
+        assert_eq!(s.get("rsz").unwrap().dims(), (1, 2));
+
+        // Cellstr logic and char-to-number conversion.
+        s.run("e = erase('gnl-CMER-X', 'gnl-CMER-'); rp = replace('a-b','-','+'); cm = strcmp({'a','b'}, 'a'); sd = str2double({'1','2.5','x'});")
+            .unwrap();
+        assert_eq!(s.get("e"), Some(&Value::Str("X".into())));
+        assert_eq!(s.get("rp"), Some(&Value::Str("a+b".into())));
+        assert_eq!(s.get("cm").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0]));
+        let sd = s.get("sd").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        assert_eq!(sd.get(..2), Some(&[1.0, 2.5][..]));
+        assert!(sd.get(2).map(|x| x.is_nan()).unwrap_or(false));
+
+        // Implicit expansion through the interpreter.
+        s.run("X = ones(3,2) - [10 20]; xd = X(3,2);").unwrap();
+        assert_eq!(scalar(&s, "xd"), -19.0);
+
+        // Table dot-assignment, subsetting, sorting and emptiness.
+        s.run("T = table(); T.name = {'b';'a';'c'}; T.v = [2;1;3]; th = height(T); tw = width(T); U = T([1 3], :); uh = height(U); S = sortrows(T,'v','ascend'); sv = S.v; sn = S.name; em = isempty(T([],:));")
+            .unwrap();
+        assert_eq!(scalar(&s, "th"), 3.0);
+        assert_eq!(scalar(&s, "tw"), 2.0);
+        assert_eq!(scalar(&s, "uh"), 2.0);
+        assert_eq!(s.get("sv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(s.get("sn").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 3 && c.items[0] == Value::Str("a".into()))), Some(true));
+        assert_eq!(scalar(&s, "em"), 1.0);
+
+        // Colormap/colour helpers and graphics property pairs.
+        s.run("lc = lines(8); lsz = size(lc); vc = validatecolor([1 0 0]); f = figure('Position',[0 0 10 10],'Color','w'); rectangle('Position',[0 0 1 1],'Curvature',1,'FaceColor',[1 0 0]); patch([0 1 1],[0 0 1],'b'); daspect([1 1 1]); h = f.findobj('Type','text'); set(h,'FontSize',11);")
+            .unwrap();
+        assert_eq!(s.get("lsz").unwrap().dims(), (1, 2));
+        assert_eq!(s.get("lsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![8.0, 3.0]));
+        assert_eq!(s.get("vc").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 0.0]));
+
+        // Text table read/write: quoted fields, tab delimiter and preserved names.
+        std::fs::write(dir.join("t.tsv"), "sample name\tvalue\tnote\na\t1.5\t\"x\ty\"\nb\t2\tz\n").unwrap();
+        s.run(&format!("Tt = readtable('{ds}/t.tsv','FileType','text','Delimiter','\\t','VariableNamingRule','preserve'); th2 = height(Tt); tw2 = width(Tt); nm = Tt.('sample name'); vv = Tt.value;"))
+            .unwrap();
+        assert_eq!(scalar(&s, "th2"), 2.0);
+        assert_eq!(scalar(&s, "tw2"), 3.0);
+        assert_eq!(s.get("nm").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2 && c.items[0] == Value::Str("a".into()))), Some(true));
+        assert_eq!(s.get("vv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.5, 2.0]));
+        s.run(&format!("writetable(Tt,'{ds}/out.csv'); Tb = readtable('{ds}/out.csv'); bh = height(Tb); bw = width(Tb);")).unwrap();
+        assert_eq!(scalar(&s, "bh"), 2.0);
+        assert_eq!(scalar(&s, "bw"), 3.0);
+
+        // mfilename('fullpath') inside a function.
+        std::fs::write(dir.join("mfp.m"), "function p = mfp()\np = mfilename('fullpath');\nend\n").unwrap();
+        s.run("mp = mfp();").unwrap();
+        assert!(matches!(s.get("mp"), Some(Value::Str(p)) if p.ends_with("mfp.m")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_calls_with_generous_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut s = Session::new();
+                s.run("a = sin(cos(0.5)); b = fileparts(fileparts('C:/a/b/c')); c = upper(lower('AbC'));").unwrap();
+                (
+                    s.get("a").and_then(|v| v.to_matrix().ok()).and_then(|m| m.as_scalar()),
+                    s.get("b").and_then(|v| match v {
+                        Value::Str(x) => Some(x.clone()),
+                        _ => None,
+                    }),
+                    s.get("c").and_then(|v| match v {
+                        Value::Str(x) => Some(x.clone()),
+                        _ => None,
+                    }),
+                )
+            })
+            .unwrap();
+        let (a, b, c) = handle.join().unwrap();
+        assert!((a.unwrap() - 0.769_196_354_841).abs() < 1e-9);
+        assert_eq!(b.as_deref(), Some("C:/a"));
+        assert_eq!(c.as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn xlsx_table_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let p1 = dir.join(format!("matcraft_xlsx_{}_{}.xlsx", std::process::id(), n));
+        let p2 = dir.join(format!("matcraft_xlsx_{}_{}_out.xlsx", std::process::id(), n));
+        let f1 = p1.to_string_lossy().replace('\\', "/");
+        let f2 = p2.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+
+        s.run(&format!("xlswrite('{f1}', [1 2; 3 4]); [num,txt,raw] = xlsread('{f1}');")).unwrap();
+        assert_eq!(s.get("num"), Some(&Value::Mat(Matrix::from_row_major(2, 2, &[1.0, 2.0, 3.0, 4.0]).unwrap())));
+        assert_eq!(
+            s.get("txt").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(4)
+        );
+        assert_eq!(
+            s.get("raw").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(4)
+        );
+
+        s.run(&format!("writecell({{1,'two'; 3,'four'}}, '{f1}'); C = readcell('{f1}'); v = C{{1,2}};")).unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Str("two".into())));
+
+        s.run(&format!(
+            "writecell({{'name','value'; 'A',1; 'B',2}}, '{f1}'); T = readtable('{f1}'); \
+             n1 = height(T); n2 = width(T); vn = T.Properties.VariableNames{{1}}; \
+             writetable(T, '{f2}'); T2 = readtable('{f2}');"
+        ))
+        .unwrap();
+        assert_eq!(s.get("n1"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("n2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("vn"), Some(&Value::Str("name".into())));
+        let t2value = match s.get("T2") {
+            Some(Value::Object(o)) => o.prop("value").and_then(|v| v.to_matrix().ok()),
+            _ => None,
+        };
+        assert_eq!(t2value.map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+
+        // Range writes and a second sheet, preserving the first.
+        s.run(&format!("xlswrite('{f1}', [9 8], 'Sheet1', 'B2'); xlswrite('{f1}', 5, 'Data');")).unwrap();
+        s.run(&format!("r = xlsread('{f1}', 'Sheet1', 'B2:C2'); d = xlsread('{f1}', 'Data'); s1 = xlsread('{f1}', 'Sheet1');")).unwrap();
+        assert_eq!(s.get("r").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![9.0, 8.0]));
+        assert_eq!(s.get("d"), Some(&Value::Num(5.0)));
+        let s1 = s.get("s1").and_then(|v| v.to_matrix().ok()).expect("Sheet1 numeric matrix");
+        assert_eq!(s1.shape(), (3, 3));
+        assert_eq!(s1.get(1, 1), Some(9.0));
+        assert_eq!(s1.get(1, 2), Some(8.0));
+        assert!(s1.get(0, 0).map(|v| v.is_nan()).unwrap_or(false));
+
+        // readtable option form.
+        s.run(&format!("T3 = readtable('{f1}', 'Sheet', 'Sheet1', 'ReadVariableNames', false); n3 = height(T3);")).unwrap();
+        assert_eq!(s.get("n3"), Some(&Value::Num(3.0)));
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn image_processing_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("A = zeros(1,1,3); A(1,1,1) = 1; g = rgb2gray(A);").unwrap();
+        assert!((scalar(&s, "g") - 0.298_936).abs() < 1e-6);
+
+        s.run("R = imresize([1 2; 3 4], [4 4], 'nearest');").unwrap();
+        assert_eq!(s.get("R").unwrap().dims(), (4, 4));
+        let r = vec(&s, "R");
+        assert_eq!(r[0], 1.0);
+        assert_eq!(r[15], 4.0);
+
+        s.run("H = fspecial('average', 3); F = imfilter(ones(3), H, 'replicate');").unwrap();
+        assert!(vec(&s, "F").iter().all(|v| (v - 1.0).abs() < 1e-12));
+
+        s.run("M = medfilt2([0 0 0; 0 9 0; 0 0 0]);").unwrap();
+        assert!(vec(&s, "M").iter().all(|v| *v == 0.0));
+
+        s.run("E = edge([0 0 1 1; 0 0 1 1; 0 0 1 1], 'sobel');").unwrap();
+        assert!(vec(&s, "E").contains(&1.0));
+        s.run("E0 = edge(ones(3), 'sobel');").unwrap();
+        assert!(vec(&s, "E0").iter().all(|v| *v == 0.0));
+
+        s.run("BW = [1 0; 0 1]; [L4, n4] = bwlabel(BW, 4); [L8, n8] = bwlabel(BW, 8);").unwrap();
+        assert_eq!(scalar(&s, "n4"), 2.0);
+        assert_eq!(scalar(&s, "n8"), 1.0);
+
+        s.run("L = bwlabel([1 1 0; 1 1 0; 0 0 1], 4); S = regionprops(L, {'Area','Centroid','BoundingBox'}); a1 = S(1).Area; c1 = S(1).Centroid; b2 = S(2).BoundingBox; a2 = S(2).Area;")
+            .unwrap();
+        assert_eq!(scalar(&s, "a1"), 4.0);
+        assert_eq!(vec(&s, "c1"), vec![1.5, 1.5]);
+        assert_eq!(vec(&s, "b2"), vec![2.5, 2.5, 1.0, 1.0]);
+        assert_eq!(scalar(&s, "a2"), 1.0);
+
+        s.run("t = graythresh([0 0 1 1]); B = imbinarize([0 0 1 1]);").unwrap();
+        assert!(scalar(&s, "t") > 0.0 && scalar(&s, "t") < 1.0);
+        assert_eq!(vec(&s, "B"), vec![0.0, 0.0, 1.0, 1.0]);
+
+        // Morphology: 3x3 square grows a single pixel, erodes a solid block.
+        s.run("P = zeros(5,5); P(3,3) = 1; D = imdilate(P, strel('square',3));").unwrap();
+        assert_eq!(s.get("D").unwrap().dims(), (5, 5));
+        assert_eq!(vec(&s, "D").iter().filter(|v| **v == 1.0).count(), 9);
+        assert_eq!(s.get("D").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+        s.run("Q = zeros(5,5); Q(2:4,2:4) = 1; E = imerode(Q, strel('square',3));").unwrap();
+        assert_eq!(vec(&s, "E").iter().filter(|v| **v == 1.0).count(), 1);
+        assert_eq!(s.get("E").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+
+        // Opening removes an isolated speck; closing fills a single-pixel hole.
+        s.run("Q(1,5) = 1; O = imopen(Q, strel('square',3));").unwrap();
+        assert_eq!(vec(&s, "O")[4], 0.0);
+        s.run("H = ones(5,5); H(3,3) = 0; Cc = imclose(H, strel('square',3));").unwrap();
+        assert_eq!(s.get("Cc").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+        s.run("Sd = strel('disk',1);").unwrap();
+        assert_eq!(s.get("Sd").unwrap().dims(), (3, 3));
+        assert_eq!(vec(&s, "Sd").iter().filter(|v| **v == 1.0).count(), 5);
+
+        // 90-degree rotation matches rot90, and crop uses 1-based pixel coordinates.
+        s.run("R = imrotate([1 2 3; 4 5 6], 90, 'nearest', 'loose'); Cr = imcrop([1 2 3 4; 5 6 7 8; 9 10 11 12; 13 14 15 16], [2 2 2 2]);").unwrap();
+        assert_eq!(s.get("R").unwrap().dims(), (3, 2));
+        assert_eq!(vec(&s, "R"), vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]);
+        assert_eq!(vec(&s, "Cr"), vec![6.0, 10.0, 7.0, 11.0]);
+
+        // Colour morphology keeps the third dimension.
+        s.run("A = zeros(3,3,3); A(:,:,1) = 1; A(:,:,2) = 0.5; Dr = imdilate(A, strel('square',3)); Rt = imrotate(A, 45, 'nearest');").unwrap();
+        assert_eq!(s.get("Dr").unwrap().dims_vec(), vec![3, 3, 3]);
+        assert_eq!(s.get("Rt").unwrap().dims_vec(), vec![4, 4, 3]);
+
+        // Bicubic resize (Keys a=-0.5) cross-checked against a SciPy-built
+        // reference implementation of the same cubic convolution.
+        s.run(
+            "A = [1 2 4; 8 16 32; 64 128 256]; B = imresize(A, 2, 'bicubic'); b11 = B(1,1); b22 = B(2,2); b33 = B(3,3); b16 = B(1,6); b66 = B(6,6);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "b11") - 0.472_107).abs() < 1e-5, "b11 = {}", scalar(&s, "b11"));
+        assert!((scalar(&s, "b22") - 1.282_715).abs() < 1e-5);
+        assert!((scalar(&s, "b33") - 4.373_535).abs() < 1e-5);
+        assert!((scalar(&s, "b16") - 2.102_661).abs() < 1e-5);
+        assert!((scalar(&s, "b66") - 281.303_711).abs() < 1e-4);
+
+        // Canny on a vertical step: a single one-pixel edge column.
+        s.run("I = zeros(10,10); I(:,6:10) = 1; E = edge(I, 'canny', [0.1 0.3], 1); ne = sum(E(:)); ec = sum(E(:,5));").unwrap();
+        assert!(scalar(&s, "ne") >= 8.0, "edge pixels = {}", scalar(&s, "ne"));
+        assert_eq!(scalar(&s, "ec"), scalar(&s, "ne"));
     }
 }

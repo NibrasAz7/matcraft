@@ -34,6 +34,26 @@ repeatable; each command prints its JSON result on its own line.
 ";
 
 fn main() -> ExitCode {
+    // The tree-walk interpreter recurses per expression node. Debug builds
+    // have large frames, so give it more stack than the default main thread
+    // (1 MiB on Windows) - corpus scripts routinely nest calls such as
+    // `fileparts(fileparts(mfilename('fullpath')))`.
+    match std::thread::Builder::new().name("matcraft".into()).stack_size(64 * 1024 * 1024).spawn(run_main) {
+        Ok(handle) => match handle.join() {
+            Ok(code) => code,
+            Err(_) => {
+                eprintln!("matcraft: internal error (panic)");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("matcraft: cannot start interpreter thread: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("run") | Some("eval") => {

@@ -11,7 +11,7 @@
 | Linear algebra | pure-Rust LU/QR/Cholesky/eig/SVD/pinv/cond/rank/rref/null/orth | faer-rs backend + complex eigensolver |
 | Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
 | Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh), imagesc/pie/contour, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
-| Toolboxes | DSP (`fft`/`ifft`/`filter`/`xcorr`/`freqz`/windows) | control/IO/optimization |
+| Toolboxes | DSP (`fft`/`ifft`/`filter`/`xcorr`/`freqz`/windows), optimization (`fminbnd`…`fmincon`/`patternsearch`/`ga`), control (`tf`/`ss`/`zpk`, MIMO/discrete `step`/`lsim`, `bode`/`margin`/`nyquist`/`pid`), statistics (distributions/`fitdist`, `regress`, `kmeans`, `ttest`/`kstest`/`adtest`/`pca`), xlsx/table + HDF5/NetCDF I/O, image processing incl. morphology | MIMO frequency arrays, HDF5 v2/chunked, Canny/bicubic, PCoA/UMAP and multiple-testing corrections |
 
 ## Phases
 
@@ -170,6 +170,159 @@
   `colormap` (parula/jet/hot/gray), `colorbar`, `caxis`/`clim`; PNG
   (resvg) and PDF (embedded raster) export via `saveas`/`exportgraphics`
   extension or `print -dsvg/-dpng/-dpdf`.
+- Optimization toolbox wave (2026-11): `fminbnd` (Brent), N-parameter
+  `fminsearch` (Nelder–Mead), `fminunc` (BFGS with central-difference
+  gradients), and `fsolve`/`lsqnonlin`/`lsqcurvefit` (Levenberg–Marquardt,
+  box bounds, jacobian + lambda outputs), all with MATLAB option aliases
+  (`MaxIterations`/`MaxIter`, `TolX`/`StepTolerance`, …) via
+  `optimset`/`optimoptions`. Tests cover the documented multi-output forms.
+  Second wave: `linprog`/`quadprog` on a shared primal-dual interior-point
+  solver (bounds folded into inequalities, `problem`-struct interface,
+  `lambda.ineqlin`/`eqlin`/`lower`/`upper`, active-set polish for accurate
+  degenerate bounds), exercised against the COBRA/kinetic-model corpus
+  call shapes.
+  Third wave: `fmincon` (SQP — linearised-constraint QP subproblems, BFGS
+  Lagrangian Hessian, L1 merit line search, `[c,ceq]` nonlinear
+  constraints, `problem` struct, `lambda.ineqnonlin`/`eqnonlin`) and
+  `patternsearch` (±coordinate + diagonal derivative-free polling, same
+  constraint set and merit function).
+- Control toolbox wave (2026-11): SISO `tf`/`ss`/`zpk` objects with native
+  `s = tf('s')` algebra, `tfdata`/`ssdata`/`zpkdata`, `pole`/`zero`/`dcgain`,
+  `series`/`parallel`/`feedback`, `tf2ss`/`ss2tf`, `step`/`impulse`/
+  `initial`/`lsim` via zero-order-hold state space on the new
+  `matcore::expm`, and `bode`/`freqresp`. `examples/control.m` tours the
+  interfaces.
+- Statistics toolbox wave (2026-11): `matcore::stats` — erf/erfc, Lanczos
+  `gammaln`, regularized incomplete gamma/beta, normal/exponential/uniform/
+  Poisson/Binomial PDF/CDF/inverses and inverse t/F CDFs. Builtins:
+  `norm*`/`exp*`/`unif*`/`pois*`/`bino*` (PDF/CDF/inverse), seeded
+  `exprnd`/`unifrnd`/`poissrnd`/`binornd`, `iqr`, `corrcoef` (R + p),
+  `regress` (b/residuals/R²/F/p), and `kmeans` (k-means++/Lloyd,
+  replicates, four distance metrics, singleton empty clusters).
+  `examples/stats.m` exercises the interfaces.
+- XLSX/table I/O wave (2026-11): a dependency-free `.xlsx` ZIP store/
+  reader (stored + deflated entries) and OpenXML reader/writer covering
+  shared strings, inline strings, numbers, booleans, A1 ranges and multiple
+  sheets. Builtins: `xlsread`/`xlswrite` (`[num,txt,raw]`, sheet/range),
+  `readcell`/`writecell`, `readtable`/`writetable` (class-tagged `table`
+  objects with `Properties.VariableNames` and per-variable fields),
+  `height`/`width`/`istable`, and `readmatrix`/`writematrix` dispatch for
+  `.xlsx`. `examples/xlsx_io.m` exercises the round trips.
+- Image-processing wave (2026-11): grayscale/RGB N-D image support with
+  `rgb2gray`, `imresize` (nearest/bilinear), `imfilter` (correlation/
+  convolution, same/full, four boundary modes), `medfilt2`, `edge`
+  (Sobel/Prewitt/Roberts), `bwlabel` (4/8 connectivity), `regionprops`
+  (Area/Centroid/BoundingBox/PixelIdxList/PixelList/Extent/EquivDiameter),
+  and Otsu `graythresh`/`imbinarize`. `examples/image_processing.m`
+  demonstrates the pipeline.
+- Control depth wave (2026-11): `pid(Kp,Ki,Kd[,Tf])`, `margin`
+  (`[Gm,Pm,Wcg,Wcp]` with unwrapped-phase interpolation), `nyquist`
+  (`[re,im,w]`), `isstable` (continuous poles or discrete `Ts` unit
+  circle), `damp` (`[wn,zeta,p]`, mapping discrete poles through
+  `log(z)/Ts`) and `bandwidth`. MIMO/discrete response wave: `ss` `step`/
+  `impulse` return N×p×m arrays, `lsim` accepts N×m inputs, `initial`
+  returns N×p, and `Ts > 0` uses the direct discrete recurrence instead of
+  the matrix exponential.
+- Genetic algorithm wave (2026-11): seeded real-valued `ga` with tournament
+  selection, blend crossover, Gaussian mutation, elitism, box bounds,
+  linear/nonlinear constraints (`nonlcon`), `problem` structs, and
+  `[x,fval,exitflag,output,population,scores]`; options include
+  `PopulationSize`, `MaxGenerations`, `MaxStallGenerations`,
+  `CrossoverFraction`, `EliteCount`, `InitialPopulation`.
+  `examples/ga.m` demonstrates it.
+- HDF5 v2/chunked wave (2026-11): reader support for superblocks v2/v3,
+  object headers v1/v2, link messages, compact/contiguous/chunked datasets,
+  fixed-array and B-tree v1/v2 chunk indexes, and shuffle/deflate/fletcher32
+  filters. Validated against h5py 3.16/HDF5 2.0 files with
+  `libver='earliest'` and `'latest'`, gzip, shuffle and B-tree v2 fixtures.
+- HDF5/NetCDF wave (2026-11): pure-Rust HDF5 v0 writer/reader (superblock
+  v0, object header v1, root symbol table/B-tree/local heap, contiguous
+  little-endian f64 datasets) validated against h5py in both directions;
+  NetCDF classic CDF-1 writer + CDF-1/2 reader (dimensions, numeric
+  variables, absent-list handling) validated against SciPy. Builtins:
+  `h5read`/`h5write`/`h5create`/`h5disp`, `ncread`/`ncwrite`/`ncinfo`/
+  `ncdisp`, with start/count/stride selection.
+- Hypothesis-test wave (2026-11): `ttest`/`ttest2` (Welch or pooled
+  variance, `Alpha`/`Tail`/`Vartype`), `kstest` (standard normal, function
+  handle or tabulated CDF), `adtest` (Anderson–Darling with
+  estimated-parameter p-value and critical values) and `pca`
+  (eigen-decomposition of the covariance, descending coefficients/scores/
+  latent roots, T², explained variance, `NumComponents`). Values
+  cross-checked against SciPy 1.16.
+- Distribution fit wave (2026-11): gamma/beta/chi-square/t/F PDF, CDF and
+  quantile kernels in `matcore::stats` (including digamma/trigamma),
+  `fitdist` for Normal/Exponential/Gamma/Beta/Poisson returning
+  `prob.*Distribution` objects, and `pdf`/`cdf`/`icdf`/`random` plus
+  `mean`/`std`/`var`/`median` dispatch on those objects. MLE values
+  cross-checked against SciPy 1.16.
+- Multivariate/multiple-testing wave (2026-11): `cmdscale`/`pcoa`
+  classical multidimensional scaling, `bonferroni`, `holm`, `sidak`,
+  `benjamini_hochberg` and `mafdr` p-value corrections, plus `signrank`
+  (exact small-sample distribution), `ranksum` (Mann–Whitney) and
+  `kruskalwallis`. Cross-checked against SciPy 1.16.
+- MIMO frequency wave (2026-11): `bode` returns real `p×m×N`
+  magnitude/phase arrays and `freqresp` a plain complex `(p*m)×N` matrix
+  (row `out*m+inp`) using `C(jwI-A)^-1B+D`; SISO shapes are unchanged.
+  Cross-checked against analytic diagonal and shared-input state-space
+  responses. `examples/control.m` demonstrates it.
+- Corpus compatibility wave (2026-11): MATLAB implicit expansion,
+  delimited-text `readtable`/`writetable`, table subsetting/`sortrows`/dot
+  assignment, cellstr `str2double`/`strcmp`, `erase`/`replace`,
+  `mfilename('fullpath')`, empty-cell `end+1` growth, `lines`/`validatecolor`,
+  `rectangle`/`patch`/`daspect`, figure property pairs and method-form
+  `findobj`, plus a 64 MB CLI interpreter stack for debug builds. Exercised
+  end-to-end on representative external M-code with real data.
+- Corpus class wave (2026-11): handle-based `inputParser` with
+  `addRequired`/`addOptional`/`addParameter`/`addParamValue`/`parse`,
+  validators, case-insensitive/unique-prefix matching and `KeepUnmatched`;
+  `string`/`strings`/`isstring` using scalar strings plus cellstr fallback;
+  `table` creation with identifier/default/explicit variable names and
+  `table2array`. Tests cover all paths, and `examples/corpus_classes.m`
+  demonstrates the workflow.
+- HDF5 chunked-writing wave (2026-11): the writer now emits superblock v3,
+  v2 object headers/link messages, chunked little-endian f64 datasets with
+  gzip-compressed chunks and fixed-array chunk indexes, plus Jenkins lookup3
+  metadata checksums. Round-trips are checked with the native reader and
+  h5py 3.16/HDF5 2.0 (multiple datasets, 100×100 multi-chunk grids, 1-D row
+  chunks, gzip/chunk metadata).
+- Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
+  column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
+  gradients, subpixel non-maximum suppression, double-threshold hysteresis,
+  optional sigma). Cross-checked against SciPy-built bicubic reference grids
+  and an independent vertical-step Canny test. `examples/image_processing.m`
+  demonstrates both.
+- Corpus file/shell wave (2026-11): persisted `savepath`/`path` search
+  paths, `addpath -begin/-end`, `dos`/`unix` shell aliases alongside
+  `system` and `!cmd`, dimensional `true`/`false`, and `xline`; regression
+  tests cover path persistence, shell output, globals across functions,
+  `mkdir`/`rmdir`, and `genpath`.
+- ANOVA wave (2026-11): `anova1` (matrix columns, cell groups, vector +
+  labels), `anova2` (with and without replication), `multcompare` (LSD,
+  Bonferroni, Sidak, Holm and finite-df Tukey–Kramer studentized range) and
+  `friedman` (with replication), with ANOVA cell tables and stats structs.
+  Checked against SciPy `f_oneway`, `friedmanchisquare` and closed-form
+  pairwise t comparisons. `examples/anova.m` tours it.
+- ODE wave (2026-11): `ode45` (adaptive Dormand–Prince 5(4)) and
+  `ode15s` (stiffly stable TR-BDF2 with step doubling and finite-difference
+  Newton Jacobians), `odeset`/`odeget`, scalar/vector tolerances, `MaxStep`,
+  `InitialStep`, `MaxIterations`, `NonNegative`, and cubic-Hermite output
+  interpolation. Checked against closed-form decay/oscillator/stiff
+  solutions and SciPy BDF on Robertson kinetics. `examples/ode.m` tours it.
+- Corpus-compatibility wave (2026-11): mined representative external
+  M-code corpora for missing generic helpers, adding `contains`,
+  `startsWith`, `endsWith`,
+  `strsplit`, `strjoin`, `strlength`, `fileread`, `isfolder`, `rows`,
+  `array2table` and `ismissing`. `examples/corpus_helpers.m` exercises them.
+- Manifold wave (2026-11): dependency-free `umap` — fuzzy k-nearest
+  neighbour graph, per-point bandwidth calibration, symmetrised weights,
+  `1/(1+a x^(2b))` curve fit, seeded random initialisation and negative-
+  sampled cross-entropy SGD. Options for neighbours, minimum distance,
+  components and epochs. `examples/stats.m` demonstrates it on two clusters.
+- Morphology wave (2026-11): grayscale/binary/RGB `imdilate`, `imerode`,
+  `imopen`, `imclose` with `strel` (`square`, `rectangle`, `disk`,
+  `diamond`, `line`, `arbitrary`), nearest/bilinear `imrotate` with
+  loose/crop bounding boxes, and `imcrop`. `examples/image_processing.m`
+  exercises the operations.
 - Wild-corpus sweep (2025-10): 638 real-world `.m` files pulled from 32
   GitHub repos across 8 domains, all last-pushed pre-2022; run through
   `matcraft-cli run` (see `docs/wild-corpus.md`). Findings fixed this

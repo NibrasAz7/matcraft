@@ -313,7 +313,27 @@ impl CMatrix {
         if let Some(s) = self.as_scalar() {
             return Ok(other.map(|b| f(s, b)));
         }
-        self.elemwise(other, f)
+        if self.shape() == other.shape() {
+            return self.elemwise(other, f);
+        }
+        let rows = self.rows.max(other.rows);
+        let cols = self.cols.max(other.cols);
+        if (self.rows != rows && self.rows != 1)
+            || (self.cols != cols && self.cols != 1)
+            || (other.rows != rows && other.rows != 1)
+            || (other.cols != cols && other.cols != 1)
+        {
+            return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
+        }
+        let mut out = CMatrix::zeros(rows, cols);
+        for c in 0..cols {
+            for r in 0..rows {
+                let a = self.get(if self.rows == 1 { 0 } else { r }, if self.cols == 1 { 0 } else { c }).unwrap_or(CNum::real(0.0));
+                let b = other.get(if other.rows == 1 { 0 } else { r }, if other.cols == 1 { 0 } else { c }).unwrap_or(CNum::real(0.0));
+                let _ = out.set(r, c, f(a, b));
+            }
+        }
+        Ok(out)
     }
 
     /// Complex matrix multiply: (m×k)·(k×n); scalars broadcast.

@@ -34,7 +34,7 @@ pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
 /// functions` so both print the same catalogue. A test in this module keeps
 /// it in lock-step with `matlang::BUILTIN_NAMES`.
 pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
-    ("construction", "zeros ones eye magic peaks rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
+    ("construction", "zeros ones true false eye magic peaks rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
     ("size/shape", "size numel length ndims reshape squeeze transpose ctranspose repmat flip permute ipermute shiftdim repelem ndgrid"),
     ("matrix ops", "diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90 meshgrid"),
     ("indexing", "ind2sub sub2ind accumarray bsxfun"),
@@ -52,7 +52,33 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("complex", "complex real imag conj angle"),
     ("poly/signal", "polyval polyfit roots poly conv deconv interp1 trapz histcounts"),
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls fir1"),
-    ("solvers", "fzero fminsearch integral quad optimset optimget"),
+    (
+        "solvers",
+        "fzero fminbnd fminsearch fminunc fsolve lsqnonlin lsqcurvefit linprog quadprog fmincon patternsearch ga integral quad optimset optimoptions optimget",
+    ),
+    (
+        "control",
+        "tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid margin nyquist isstable damp bandwidth",
+    ),
+    (
+        "statistics",
+        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap",
+    ),
+    ("ode", "ode45 ode15s odeset odeget"),
+    (
+        "corpus classes",
+        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array",
+    ),
+    ("anova", "anova1 anova2 multcompare friedman"),
+    (
+        "xlsx/table",
+        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace",
+    ),
+    ("hdf5/netcdf", "h5read h5write h5create h5disp ncread ncwrite ncinfo ncdisp"),
+    (
+        "image processing",
+        "rgb2gray imresize imfilter medfilt2 edge bwlabel regionprops graythresh imbinarize imdilate imerode imopen imclose imrotate imcrop strel",
+    ),
     ("function handles", "feval func2str str2func functions arrayfun cellfun inline"),
     ("objects", "isobject methods properties"),
     ("debugging", "dbstop dbclear dbcont dbstatus dbstep dbquit run"),
@@ -60,12 +86,15 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("text scan", "fscanf sscanf textscan strread dlmread dlmwrite csvwrite readmatrix writematrix"),
     ("file io", "fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets delete copyfile movefile rmdir"),
     ("dates", "now clock datenum datestr etime"),
-    ("system", "version computer ispc isunix ismac getenv setenv system ver license beep"),
+    ("system", "version computer ispc isunix ismac getenv setenv system dos unix ver license beep"),
     ("graphics objects", "get set drawnow waitbar gca ishandle findobj findall ishold"),
     ("image io", "imread imwrite im2double fspecial"),
     ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc global persistent import argv"),
-    ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir"),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image imshow text pie contour plot3 surf mesh vline saveas exportgraphics print"),
+    (
+        "files/path",
+        "save load type addpath rmpath savepath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir",
+    ),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch pie contour plot3 surf mesh vline xline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.
