@@ -655,8 +655,22 @@ struct H5Filter {
 
 enum H5Layout {
     Compact(Vec<u8>),
-    Contiguous { addr: usize, size: usize },
-    Chunked { rank: usize, chunk_dims: Vec<usize>, elem_size: usize, index: H5ChunkIndex },
+    Contiguous {
+        addr: usize,
+        size: usize,
+    },
+    Chunked {
+        rank: usize,
+        chunk_dims: Vec<usize>,
+        elem_size: usize,
+        index: H5ChunkIndex,
+    },
+    /// Virtual storage: a global-heap address plus object index holding the
+    /// mapping list.
+    Virtual {
+        addr: usize,
+        index: usize,
+    },
 }
 
 enum H5ChunkIndex {
@@ -664,6 +678,7 @@ enum H5ChunkIndex {
     BTreeV1 { addr: usize },
     Single { addr: usize, filtered_size: Option<usize>, mask: u32 },
     Implicit { addr: usize },
+    ExtensibleArray { addr: usize },
     BTreeV2 { addr: usize, version: u8 },
     Unsupported(u8),
 }
@@ -697,10 +712,32 @@ fn len_at(b: &[u8], p: usize, ctx: H5Ctx) -> usize {
 
 pub(crate) fn read(path: &std::path::Path) -> Result<H5File, LangError> {
     let bytes = std::fs::read(path).map_err(|e| LangError::new(format!("hdf5: cannot read {}: {e}", path.display()), 0))?;
-    read_bytes(&bytes)
+    let base = path.parent().map(|p| p.to_path_buf());
+    read_bytes_with(&bytes, base, 0)
 }
 
+#[cfg(test)]
 pub(crate) fn read_bytes(b: &[u8]) -> Result<H5File, LangError> {
+    read_bytes_with(b, None, 0)
+}
+
+#[derive(Clone, Default)]
+struct H5ReadCtx {
+    /// Directory used to resolve relative virtual-dataset source files.
+    base: Option<std::path::PathBuf>,
+    /// VDS resolution depth, so a self-referential mapping cannot recurse
+    /// forever.
+    depth: usize,
+    /// When false, virtual layouts are skipped (used for same-file source
+    /// lookups, which must not re-enter the VDS being resolved).
+    follow_virtual: bool,
+}
+
+fn read_bytes_with(b: &[u8], base: Option<std::path::PathBuf>, depth: usize) -> Result<H5File, LangError> {
+    read_bytes_opts(b, base, depth, true)
+}
+
+fn read_bytes_opts(b: &[u8], base: Option<std::path::PathBuf>, depth: usize, follow_virtual: bool) -> Result<H5File, LangError> {
     let (sb, version) = if b.get(0..8) == Some(b"\x89HDF\r\n\x1a\n") {
         (0usize, *b.get(8).ok_or_else(|| LangError::new("hdf5: truncated superblock", 0))?)
     } else if b.get(512..520) == Some(b"\x89HDF\r\n\x1a\n") {
@@ -708,23 +745,24 @@ pub(crate) fn read_bytes(b: &[u8]) -> Result<H5File, LangError> {
     } else {
         return Err(LangError::new("hdf5: bad HDF5 signature", 0));
     };
+    let rctx = H5ReadCtx { base, depth, follow_virtual };
     match version {
         0 | 1 => {
             let ctx =
                 H5Ctx { offset_size: b.get(sb + 13).copied().unwrap_or(8) as usize, length_size: b.get(sb + 14).copied().unwrap_or(8) as usize };
             let root_oh = off_at(b, sb + 64, ctx);
-            read_root_v1(b, ctx, root_oh)
+            read_root_v1(b, ctx, root_oh, &rctx)
         }
         2 | 3 => {
             let ctx = H5Ctx { offset_size: b.get(sb + 9).copied().unwrap_or(8) as usize, length_size: b.get(sb + 10).copied().unwrap_or(8) as usize };
             let root_oh = off_at(b, sb + 36, ctx);
-            read_root_v2(b, ctx, root_oh)
+            read_root_v2(b, ctx, root_oh, &rctx)
         }
         other => Err(LangError::new(format!("hdf5: unsupported superblock version {other}"), 0)),
     }
 }
 
-fn read_root_v1(b: &[u8], ctx: H5Ctx, root_oh: usize) -> Result<H5File, LangError> {
+fn read_root_v1(b: &[u8], ctx: H5Ctx, root_oh: usize, rctx: &H5ReadCtx) -> Result<H5File, LangError> {
     let mut file = H5File::default();
     let mut symbols = Vec::new();
     let mut heap_addr = 0usize;
@@ -738,7 +776,7 @@ fn read_root_v1(b: &[u8], ctx: H5Ctx, root_oh: usize) -> Result<H5File, LangErro
     })?;
     if btree_addr == 0 || heap_addr == 0 {
         // Superblock v0 files can still use a v2-style root group.
-        return read_root_v2(b, ctx, root_oh);
+        return read_root_v2(b, ctx, root_oh, rctx);
     }
     let entries = u16_at(b, btree_addr + 6).unwrap_or(0) as usize;
     for i in 0..entries {
@@ -759,14 +797,14 @@ fn read_root_v1(b: &[u8], ctx: H5Ctx, root_oh: usize) -> Result<H5File, LangErro
             end += 1;
         }
         let name = String::from_utf8_lossy(b.get(start..end).unwrap_or(&[])).to_string();
-        if let Some(ds) = parse_dataset(b, ctx, oh, name)? {
+        if let Some(ds) = parse_dataset(b, ctx, rctx, oh, name)? {
             file.datasets.push(ds);
         }
     }
     Ok(file)
 }
 
-fn read_root_v2(b: &[u8], ctx: H5Ctx, root_oh: usize) -> Result<H5File, LangError> {
+fn read_root_v2(b: &[u8], ctx: H5Ctx, root_oh: usize, rctx: &H5ReadCtx) -> Result<H5File, LangError> {
     let mut file = H5File::default();
     let mut links: Vec<(String, usize)> = Vec::new();
     walk_object_header(b, root_oh, ctx, &mut |typ, data, _| {
@@ -781,7 +819,7 @@ fn read_root_v2(b: &[u8], ctx: H5Ctx, root_oh: usize) -> Result<H5File, LangErro
         return Err(LangError::new("hdf5: root group has no links", 0));
     }
     for (name, oh) in links {
-        if let Some(ds) = parse_dataset(b, ctx, oh, name)? {
+        if let Some(ds) = parse_dataset(b, ctx, rctx, oh, name)? {
             file.datasets.push(ds);
         }
     }
@@ -982,7 +1020,10 @@ fn parse_layout(data: &[u8], ctx: H5Ctx, expected_rank: usize) -> Result<H5Layou
                         p += 1;
                         H5ChunkIndex::FixedArray { addr: read_uint(data, p, ctx.offset_size).unwrap_or(0) as usize }
                     }
-                    4 => H5ChunkIndex::Unsupported(4),
+                    4 => {
+                        p += 5; // max bits, index elements, min pointers, min elements, page bits
+                        H5ChunkIndex::ExtensibleArray { addr: read_uint(data, p, ctx.offset_size).unwrap_or(0) as usize }
+                    }
                     5 => {
                         p += 6; // node size, split %, merge %
                         H5ChunkIndex::BTreeV2 { addr: read_uint(data, p, ctx.offset_size).unwrap_or(0) as usize, version }
@@ -994,7 +1035,12 @@ fn parse_layout(data: &[u8], ctx: H5Ctx, expected_rank: usize) -> Result<H5Layou
                 Err(LangError::new(format!("hdf5: unsupported chunked layout version {version}"), 0))
             }
         }
-        _ => Err(LangError::new("hdf5: virtual layouts are not supported", 0)),
+        3 if version == 4 => {
+            let addr = read_uint(data, 2, ctx.offset_size).unwrap_or(0) as usize;
+            let index = u32_at(data, 2 + ctx.offset_size).unwrap_or(0) as usize;
+            Ok(H5Layout::Virtual { addr, index })
+        }
+        _ => Err(LangError::new("hdf5: unsupported data layout", 0)),
     }
 }
 
@@ -1039,8 +1085,9 @@ fn parse_filters(data: &[u8]) -> Result<Vec<H5Filter>, LangError> {
     Ok(filters)
 }
 
-fn parse_dataset(b: &[u8], ctx: H5Ctx, addr: usize, name: String) -> Result<Option<H5Dataset>, LangError> {
+fn parse_dataset(b: &[u8], ctx: H5Ctx, rctx: &H5ReadCtx, addr: usize, name: String) -> Result<Option<H5Dataset>, LangError> {
     let mut dims: Vec<usize> = Vec::new();
+    let mut max_dims: Vec<usize> = Vec::new();
     let mut kind = 0u8;
     let mut size = 0usize;
     let mut layout_raw: Option<Vec<u8>> = None;
@@ -1049,9 +1096,18 @@ fn parse_dataset(b: &[u8], ctx: H5Ctx, addr: usize, name: String) -> Result<Opti
         if typ == 0x0001 {
             let version = b.get(data.start).copied().unwrap_or(1);
             let rank = b.get(data.start + 1).copied().unwrap_or(0) as usize;
+            let flags = b.get(data.start + 2).copied().unwrap_or(0);
             let base = if version >= 2 { 4 } else { 8 };
+            if rank > 32 {
+                return Err(LangError::new("hdf5: dataspace rank is too large", 0));
+            }
             for i in 0..rank {
                 dims.push(read_uint(b, data.start + base + i * 8, 8).unwrap_or(0) as usize);
+            }
+            if flags & 0x01 != 0 {
+                for i in 0..rank {
+                    max_dims.push(read_uint(b, data.start + base + rank * 8 + i * 8, 8).unwrap_or(0) as usize);
+                }
             }
         } else if typ == 0x0003 {
             kind = b.get(data.start).copied().unwrap_or(0) & 0x0F;
@@ -1071,6 +1127,9 @@ fn parse_dataset(b: &[u8], ctx: H5Ctx, addr: usize, name: String) -> Result<Opti
         None => None,
     };
     let count = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    if count > 50_000_000 {
+        return Err(LangError::new("hdf5: dataset is too large to read into memory", 0));
+    }
     let data = match layout {
         Some(H5Layout::Compact(ref raw)) => decode_values(raw, count, kind, size),
         Some(H5Layout::Contiguous { addr, size: nbytes }) => {
@@ -1079,7 +1138,13 @@ fn parse_dataset(b: &[u8], ctx: H5Ctx, addr: usize, name: String) -> Result<Opti
         }
         Some(H5Layout::Chunked { rank, chunk_dims, elem_size, index }) => {
             let elem = if elem_size == 0 { size } else { elem_size };
-            read_chunks(b, ctx, &dims, rank, &chunk_dims, elem, kind, size, &index, &filters)?
+            read_chunks(b, ctx, &dims, &max_dims, rank, &chunk_dims, elem, kind, size, &index, &filters)?
+        }
+        Some(H5Layout::Virtual { addr, index }) => {
+            if !rctx.follow_virtual {
+                return Ok(None);
+            }
+            read_virtual(b, ctx, rctx, addr, index, &dims)?
         }
         None => return Ok(None),
     };
@@ -1127,6 +1192,7 @@ fn read_chunks(
     b: &[u8],
     ctx: H5Ctx,
     dims: &[usize],
+    max_dims: &[usize],
     rank: usize,
     chunk_dims: &[usize],
     elem_size: usize,
@@ -1141,6 +1207,9 @@ fn read_chunks(
     let chunk_elems = chunk_dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
     let raw_size = chunk_elems.saturating_mul(elem_size);
     let grid = chunk_dims.iter().zip(dims).fold(1usize, |a, (&c, &d)| a.saturating_mul(d.div_ceil(c.max(1))));
+    if grid > 10_000_000 {
+        return Err(LangError::new("hdf5: chunk grid is too large to index", 0));
+    }
     let mut records: Vec<H5ChunkRecord> = Vec::new();
     match index {
         H5ChunkIndex::FixedArray { addr } => collect_fixed_array(b, ctx, *addr, grid, rank, dims, chunk_dims, elem_size, raw_size, &mut records)?,
@@ -1157,6 +1226,9 @@ fn read_chunks(
                     mask: 0,
                 });
             }
+        }
+        H5ChunkIndex::ExtensibleArray { addr } => {
+            collect_extensible_array(b, ctx, *addr, grid, rank, dims, max_dims, chunk_dims, raw_size, &mut records)?
         }
         H5ChunkIndex::BTreeV2 { addr, version } => collect_btree_v2(b, ctx, *addr, rank, *version, chunk_dims, raw_size, elem_size, &mut records)?,
         H5ChunkIndex::Unsupported(t) => return Err(LangError::new(format!("hdf5: chunk index type {t} is not supported"), 0)),
@@ -1247,6 +1319,257 @@ fn collect_fixed_array(
         }
     }
     let _ = elem_size;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct EaHeader {
+    client: u8,
+    elem_size: usize,
+    max_bits: usize,
+    idx_el: usize,
+    min_el: usize,
+    sup_min: usize,
+    page_bits: usize,
+    idx_addr: usize,
+}
+
+#[derive(Clone, Copy)]
+struct EaSblk {
+    ndblks: usize,
+    dblk_nelmts: usize,
+    start_idx: usize,
+    start_dblk: usize,
+}
+
+struct EaGeometry {
+    idx_el: usize,
+    min_el: usize,
+    page_nelmts: usize,
+    iblock_nsblks: usize,
+    ndblk_addrs: usize,
+    nsblk_addrs: usize,
+    sblk: Vec<EaSblk>,
+}
+
+impl EaGeometry {
+    fn new(h: &EaHeader) -> Result<Self, LangError> {
+        if h.min_el == 0 || !h.min_el.is_power_of_two() {
+            return Err(LangError::new("hdf5: invalid extensible-array data-block size", 0));
+        }
+        if h.sup_min == 0 || !h.sup_min.is_power_of_two() {
+            return Err(LangError::new("hdf5: invalid extensible-array super-block pointers", 0));
+        }
+        let min_bits = h.min_el.trailing_zeros() as usize;
+        if h.max_bits < min_bits || h.max_bits > 64 || h.page_bits >= 64 {
+            return Err(LangError::new("hdf5: invalid extensible-array header parameters", 0));
+        }
+        let nsblks = h.max_bits - min_bits + 1;
+        let iblock_nsblks = 2 * h.sup_min.trailing_zeros() as usize;
+        if iblock_nsblks > nsblks {
+            return Err(LangError::new("hdf5: extensible-array super-block geometry is invalid", 0));
+        }
+        let mut sblk = Vec::with_capacity(nsblks);
+        let mut start_idx = 0usize;
+        let mut start_dblk = 0usize;
+        for u in 0..nsblks {
+            let ndblks = 1usize.checked_shl((u / 2) as u32).ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?;
+            let factor = 1usize.checked_shl(u.div_ceil(2) as u32).ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?;
+            let dblk_nelmts = factor.checked_mul(h.min_el).ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?;
+            sblk.push(EaSblk { ndblks, dblk_nelmts, start_idx, start_dblk });
+            start_idx = start_idx
+                .checked_add(ndblks.checked_mul(dblk_nelmts).ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?)
+                .ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?;
+            start_dblk = start_dblk.checked_add(ndblks).ok_or_else(|| LangError::new("hdf5: extensible-array is too large", 0))?;
+        }
+        Ok(EaGeometry {
+            idx_el: h.idx_el,
+            min_el: h.min_el,
+            page_nelmts: 1usize << h.page_bits.min(62),
+            iblock_nsblks,
+            ndblk_addrs: 2 * (h.sup_min - 1),
+            nsblk_addrs: nsblks - iblock_nsblks,
+            sblk,
+        })
+    }
+
+    fn locate(&self, index: usize) -> Option<(usize, usize, usize, usize)> {
+        if index < self.idx_el {
+            return None;
+        }
+        let e = index - self.idx_el;
+        let sblk_idx = (e / self.min_el).checked_add(1)?.ilog2() as usize;
+        let s = self.sblk.get(sblk_idx)?;
+        let elmt = e.checked_sub(s.start_idx)?;
+        let local_dblk = elmt / s.dblk_nelmts.max(1);
+        let offset = elmt % s.dblk_nelmts.max(1);
+        (local_dblk < s.ndblks).then_some((sblk_idx, local_dblk, offset, s.dblk_nelmts))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EaElement {
+    addr: usize,
+    nbytes: usize,
+    mask: u32,
+}
+
+fn read_ea_header(b: &[u8], ctx: H5Ctx, addr: usize) -> Result<EaHeader, LangError> {
+    let s = b.get(addr..addr + 12).ok_or_else(|| LangError::new("hdf5: extensible-array header is truncated", 0))?;
+    if s.get(0..4) != Some(b"EAHD") || s.get(4) != Some(&0) {
+        return Err(LangError::new("hdf5: invalid extensible-array header", 0));
+    }
+    let h = EaHeader {
+        client: s.get(5).copied().unwrap_or(0),
+        elem_size: s.get(6).copied().unwrap_or(0) as usize,
+        max_bits: s.get(7).copied().unwrap_or(0) as usize,
+        idx_el: s.get(8).copied().unwrap_or(0) as usize,
+        min_el: s.get(9).copied().unwrap_or(0) as usize,
+        sup_min: s.get(10).copied().unwrap_or(0) as usize,
+        page_bits: s.get(11).copied().unwrap_or(0) as usize,
+        idx_addr: off_at(b, addr + 12 + 6 * ctx.length_size, ctx),
+    };
+    let min_elem = if h.client == 1 { ctx.offset_size + 4 } else { ctx.offset_size };
+    if h.client > 1 || h.elem_size < min_elem || h.idx_el == 0 || h.idx_addr == 0 || h.idx_addr == usize::MAX {
+        return Err(LangError::new("hdf5: invalid extensible-array header parameters", 0));
+    }
+    Ok(h)
+}
+
+fn read_ea_element(b: &[u8], off: usize, h: &EaHeader, ctx: H5Ctx, raw_size: usize) -> Option<EaElement> {
+    let bytes = b.get(off..off.checked_add(h.elem_size)?)?;
+    if bytes.iter().all(|&v| v == 0xFF) {
+        return None;
+    }
+    let addr = read_uint(bytes, 0, ctx.offset_size)? as usize;
+    if addr == 0 || addr == usize::MAX {
+        return None;
+    }
+    if h.client == 0 {
+        return Some(EaElement { addr, nbytes: raw_size, mask: 0 });
+    }
+    let size_len = h.elem_size.checked_sub(ctx.offset_size + 4)?;
+    if size_len == 0 {
+        return None;
+    }
+    let nbytes = read_uint(bytes, ctx.offset_size, size_len)? as usize;
+    let mask = u32_at(bytes, ctx.offset_size + size_len)?;
+    (nbytes > 0).then_some(EaElement { addr, nbytes, mask })
+}
+
+fn ea_chunk_offsets(index: usize, rank: usize, dims: &[usize], max_dims: &[usize], chunk_dims: &[usize]) -> Vec<usize> {
+    let unlimited = max_dims.iter().position(|&m| m == usize::MAX || m == u64::MAX as usize);
+    let Some(u) = unlimited.filter(|&u| u < rank) else {
+        return chunk_offsets(index, rank, dims, chunk_dims);
+    };
+    let mut rem = index;
+    let mut offs = vec![0usize; rank];
+    for d in (0..rank).rev() {
+        if d == u {
+            continue;
+        }
+        let c = chunk_dims.get(d).copied().unwrap_or(1).max(1);
+        let n = dims.get(d).copied().unwrap_or(0).div_ceil(c).max(1);
+        if let Some(slot) = offs.get_mut(d) {
+            *slot = (rem % n).saturating_mul(c);
+        }
+        rem /= n;
+    }
+    if let Some(slot) = offs.get_mut(u) {
+        *slot = rem.saturating_mul(chunk_dims.get(u).copied().unwrap_or(1));
+    }
+    offs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_extensible_array(
+    b: &[u8],
+    ctx: H5Ctx,
+    header_addr: usize,
+    grid: usize,
+    rank: usize,
+    dims: &[usize],
+    max_dims: &[usize],
+    chunk_dims: &[usize],
+    raw_size: usize,
+    out: &mut Vec<H5ChunkRecord>,
+) -> Result<(), LangError> {
+    let h = read_ea_header(b, ctx, header_addr)?;
+    let geo = EaGeometry::new(&h)?;
+    if h.idx_el.saturating_add(geo.sblk.last().map(|s| s.start_idx.saturating_add(s.ndblks.saturating_mul(s.dblk_nelmts))).unwrap_or(0)) < grid {
+        return Err(LangError::new("hdf5: extensible-array does not cover the dataset", 0));
+    }
+    let idx = h.idx_addr;
+    if b.get(idx..idx + 4) != Some(b"EAIB") {
+        return Err(LangError::new("hdf5: extensible-array index block is missing", 0));
+    }
+    let elems_start = idx + 6 + ctx.offset_size;
+    for i in 0..h.idx_el.min(grid) {
+        let off = elems_start.saturating_add(i.saturating_mul(h.elem_size));
+        if let Some(el) = read_ea_element(b, off, &h, ctx, raw_size) {
+            out.push(H5ChunkRecord {
+                offset: ea_chunk_offsets(i, rank, dims, max_dims, chunk_dims),
+                addr: el.addr,
+                nbytes: el.nbytes,
+                mask: el.mask,
+            });
+        }
+    }
+    let dblk_base = elems_start.saturating_add(h.idx_el.saturating_mul(h.elem_size));
+    let dblk_addrs: Vec<usize> = (0..geo.ndblk_addrs).map(|i| off_at(b, dblk_base + i * ctx.offset_size, ctx)).collect();
+    let sblk_base = dblk_base.saturating_add(geo.ndblk_addrs.saturating_mul(ctx.offset_size));
+    let sblk_addrs: Vec<usize> = (0..geo.nsblk_addrs).map(|i| off_at(b, sblk_base + i * ctx.offset_size, ctx)).collect();
+    let bo_size = h.max_bits.div_ceil(8).max(1);
+    for index in h.idx_el..grid {
+        let Some((sblk_idx, local_dblk, offset_in_dblk, dblk_nelmts)) = geo.locate(index) else {
+            continue;
+        };
+        let addr = if sblk_idx < geo.iblock_nsblks {
+            let Some(&s) = geo.sblk.get(sblk_idx) else { continue };
+            dblk_addrs.get(s.start_dblk + local_dblk).copied().unwrap_or(0)
+        } else {
+            let s_off = sblk_idx - geo.iblock_nsblks;
+            let Some(&sblk_addr) = sblk_addrs.get(s_off) else { continue };
+            if sblk_addr == 0 || sblk_addr == usize::MAX {
+                continue;
+            }
+            let s = geo.sblk.get(sblk_idx).copied().unwrap_or(EaSblk { ndblks: 0, dblk_nelmts: 0, start_idx: 0, start_dblk: 0 });
+            let paged = dblk_nelmts > geo.page_nelmts;
+            let pages = if paged { dblk_nelmts / geo.page_nelmts } else { 0 };
+            let bitmap = s.ndblks.saturating_mul(pages.div_ceil(8));
+            let addr_off = sblk_addr + 6 + ctx.offset_size + bo_size + if paged { bitmap } else { 0 };
+            off_at(b, addr_off + local_dblk * ctx.offset_size, ctx)
+        };
+        if addr == 0 || addr == usize::MAX {
+            continue;
+        }
+        if b.get(addr..addr + 4) != Some(b"EADB") {
+            continue;
+        }
+        let paged = dblk_nelmts > geo.page_nelmts;
+        let elem_off = if paged {
+            let pages = dblk_nelmts / geo.page_nelmts;
+            let bitmap_len = pages.div_ceil(8);
+            let page = offset_in_dblk / geo.page_nelmts;
+            let in_page = offset_in_dblk % geo.page_nelmts;
+            let bitmap_off = addr + 6 + ctx.offset_size + bo_size;
+            if page >= pages || b.get(bitmap_off + page / 8).map(|v| v & (1u8 << (page % 8)) == 0).unwrap_or(true) {
+                continue;
+            }
+            let page_size = geo.page_nelmts.saturating_mul(h.elem_size).saturating_add(4);
+            addr + 6 + ctx.offset_size + bo_size + bitmap_len + page.saturating_mul(page_size) + in_page.saturating_mul(h.elem_size)
+        } else {
+            addr + 6 + ctx.offset_size + bo_size + offset_in_dblk.saturating_mul(h.elem_size)
+        };
+        if let Some(el) = read_ea_element(b, elem_off, &h, ctx, raw_size) {
+            out.push(H5ChunkRecord {
+                offset: ea_chunk_offsets(index, rank, dims, max_dims, chunk_dims),
+                addr: el.addr,
+                nbytes: el.nbytes,
+                mask: el.mask,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1455,6 +1778,389 @@ fn unshuffle(data: &[u8], elem_size: usize) -> Vec<u8> {
     out
 }
 
+#[derive(Clone)]
+enum VdsSelection {
+    None,
+    All,
+    Points(Vec<Vec<u64>>),
+    Regular(Vec<(u64, u64, u64, u64)>),
+    Blocks(Vec<(Vec<u64>, Vec<u64>)>),
+}
+
+struct VdsMapping {
+    source_file: String,
+    source_dataset: String,
+    source_selection: VdsSelection,
+    virtual_selection: VdsSelection,
+}
+
+const MAX_VDS_ELEMENTS: usize = 50_000_000;
+
+fn vds_take_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+    let v = u32_at(data, *pos)?;
+    *pos += 4;
+    Some(v)
+}
+
+fn vds_take_uint(data: &[u8], pos: &mut usize, size: usize) -> Option<u64> {
+    let v = read_uint(data, *pos, size)?;
+    *pos += size;
+    Some(v)
+}
+
+fn vds_take_cstr(data: &[u8], pos: &mut usize) -> Option<String> {
+    let start = *pos;
+    let end = data.get(start..)?.iter().position(|&b| b == 0).map(|n| start + n)?;
+    *pos = end + 1;
+    Some(String::from_utf8_lossy(data.get(start..end)?).to_string())
+}
+
+/// Parse one serialized dataspace selection. The wire form is a 32-bit
+/// selection type, a 32-bit version, then a type-specific body (HDF5's
+/// `H5S_select_deserialize`).
+fn parse_vds_selection(data: &[u8], pos: &mut usize) -> Result<VdsSelection, LangError> {
+    let sel_type = vds_take_u32(data, pos).ok_or_else(|| LangError::new("hdf5: virtual selection is truncated", 0))?;
+    let version = vds_take_u32(data, pos).ok_or_else(|| LangError::new("hdf5: virtual selection is truncated", 0))?;
+    match sel_type {
+        0 | 3 => {
+            if version > 1 {
+                return Err(LangError::new("hdf5: unsupported virtual selection version", 0));
+            }
+            *pos = pos.saturating_add(8);
+            Ok(if sel_type == 3 { VdsSelection::All } else { VdsSelection::None })
+        }
+        1 => {
+            let enc = if version == 2 {
+                let e = *data.get(*pos).ok_or_else(|| LangError::new("hdf5: virtual point selection is truncated", 0))? as usize;
+                *pos += 1;
+                e
+            } else {
+                *pos = pos.saturating_add(4 + 4);
+                4
+            };
+            if !matches!(enc, 1 | 2 | 4 | 8) {
+                return Err(LangError::new("hdf5: invalid virtual point-selection width", 0));
+            }
+            let rank = vds_take_u32(data, pos).ok_or_else(|| LangError::new("hdf5: virtual point selection is truncated", 0))? as usize;
+            if rank == 0 || rank > 32 {
+                return Err(LangError::new("hdf5: invalid virtual point-selection rank", 0));
+            }
+            let n = vds_take_uint(data, pos, enc).unwrap_or(0) as usize;
+            if n > MAX_VDS_ELEMENTS || n.saturating_mul(rank).saturating_mul(enc) > data.len().saturating_sub(*pos) {
+                return Err(LangError::new("hdf5: virtual point selection is too large", 0));
+            }
+            let mut points = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut p = Vec::with_capacity(rank);
+                for _ in 0..rank {
+                    p.push(vds_take_uint(data, pos, enc).ok_or_else(|| LangError::new("hdf5: virtual point selection is truncated", 0))?);
+                }
+                points.push(p);
+            }
+            Ok(VdsSelection::Points(points))
+        }
+        2 => {
+            let (flags, enc) = match version {
+                1 => {
+                    *pos = pos.saturating_add(8);
+                    (0u8, 4usize)
+                }
+                2 => {
+                    let f = *data.get(*pos).ok_or_else(|| LangError::new("hdf5: virtual hyperslab is truncated", 0))?;
+                    *pos += 1;
+                    *pos = pos.saturating_add(4);
+                    (f, 8)
+                }
+                3 => {
+                    let f = *data.get(*pos).ok_or_else(|| LangError::new("hdf5: virtual hyperslab is truncated", 0))?;
+                    *pos += 1;
+                    let e = *data.get(*pos).ok_or_else(|| LangError::new("hdf5: virtual hyperslab is truncated", 0))? as usize;
+                    *pos += 1;
+                    (f, e)
+                }
+                _ => return Err(LangError::new("hdf5: unsupported virtual hyperslab version", 0)),
+            };
+            if !matches!(enc, 1 | 2 | 4 | 8) {
+                return Err(LangError::new("hdf5: invalid virtual hyperslab width", 0));
+            }
+            let rank = vds_take_u32(data, pos).ok_or_else(|| LangError::new("hdf5: virtual hyperslab is truncated", 0))? as usize;
+            if rank == 0 || rank > 32 {
+                return Err(LangError::new("hdf5: invalid virtual hyperslab rank", 0));
+            }
+            if version >= 2 && flags & 0x01 != 0 {
+                let need = rank.saturating_mul(4).saturating_mul(enc);
+                if need > data.len().saturating_sub(*pos) {
+                    return Err(LangError::new("hdf5: virtual hyperslab is truncated", 0));
+                }
+                let mut dims = Vec::with_capacity(rank);
+                for _ in 0..rank {
+                    let start = vds_take_uint(data, pos, enc).unwrap_or(0);
+                    let stride = vds_take_uint(data, pos, enc).unwrap_or(1);
+                    let count = vds_take_uint(data, pos, enc).unwrap_or(0);
+                    let block = vds_take_uint(data, pos, enc).unwrap_or(0);
+                    dims.push((start, stride, count, block));
+                }
+                Ok(VdsSelection::Regular(dims))
+            } else {
+                let n = vds_take_uint(data, pos, enc).unwrap_or(0) as usize;
+                if n > MAX_VDS_ELEMENTS || n.saturating_mul(rank).saturating_mul(2).saturating_mul(enc) > data.len().saturating_sub(*pos) {
+                    return Err(LangError::new("hdf5: virtual hyperslab block list is too large", 0));
+                }
+                let mut blocks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let mut start = Vec::with_capacity(rank);
+                    let mut end = Vec::with_capacity(rank);
+                    for _ in 0..rank {
+                        start.push(vds_take_uint(data, pos, enc).unwrap_or(0));
+                    }
+                    for _ in 0..rank {
+                        end.push(vds_take_uint(data, pos, enc).unwrap_or(0));
+                    }
+                    blocks.push((start, end));
+                }
+                Ok(VdsSelection::Blocks(blocks))
+            }
+        }
+        _ => Err(LangError::new("hdf5: unknown virtual selection type", 0)),
+    }
+}
+
+fn vds_linear(coord: &[u64], shape: &[usize]) -> Option<usize> {
+    if coord.len() != shape.len() {
+        return None;
+    }
+    let mut stride = 1usize;
+    let mut linear = 0usize;
+    for d in (0..shape.len()).rev() {
+        let c = *coord.get(d)? as usize;
+        if c >= shape[d] {
+            return None;
+        }
+        linear = linear.checked_add(c.checked_mul(stride)?)?;
+        stride = stride.checked_mul(shape[d])?;
+    }
+    Some(linear)
+}
+
+fn vds_cartesian_offsets(per_dim: &[Vec<u64>], shape: &[usize], out: &mut Vec<usize>) -> Result<(), LangError> {
+    if per_dim.len() != shape.len() {
+        return Err(LangError::new("hdf5: virtual hyperslab rank does not match the dataspace", 0));
+    }
+    let total = per_dim.iter().fold(1usize, |a, v| a.saturating_mul(v.len()));
+    if total > MAX_VDS_ELEMENTS {
+        return Err(LangError::new("hdf5: virtual hyperslab is too large", 0));
+    }
+    if per_dim.iter().any(|v| v.is_empty()) || per_dim.is_empty() {
+        return Ok(());
+    }
+    let mut idx = vec![0usize; per_dim.len()];
+    loop {
+        let coord: Vec<u64> = per_dim.iter().enumerate().map(|(d, v)| v[idx[d]]).collect();
+        if let Some(linear) = vds_linear(&coord, shape) {
+            out.push(linear);
+        }
+        let mut d = per_dim.len();
+        loop {
+            if d == 0 {
+                return Ok(());
+            }
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < per_dim[d].len() {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+fn vds_selection_offsets(sel: &VdsSelection, shape: &[usize]) -> Result<Vec<usize>, LangError> {
+    let total = shape.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    if total > MAX_VDS_ELEMENTS {
+        return Err(LangError::new("hdf5: virtual dataspace is too large", 0));
+    }
+    match sel {
+        VdsSelection::None => Ok(Vec::new()),
+        VdsSelection::All => Ok((0..total).collect()),
+        VdsSelection::Points(points) => {
+            let mut out = Vec::with_capacity(points.len());
+            for p in points {
+                out.push(vds_linear(p, shape).ok_or_else(|| LangError::new("hdf5: virtual point is out of bounds", 0))?);
+            }
+            Ok(out)
+        }
+        VdsSelection::Regular(dims) => {
+            if dims.len() != shape.len() {
+                return Err(LangError::new("hdf5: virtual hyperslab rank does not match the dataspace", 0));
+            }
+            let mut per_dim: Vec<Vec<u64>> = Vec::with_capacity(dims.len());
+            for (d, &(start, stride, count, block)) in dims.iter().enumerate() {
+                let dim = shape[d];
+                let stride = stride.max(1);
+                let count = if count == u64::MAX { (dim as u64).saturating_sub(start).div_ceil(stride).max(1) } else { count };
+                let block = if block == u64::MAX { dim as u64 } else { block };
+                let mut coords = Vec::new();
+                for k in 0..count {
+                    let base = start.saturating_add(k.saturating_mul(stride));
+                    if base >= dim as u64 {
+                        break;
+                    }
+                    let len = block.min((dim as u64).saturating_sub(base));
+                    for j in 0..len {
+                        coords.push(base + j);
+                        if coords.len() > MAX_VDS_ELEMENTS {
+                            return Err(LangError::new("hdf5: virtual hyperslab is too large", 0));
+                        }
+                    }
+                }
+                per_dim.push(coords);
+            }
+            let count = per_dim.iter().fold(1usize, |a, v| a.saturating_mul(v.len()));
+            let mut out = Vec::with_capacity(count.min(MAX_VDS_ELEMENTS));
+            vds_cartesian_offsets(&per_dim, shape, &mut out)?;
+            Ok(out)
+        }
+        VdsSelection::Blocks(blocks) => {
+            let mut out = Vec::new();
+            for (start, end) in blocks {
+                if start.len() != shape.len() || end.len() != shape.len() {
+                    return Err(LangError::new("hdf5: virtual hyperslab rank does not match the dataspace", 0));
+                }
+                let mut per_dim: Vec<Vec<u64>> = Vec::with_capacity(shape.len());
+                for d in 0..shape.len() {
+                    let lo = start[d].min(shape[d] as u64);
+                    let hi = end[d].min(shape[d].saturating_sub(1) as u64);
+                    per_dim.push(if hi >= lo { (lo..=hi).collect() } else { Vec::new() });
+                }
+                vds_cartesian_offsets(&per_dim, shape, &mut out)?;
+            }
+            out.sort_unstable();
+            out.dedup();
+            Ok(out)
+        }
+    }
+}
+
+fn vds_heap_object(b: &[u8], ctx: H5Ctx, addr: usize, index: usize) -> Result<&[u8], LangError> {
+    if b.get(addr..addr + 4) != Some(b"GCOL") {
+        return Err(LangError::new("hdf5: virtual mapping heap collection is missing", 0));
+    }
+    let size = len_at(b, addr + 8, ctx);
+    let end = addr.saturating_add(size).min(b.len());
+    let mut p = addr.saturating_add(16);
+    while p + 8 + ctx.length_size <= end {
+        let obj_index = u16_at(b, p).unwrap_or(0) as usize;
+        let obj_size = len_at(b, p + 8, ctx);
+        let data_start = p + 8 + ctx.length_size;
+        if obj_index == index {
+            return b
+                .get(data_start..data_start.saturating_add(obj_size))
+                .ok_or_else(|| LangError::new("hdf5: virtual mapping heap object is truncated", 0));
+        }
+        let step = 8usize.saturating_add(ctx.length_size).saturating_add(pad8(obj_size));
+        if step == 0 {
+            break;
+        }
+        p = p.saturating_add(step);
+    }
+    Err(LangError::new("hdf5: virtual mapping heap object was not found", 0))
+}
+
+fn parse_vds_mappings(data: &[u8], ctx: H5Ctx) -> Result<Vec<VdsMapping>, LangError> {
+    if data.len() < 1 + ctx.length_size {
+        return Err(LangError::new("hdf5: virtual mapping block is truncated", 0));
+    }
+    let version = data[0];
+    if version > 1 {
+        return Err(LangError::new("hdf5: unsupported virtual mapping block version", 0));
+    }
+    let num = len_at(data, 1, ctx);
+    if num > 100_000 {
+        return Err(LangError::new("hdf5: virtual mapping block has too many entries", 0));
+    }
+    let mut pos = 1 + ctx.length_size;
+    let mut mappings: Vec<VdsMapping> = Vec::with_capacity(num);
+    for _ in 0..num {
+        let flags = if version >= 1 {
+            let f = *data.get(pos).ok_or_else(|| LangError::new("hdf5: virtual mapping is truncated", 0))?;
+            pos += 1;
+            if f & !0x07 != 0 {
+                return Err(LangError::new("hdf5: unknown virtual mapping flags", 0));
+            }
+            f
+        } else {
+            0
+        };
+        let source_file = if flags & 0x04 != 0 {
+            ".".to_string()
+        } else if flags & 0x01 != 0 {
+            let origin = len_at(data, pos, ctx);
+            pos += ctx.length_size;
+            mappings.get(origin).map(|m| m.source_file.clone()).ok_or_else(|| LangError::new("hdf5: invalid shared virtual source file", 0))?
+        } else {
+            vds_take_cstr(data, &mut pos).ok_or_else(|| LangError::new("hdf5: virtual source file name is truncated", 0))?
+        };
+        let source_dataset = if flags & 0x02 != 0 {
+            let origin = len_at(data, pos, ctx);
+            pos += ctx.length_size;
+            mappings.get(origin).map(|m| m.source_dataset.clone()).ok_or_else(|| LangError::new("hdf5: invalid shared virtual source dataset", 0))?
+        } else {
+            vds_take_cstr(data, &mut pos).ok_or_else(|| LangError::new("hdf5: virtual source dataset name is truncated", 0))?
+        };
+        let source_selection = parse_vds_selection(data, &mut pos)?;
+        let virtual_selection = parse_vds_selection(data, &mut pos)?;
+        if pos > data.len() {
+            return Err(LangError::new("hdf5: virtual mapping block is truncated", 0));
+        }
+        mappings.push(VdsMapping { source_file, source_dataset, source_selection, virtual_selection });
+    }
+    Ok(mappings)
+}
+
+fn read_virtual(b: &[u8], ctx: H5Ctx, rctx: &H5ReadCtx, heap_addr: usize, heap_index: usize, dims: &[usize]) -> Result<Vec<f64>, LangError> {
+    let count = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    if count > 50_000_000 {
+        return Err(LangError::new("hdf5: virtual dataset is too large", 0));
+    }
+    let mut out = vec![0.0f64; count];
+    if rctx.depth > 3 {
+        return Err(LangError::new("hdf5: virtual dataset nesting is too deep", 0));
+    }
+    let obj = vds_heap_object(b, ctx, heap_addr, heap_index)?;
+    let mappings = parse_vds_mappings(obj, ctx)?;
+    for m in mappings {
+        let source_file = if m.source_file.is_empty() || m.source_file == "." {
+            read_bytes_opts(b, rctx.base.clone(), rctx.depth + 1, false)?
+        } else {
+            let path = std::path::Path::new(&m.source_file);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Some(base) = &rctx.base {
+                base.join(path)
+            } else {
+                path.to_path_buf()
+            };
+            let Ok(bytes) = std::fs::read(&resolved) else {
+                continue;
+            };
+            let base = resolved.parent().map(|p| p.to_path_buf());
+            read_bytes_opts(&bytes, base, rctx.depth + 1, true)?
+        };
+        let want = m.source_dataset.trim_start_matches('/');
+        let Some(source) = source_file.datasets.iter().find(|d| d.name == want || d.name == m.source_dataset) else {
+            continue;
+        };
+        let src_offsets = vds_selection_offsets(&m.source_selection, &source.dims)?;
+        let dst_offsets = vds_selection_offsets(&m.virtual_selection, dims)?;
+        for (&src, &dst) in src_offsets.iter().zip(dst_offsets.iter()) {
+            if let (Some(&v), Some(slot)) = (source.data.get(src), out.get_mut(dst)) {
+                *slot = v;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1537,5 +2243,51 @@ mod tests {
     #[test]
     fn read_superblock_v3_gzip_shuffle_btree_v2() {
         check_fixture(include_bytes!("../tests/fixtures/h5_v3_bt2.h5"), "a", &[3, 4], 12);
+    }
+
+    #[test]
+    fn read_extensible_array_plain() {
+        check_fixture(include_bytes!("../tests/fixtures/h5_ea_plain.h5"), "a", &[100, 100], 10_000);
+    }
+
+    #[test]
+    fn read_extensible_array_gzip() {
+        check_fixture(include_bytes!("../tests/fixtures/h5_ea_gzip.h5"), "a", &[100, 100], 10_000);
+    }
+
+    #[test]
+    fn read_extensible_array_second_dimension_unlimited() {
+        check_fixture(include_bytes!("../tests/fixtures/h5_ea_col.h5"), "a", &[100, 100], 10_000);
+    }
+
+    #[test]
+    fn read_multi_unlimited_btree_v2() {
+        check_fixture(include_bytes!("../tests/fixtures/h5_bt2_multi.h5"), "a", &[20, 20], 400);
+    }
+
+    #[test]
+    fn read_virtual_dataset() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/h5_vds.h5");
+        let f = read(&path).unwrap();
+        let ds = f.datasets.iter().find(|d| d.name == "v").unwrap();
+        assert_eq!(ds.dims, vec![20, 10]);
+        let row: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let expected: Vec<f64> = row.iter().chain(row.iter()).copied().collect();
+        assert_eq!(ds.data, expected);
+    }
+
+    #[test]
+    fn read_virtual_dataset_offset_mapping() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/h5_vds_sel.h5");
+        let f = read(&path).unwrap();
+        let ds = f.datasets.iter().find(|d| d.name == "v").unwrap();
+        assert_eq!(ds.dims, vec![20, 20]);
+        let mut expected = vec![0.0f64; 400];
+        for r in 0..10 {
+            for c in 0..10 {
+                expected[(r + 5) * 20 + c + 5] = (r * 10 + c) as f64;
+            }
+        }
+        assert_eq!(ds.data, expected);
     }
 }

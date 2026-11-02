@@ -171,6 +171,8 @@ pub enum Stmt {
         methods: Vec<ClassMethod>,
         /// `enumeration` members — `name (value)` entries.
         enums: Vec<ClassProp>,
+        /// `events` names, in declaration order.
+        events: Vec<ClassProp>,
     },
 }
 

@@ -140,6 +140,9 @@ struct ClassDef {
     sigs: HashMap<String, bool>,
     /// `enumeration` members: (name, value expression).
     enums: Vec<(String, Option<Expr>)>,
+    /// `events` names, in declaration order (inherited ones are resolved
+    /// through `supers` on lookup).
+    events: Vec<String>,
     /// `.m` file the classdef came from ("" for session-eval'd defs).
     file: String,
 }
@@ -1522,11 +1525,12 @@ impl Session {
     /// Record a `Stmt::ClassDef` into `classes` — a later re-registration
     /// (edited file, re-run script) replaces the definition wholesale.
     fn register_class(&mut self, s: &Stmt, file: &str) {
-        let Stmt::ClassDef { name, supers, props, methods, enums } = s else { return };
+        let Stmt::ClassDef { name, supers, props, methods, enums, events } = s else { return };
         let mut def = ClassDef {
             supers: supers.clone(),
             props: props.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
             enums: enums.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+            events: events.iter().map(|e| e.name.clone()).collect(),
             file: file.to_string(),
             ..ClassDef::default()
         };
@@ -3984,6 +3988,78 @@ impl Session {
             "isstruct" => {
                 let v = self.eval_args(args)?;
                 Ok(Some(Value::Num(matches!(v.first(), Some(Value::Struct(_))) as u8 as f64)))
+            }
+            "events" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("events needs an object or a class name", 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let mut names: Vec<String> = Vec::new();
+                for d in &chain {
+                    for e in &d.events {
+                        if !names.contains(e) {
+                            names.push(e.clone());
+                        }
+                    }
+                }
+                Ok(Some(Value::Cell(CellArray::col(names.into_iter().map(Value::Str).collect()))))
+            }
+            "metaclass" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("metaclass needs an object or a class name", 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let mut props: Vec<String> = Vec::new();
+                let mut methods: Vec<String> = Vec::new();
+                let mut events: Vec<String> = Vec::new();
+                for d in &chain {
+                    for (p, _) in &d.props {
+                        if !props.contains(p) {
+                            props.push(p.clone());
+                        }
+                    }
+                    for k in d.methods.keys().chain(d.sigs.keys()) {
+                        if !methods.contains(k) {
+                            methods.push(k.clone());
+                        }
+                    }
+                    for e in &d.events {
+                        if !events.contains(e) {
+                            events.push(e.clone());
+                        }
+                    }
+                }
+                let mut supers: Vec<String> =
+                    chain.last().map(|d| d.supers.iter().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()).collect()).unwrap_or_default();
+                supers.dedup();
+                let mut s = StructArray::new();
+                s.set_field(0, "Name", Value::Str(cname))?;
+                s.set_field(0, "Properties", Value::Cell(CellArray::col(props.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Methods", Value::Cell(CellArray::col(methods.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Events", Value::Cell(CellArray::col(events.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Superclasses", Value::Cell(CellArray::col(supers.into_iter().map(Value::Str).collect())))?;
+                Ok(Some(Value::Struct(s)))
+            }
+            "ismethod" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs an object or a class name"), 0)),
+                };
+                let member = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a member name"), 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let found = chain.iter().any(|d| d.methods.contains_key(&member) || d.sigs.contains_key(&member));
+                Ok(Some(Value::Num(found as u8 as f64)))
             }
             "isfield" => {
                 let v = self.eval_args(args)?;
@@ -8251,7 +8327,11 @@ impl Session {
                     _ => String::new(),
                 };
                 let yes = match v.first() {
-                    Some(Value::Object(o)) => o.has_prop(&prop),
+                    Some(Value::Object(o)) => o.prop_names().iter().any(|p| p.eq_ignore_ascii_case(&prop)),
+                    Some(Value::Str(cname)) => {
+                        let chain = self.class_chain(cname)?;
+                        chain.iter().any(|d| d.props.iter().any(|(p, _)| p.eq_ignore_ascii_case(&prop)))
+                    }
                     Some(Value::Num(_)) => matches!(
                         prop.as_str(),
                         "position"
@@ -11161,9 +11241,13 @@ impl Session {
             "uimenu" => Ok(vec![Value::Num(1.0)]),
             "actxserver" => {
                 let prog = sarg(0).unwrap_or("").to_string();
-                let mut props = StructArray::new();
-                props.set_field(0, "ProgID", Value::Str(prog))?;
-                Ok(vec![Value::Object(MObject::owned("COM".into(), props))])
+                Err(LangError::new(
+                    format!(
+                        "actxserver: COM automation is not available in this build (requested '{prog}'); \
+                         MatCraft is pure safe Rust and needs a platform automation bridge"
+                    ),
+                    0,
+                ))
             }
             "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
             "ver" => {
@@ -14963,6 +15047,10 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "isobject",
     "methods",
     "properties",
+    "events",
+    "metaclass",
+    "ismethod",
+    "isprop",
     "fieldnames",
     "isfield",
     "rmfield",
@@ -20043,6 +20131,10 @@ end",
             y = obj.a;
         end
     end
+    events
+        Changed
+        Closed
+    end
 end",
         )
         .unwrap();
@@ -20078,6 +20170,26 @@ end",
         } else {
             panic!("fieldnames(o) is not a cell");
         }
+        s.run("ev = events(o); mc = metaclass(o); im = ismethod(o,'geta'); ip = isprop(o,'a');").unwrap();
+        if let Some(Value::Cell(ev)) = s.get("ev") {
+            let names: Vec<&str> = (0..ev.numel())
+                .filter_map(|i| match ev.get_linear(i) {
+                    Some(Value::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"Changed") && names.contains(&"Closed"));
+        } else {
+            panic!("events(o) is not a cell");
+        }
+        if let Some(Value::Struct(mc)) = s.get("mc") {
+            assert_eq!(mc.field_at(0, "Name"), Some(&Value::Str("Mp".into())));
+            assert!(matches!(mc.field_at(0, "Events"), Some(Value::Cell(_))));
+        } else {
+            panic!("metaclass(o) is not a struct");
+        }
+        assert_eq!(s.get("im"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("ip"), Some(&Value::Num(1.0)));
     }
 
     #[test]

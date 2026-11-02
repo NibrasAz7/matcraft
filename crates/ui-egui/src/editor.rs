@@ -326,6 +326,47 @@ impl Editor {
             self.dirty = true;
         }
 
+        // ---- parameter hint ----------------------------------------------
+        // While the buffer has focus, the innermost call around the caret
+        // gets an Excel-style signature popup above the caret line.
+        if output.response.has_focus() {
+            let hint = output.cursor_range.and_then(|cr| {
+                let ci = cr.primary.index.0;
+                let byte = self.text.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(self.text.len());
+                call_hint(&self.text, byte).and_then(|(name, arg)| param_hint(&name, arg, &self.text)).map(|h| (h, ci))
+            });
+            if let Some((h, ci)) = hint {
+                let caret = output.galley.pos_from_cursor(egui::text::CCursor::new(ci));
+                let x = output.galley_pos.x + caret.left();
+                let y = output.galley_pos.y + caret.top();
+                let accent = egui::Color32::from_rgb(0x1E, 0x6F, 0xD9);
+                egui::Area::new(egui::Id::new(("param-hint", salt)))
+                    .order(egui::Order::Foreground)
+                    .interactable(false)
+                    .pivot(egui::Align2::LEFT_BOTTOM)
+                    .fixed_pos(egui::pos2(x, (y - 4.0).max(grect.top() + 64.0)))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&h.name).monospace().strong().color(accent));
+                                ui.label(egui::RichText::new("(").monospace());
+                                for (i, p) in h.params.iter().enumerate() {
+                                    if i > 0 {
+                                        ui.label(egui::RichText::new(", ").monospace());
+                                    }
+                                    let t = egui::RichText::new(p).monospace();
+                                    ui.label(if i + 1 == h.arg { t.strong().underline().color(accent) } else { t });
+                                }
+                                ui.label(egui::RichText::new(")").monospace());
+                            });
+                            let total = h.params.len().max(1);
+                            let which = h.arg.min(total);
+                            ui.label(egui::RichText::new(format!("argument {which} of {total} — {}", h.doc)).small().weak());
+                        });
+                    });
+            }
+        }
+
         // Gutter: line numbers on each row that begins a line, breakpoint
         // dots on marked lines. Rows that start a line always begin right
         // after a `\n` (or at char 0), so their start offset equals a line
@@ -460,6 +501,261 @@ const KEYWORDS: &[&str] = &[
     "try",
     "while",
 ];
+
+/// Builtin call signatures used by the editor's parameter hint. The first
+/// field is the display signature, the second a one-line description.
+const SIGNATURES: &[(&str, &str, &str)] = &[
+    ("plot", "plot(X, Y, LineSpec)", "Plot columns of Y against X; LineSpec selects colour, marker and line style."),
+    ("plot3", "plot3(X, Y, Z, LineSpec)", "Plot 3-D lines through the columns of X, Y and Z."),
+    ("scatter", "scatter(X, Y, Size, Color, Marker)", "Draw a scatter plot with optional marker size, colour and shape."),
+    ("bar", "bar(Y, Style)", "Draw a bar chart; Style selects grouped, stacked or horizontal bars."),
+    ("histogram", "histogram(X, BinEdges)", "Plot a histogram using automatic or explicit bin edges."),
+    ("xlabel", "xlabel(Text)", "Set the x-axis label."),
+    ("ylabel", "ylabel(Text)", "Set the y-axis label."),
+    ("zlabel", "zlabel(Text)", "Set the z-axis label."),
+    ("title", "title(Text)", "Set the axes title."),
+    ("legend", "legend(Labels, Location)", "Add a legend using a cellstr of labels."),
+    ("axis", "axis(Limits)", "Set axis limits, equal/aspect modes or visibility."),
+    ("xlim", "xlim(Limits)", "Set or query the x-axis limits."),
+    ("ylim", "ylim(Limits)", "Set or query the y-axis limits."),
+    ("grid", "grid(State)", "Turn the axes grid on or off."),
+    ("hold", "hold(State)", "Retain the current plot when adding new graphics."),
+    ("figure", "figure(Number, Name, Value, ...)", "Create or select a figure window."),
+    ("subplot", "subplot(M, N, P)", "Select one cell of an M-by-N axes grid."),
+    ("zeros", "zeros(Size, ClassName)", "Create an array of zeros."),
+    ("ones", "ones(Size, ClassName)", "Create an array of ones."),
+    ("eye", "eye(Size, ClassName)", "Create an identity matrix."),
+    ("rand", "rand(Size)", "Uniformly distributed random numbers in (0,1)."),
+    ("randn", "randn(Size)", "Normally distributed random numbers."),
+    ("randi", "randi(Imax, Size)", "Uniformly distributed random integers."),
+    ("linspace", "linspace(A, B, N)", "N linearly spaced points from A to B."),
+    ("logspace", "logspace(A, B, N)", "N logarithmically spaced points from 10^A to 10^B."),
+    ("size", "size(A, Dim)", "Array dimensions, or the length of one dimension."),
+    ("numel", "numel(A)", "Number of elements in an array."),
+    ("reshape", "reshape(A, Size)", "Reshape an array without changing its elements."),
+    ("repmat", "repmat(A, Reps)", "Repeat copies of an array."),
+    ("sum", "sum(A, Dim, NanFlag)", "Sum of elements along a dimension."),
+    ("mean", "mean(A, Dim, NanFlag)", "Arithmetic mean along a dimension."),
+    ("median", "median(A, Dim, NanFlag)", "Median along a dimension."),
+    ("std", "std(A, Weight, Dim)", "Standard deviation."),
+    ("var", "var(A, Weight, Dim)", "Variance."),
+    ("min", "min(A, B, Dim, NanFlag)", "Smallest elements, or element-wise minimum."),
+    ("max", "max(A, B, Dim, NanFlag)", "Largest elements, or element-wise maximum."),
+    ("find", "find(A, K, Direction)", "Indices of nonzero elements."),
+    ("sort", "sort(A, Dim, Direction)", "Sort elements along a dimension."),
+    ("unique", "unique(A, Occurrence)", "Unique values, optionally including stable order."),
+    ("ismember", "ismember(A, B)", "True where elements of A occur in B."),
+    ("interp1", "interp1(X, V, Xq, Method)", "One-dimensional interpolation."),
+    ("polyfit", "polyfit(X, Y, Degree)", "Least-squares polynomial coefficients."),
+    ("polyval", "polyval(P, X)", "Evaluate a polynomial at X."),
+    ("fft", "fft(X, N, Dim)", "Discrete Fourier transform."),
+    ("ifft", "ifft(X, N, Dim)", "Inverse discrete Fourier transform."),
+    ("conv", "conv(A, B, Shape)", "Convolution of two vectors."),
+    ("filter", "filter(B, A, X)", "One-dimensional digital filter."),
+    ("ode45", "ode45(OdeFcn, TSpan, Y0, Options)", "Solve a non-stiff ordinary differential equation."),
+    ("fsolve", "fsolve(Fun, X0, Options)", "Solve a system of nonlinear equations."),
+    ("fminsearch", "fminsearch(Fun, X0, Options)", "Derivative-free unconstrained minimisation."),
+    ("fminbnd", "fminbnd(Fun, Lower, Upper, Options)", "Minimise a scalar function on a bounded interval."),
+    ("fminunc", "fminunc(Fun, X0, Options)", "Unconstrained minimisation."),
+    ("fmincon", "fmincon(Fun, X0, A, B, Aeq, Beq, LB, UB, Nonlcon, Options)", "Constrained nonlinear minimisation."),
+    ("lsqnonlin", "lsqnonlin(Fun, X0, LB, UB, Options)", "Solve nonlinear least-squares problems."),
+    ("lsqcurvefit", "lsqcurvefit(Fun, X0, XData, YData, LB, UB, Options)", "Fit a nonlinear curve to data."),
+    ("linprog", "linprog(F, A, B, Aeq, Beq, LB, UB, Options)", "Solve a linear program."),
+    ("quadprog", "quadprog(H, F, A, B, Aeq, Beq, LB, UB, X0, Options)", "Solve a convex quadratic program."),
+    ("ga", "ga(FitnessFcn, Nvars, A, B, Aeq, Beq, LB, UB, Options)", "Genetic algorithm for bounded optimisation."),
+    ("patternsearch", "patternsearch(Fun, X0, A, B, Aeq, Beq, LB, UB, Options)", "Derivative-free pattern-search minimisation."),
+    ("optimset", "optimset(Name, Value, ...)", "Create or update an optimisation options struct."),
+    ("optimoptions", "optimoptions(Solver, Name, Value, ...)", "Create solver-specific optimisation options."),
+    ("fitlm", "fitlm(X, Y, Modelspec)", "Fit a linear regression model."),
+    ("table", "table(Var1, Var2, ..., VariableNames, Value, ...)", "Create a table from column variables."),
+    ("readtable", "readtable(File, Name, Value, ...)", "Read a text, CSV or spreadsheet file into a table."),
+    ("writetable", "writetable(T, File, Name, Value, ...)", "Write a table to a text, CSV or spreadsheet file."),
+    ("readmatrix", "readmatrix(File, Name, Value, ...)", "Read a numeric matrix from a file."),
+    ("writematrix", "writematrix(A, File, Name, Value, ...)", "Write a numeric matrix to a file."),
+    ("readcell", "readcell(File, Name, Value, ...)", "Read a file into a cell array."),
+    ("writecell", "writecell(C, File, Name, Value, ...)", "Write a cell array to a file."),
+    ("csvread", "csvread(File, Row, Col)", "Read a comma-separated numeric file."),
+    ("csvwrite", "csvwrite(File, A)", "Write a numeric matrix as comma-separated values."),
+    ("xlsread", "xlsread(File, Sheet, Range)", "Read numeric data from a spreadsheet."),
+    ("xlswrite", "xlswrite(File, A, Sheet, Range)", "Write numeric data to a spreadsheet."),
+    ("h5read", "h5read(File, Dataset, Start, Count)", "Read a numeric HDF5 dataset, optionally a hyperslab."),
+    ("h5write", "h5write(File, Dataset, Data, Start, Count)", "Write a numeric HDF5 dataset or hyperslab."),
+    ("h5create", "h5create(File, Dataset, Size, Name, Value, ...)", "Create an HDF5 dataset."),
+    ("imread", "imread(File, Format)", "Read an image file."),
+    ("imwrite", "imwrite(A, File, Format)", "Write an image file."),
+    ("imshow", "imshow(A, DisplayRange)", "Display an image in a figure."),
+    ("imresize", "imresize(A, Scale, Method)", "Resize an image with nearest, bilinear, bicubic or Lanczos interpolation."),
+    ("rgb2gray", "rgb2gray(RGB)", "Convert an RGB image to grayscale."),
+    ("imfilter", "imfilter(A, H, Boundary, Size)", "Apply a linear filter to an image."),
+    ("edge", "edge(A, Method, Threshold)", "Detect edges in an image."),
+    ("regionprops", "regionprops(BW, Properties)", "Measure connected-component properties."),
+    ("fprintf", "fprintf(FormatSpec, A, ...)", "Write formatted text to the Command Window or a file."),
+    ("sprintf", "sprintf(FormatSpec, A, ...)", "Format data into a character vector."),
+    ("disp", "disp(X)", "Display a value without printing its name."),
+    ("error", "error(Message, A, ...)", "Raise an error with a formatted message."),
+    ("warning", "warning(Message, A, ...)", "Display a formatted warning."),
+    ("input", "input(Prompt, Choice)", "Request input from the user."),
+    ("strsplit", "strsplit(Text, Delimiter)", "Split text at delimiters."),
+    ("strjoin", "strjoin(C, Delimiter)", "Join a cellstr with a delimiter."),
+    ("regexp", "regexp(Text, Expression, Option)", "Match regular expressions."),
+    ("regexprep", "regexprep(Text, Expression, Replace)", "Replace regular-expression matches."),
+    ("contains", "contains(Text, Pattern)", "True where text contains a pattern."),
+    ("startsWith", "startsWith(Text, Prefix)", "True where text starts with a prefix."),
+    ("endsWith", "endsWith(Text, Suffix)", "True where text ends with a suffix."),
+    ("upper", "upper(Text)", "Convert text to uppercase."),
+    ("lower", "lower(Text)", "Convert text to lowercase."),
+    ("num2str", "num2str(A, Format)", "Convert numbers to a character vector."),
+    ("str2num", "str2num(Text)", "Convert a character vector to numbers."),
+    ("mat2str", "mat2str(A, Precision)", "Convert a matrix to a string that evaluates back to it."),
+    ("eval", "eval(Expression)", "Evaluate an M-code expression string."),
+    ("feval", "feval(Fun, A, ...)", "Evaluate a function handle or function name."),
+    ("cellfun", "cellfun(Fun, C, UniformOutput)", "Apply a function to every cell."),
+    ("arrayfun", "arrayfun(Fun, A, UniformOutput)", "Apply a function element-wise to an array."),
+    ("struct", "struct(Field, Value, ...)", "Create a structure array."),
+    ("fieldnames", "fieldnames(S)", "List field names of a struct or object."),
+    ("getfield", "getfield(S, Field)", "Read a structure field."),
+    ("setfield", "setfield(S, Field, Value)", "Set a structure field."),
+    ("isfield", "isfield(S, Field)", "True when a structure has the named field."),
+    ("class", "class(Value)", "Return the class name of a value."),
+    ("isa", "isa(Value, ClassName)", "True when a value has the named class."),
+    ("validateattributes", "validateattributes(A, Classes, Attributes)", "Validate array class and attribute constraints."),
+    ("inputParser", "inputParser()", "Create an input parser object."),
+    ("addRequired", "addRequired(Parser, Name, Validator)", "Add a required input to an input parser."),
+    ("addOptional", "addOptional(Parser, Name, Default, Validator)", "Add an optional positional input."),
+    ("addParameter", "addParameter(Parser, Name, Default, Validator)", "Add a name-value parameter."),
+    ("parse", "parse(Parser, Inputs, ...)", "Parse and validate the supplied inputs."),
+    ("tic", "tic()", "Start a stopwatch timer."),
+    ("toc", "toc(StartTime)", "Read the stopwatch timer."),
+    ("save", "save(File, Variables, Format)", "Save workspace variables to a MAT-file."),
+    ("load", "load(File, Variables)", "Load variables from a MAT-file."),
+    ("clear", "clear(Variables)", "Remove variables from the workspace."),
+    ("maxNumCompThreads", "maxNumCompThreads(N)", "Set or query the number of parallel CPU workers."),
+    ("parpool", "parpool(Workers)", "Create a parallel pool with the requested worker count."),
+    ("gpuArray", "gpuArray(A)", "Move an array to the optional GPU backend."),
+    ("gather", "gather(A)", "Copy a GPU array back to the CPU."),
+];
+
+/// A call signature found at the cursor.
+struct ParamHint {
+    name: String,
+    doc: String,
+    arg: usize,
+    params: Vec<String>,
+}
+
+/// Locate the innermost function call whose argument list contains
+/// `byte_pos`. Returns the callee name and the 1-based argument index.
+fn call_hint(text: &str, byte_pos: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let end = byte_pos.min(bytes.len());
+    let mut stack: Vec<(u8, usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < end {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'%' => {
+                while i < end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'\'' => {
+                let prev = (0..i).rev().find(|&j| !bytes[j].is_ascii_whitespace()).map(|j| bytes[j]);
+                if !prev.is_some_and(|p| p.is_ascii_alphanumeric() || matches!(p, b')' | b']' | b'}' | b'\'' | b'.')) {
+                    in_string = true;
+                }
+            }
+            b'(' => stack.push((b'(', i, 1)),
+            b'[' | b'{' => stack.push((b, i, 0)),
+            b')' => {
+                while let Some((open, _, _)) = stack.pop() {
+                    if open == b'(' {
+                        break;
+                    }
+                }
+            }
+            b']' | b'}' => {
+                while let Some((open, _, _)) = stack.pop() {
+                    if open == b'[' || open == b'{' {
+                        break;
+                    }
+                }
+            }
+            b',' => {
+                if let Some(paren) = stack.iter().rposition(|(o, _, _)| *o == b'(') {
+                    let bracket_above = stack[paren + 1..].iter().any(|(o, _, _)| *o == b'[' || *o == b'{');
+                    if !bracket_above {
+                        if let Some((_, _, arg)) = stack.get_mut(paren) {
+                            *arg += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (_, open, arg) = *stack.iter().rev().find(|(o, _, _)| *o == b'(')?;
+    let mut j = open;
+    while j > 0 && bytes.get(j - 1).is_some_and(u8::is_ascii_whitespace) {
+        j -= 1;
+    }
+    let name_end = j;
+    while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_' || bytes[j - 1] == b'.') {
+        j -= 1;
+    }
+    if j == name_end {
+        return None;
+    }
+    Some((String::from_utf8_lossy(&bytes[j..name_end]).to_string(), arg))
+}
+
+/// Builtin signature table lookup, or the signature of a local function in
+/// the buffer. The latter lets hints work for user code without evaluating
+/// it.
+fn signature_at(name: &str, text: &str) -> Option<(String, String, Vec<String>)> {
+    if let Some((_, display, doc)) = SIGNATURES.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
+        let params = display
+            .split_once('(')
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(args, _)| args.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
+        return Some(((*display).to_string(), (*doc).to_string(), params));
+    }
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("function") || !t["function".len()..].starts_with(|c: char| c.is_whitespace() || c == '[') {
+            continue;
+        }
+        let rest = t["function".len()..].trim_start();
+        let rest = rest.split_once('=').map(|(_, r)| r.trim_start()).unwrap_or(rest);
+        let Some((fname, tail)) = rest.split_once('(') else { continue };
+        if !fname.trim().eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let Some((args, _)) = tail.rsplit_once(')') else { continue };
+        let params: Vec<String> = args.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+        return Some((format!("{}({})", fname.trim(), params.join(", ")), "Local function defined in this buffer.".to_string(), params));
+    }
+    None
+}
+
+fn param_hint(name: &str, arg: usize, text: &str) -> Option<ParamHint> {
+    let (_signature, doc, params) = signature_at(name, text)?;
+    Some(ParamHint { name: name.to_string(), doc, arg: arg.max(1), params })
+}
 
 /// `highlight` plus find-bar marks: every match gets a light-yellow
 /// background, the current one a stronger amber — like the Editor's find
@@ -628,5 +924,35 @@ mod tests {
         let mut e = Editor::new();
         e.want_line = Some(7);
         assert_eq!(e.want_line, Some(7));
+    }
+
+    #[test]
+    fn call_hint_tracks_argument_index() {
+        let text = "plot(x, y)";
+        assert_eq!(call_hint(text, 5), Some(("plot".into(), 1)));
+        assert_eq!(call_hint(text, 6), Some(("plot".into(), 1)));
+        assert_eq!(call_hint(text, 7), Some(("plot".into(), 2)));
+        assert_eq!(call_hint("zeros(3)", 7), Some(("zeros".into(), 1)));
+        assert_eq!(call_hint("A(:, 2)", 6), Some(("A".into(), 2)));
+        assert!(param_hint("A", 2, "A(:, 2)").is_none());
+    }
+
+    #[test]
+    fn call_hint_ignores_nested_commas_and_strings() {
+        assert_eq!(call_hint("f(g(1, 2), 3)", 11), Some(("f".into(), 2)));
+        assert_eq!(call_hint("disp('a, b')", 8), Some(("disp".into(), 1)));
+        assert_eq!(call_hint("x = [1, 2]; plot(x, 3)", 20), Some(("plot".into(), 2)));
+    }
+
+    #[test]
+    fn signature_table_and_local_functions() {
+        let (sig, _, params) = signature_at("plot", "").unwrap();
+        assert!(sig.starts_with("plot("));
+        assert_eq!(params.len(), 3);
+        let text = "function [a, b] = pair(x, y)\na = x; b = y;\nend\n";
+        let (sig, _, params) = signature_at("pair", text).unwrap();
+        assert_eq!(sig, "pair(x, y)");
+        assert_eq!(params, vec!["x", "y"]);
+        assert!(signature_at("no_such_function", text).is_none());
     }
 }

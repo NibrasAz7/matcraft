@@ -587,6 +587,7 @@ impl Parser {
         let mut props = Vec::new();
         let mut methods = Vec::new();
         let mut enums = Vec::new();
+        let mut events = Vec::new();
         loop {
             self.skip_separators();
             match self.peek() {
@@ -609,15 +610,11 @@ impl Parser {
                 Tok::Ident(k) if k == "events" => {
                     self.next();
                     let _ = self.attr_parens()?;
-                    // Event names are parsed but dropped — they only
-                    // matter for handle-class listeners, which MatCraft
-                    // doesn't model.
-                    let mut drop = Vec::new();
-                    self.class_props(&mut drop, depth)?;
+                    self.class_props(&mut events, depth)?;
                 }
                 Tok::Ident(k) if k == "end" || END_VARIANTS.contains(&k.as_str()) => {
                     self.next();
-                    return Ok(Stmt::ClassDef { name, supers, props, methods, enums });
+                    return Ok(Stmt::ClassDef { name, supers, props, methods, enums, events });
                 }
                 Tok::Eof => return self.err("missing 'end' for 'classdef'"),
                 t => return self.err(format!("expected a classdef section or 'end', found {t:?}")),

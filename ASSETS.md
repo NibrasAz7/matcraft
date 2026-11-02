@@ -11,3 +11,10 @@ templates or sample files — ever.
 | `crates/matlang/tests/fixtures/h5_v2_contiguous.h5` | MatCraft contributors | generated from deterministic 0..5 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v2, contiguous dataset |
 | `crates/matlang/tests/fixtures/h5_v3_gzip.h5` | MatCraft contributors | generated from deterministic 0..23 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, fixed-array chunks |
 | `crates/matlang/tests/fixtures/h5_v3_bt2.h5` | MatCraft contributors | generated from deterministic 0..11 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, B-tree v2 chunks |
+| `crates/matlang/tests/fixtures/h5_ea_plain.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, one unlimited dimension, extensible-array index |
+| `crates/matlang/tests/fixtures/h5_ea_gzip.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, extensible-array index |
+| `crates/matlang/tests/fixtures/h5_ea_col.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, second dimension unlimited, extensible-array index |
+| `crates/matlang/tests/fixtures/h5_bt2_multi.h5` | MatCraft contributors | generated from deterministic 0..399 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, two unlimited dimensions, B-tree v2 index |
+| `crates/matlang/tests/fixtures/h5_vds_src.h5` | MatCraft contributors | generated from deterministic 0..99 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | Virtual-dataset source |
+| `crates/matlang/tests/fixtures/h5_vds.h5` | MatCraft contributors | generated with h5py 3.16 / HDF5 2.0 | CC0-1.0 | Virtual dataset, relative external source, two mappings |
+| `crates/matlang/tests/fixtures/h5_vds_sel.h5` | MatCraft contributors | generated with h5py 3.16 / HDF5 2.0 | CC0-1.0 | Virtual dataset, offset hyperslab mapping |

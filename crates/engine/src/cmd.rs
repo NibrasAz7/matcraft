@@ -80,7 +80,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "rgb2gray imresize imfilter medfilt2 edge bwlabel regionprops graythresh imbinarize imdilate imerode imopen imclose imrotate imcrop strel",
     ),
     ("function handles", "feval func2str str2func functions arrayfun cellfun inline"),
-    ("objects", "isobject methods properties"),
+    ("objects", "isobject methods properties events metaclass ismethod isprop"),
     ("debugging", "dbstop dbclear dbcont dbstatus dbstep dbquit run"),
     ("strings", "num2str int2str mat2str str2double str2num str2mat strcmp strcmpi strncmp strncmpi strmatch strcat upper lower strtrim strrep strfind strtok blanks deblank double logical char regexp regexpi regexprep"),
     ("text scan", "fscanf sscanf textscan strread dlmread dlmwrite csvwrite readmatrix writematrix"),

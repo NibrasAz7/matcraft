@@ -179,8 +179,7 @@
   Second wave: `linprog`/`quadprog` on a shared primal-dual interior-point
   solver (bounds folded into inequalities, `problem`-struct interface,
   `lambda.ineqlin`/`eqlin`/`lower`/`upper`, active-set polish for accurate
-  degenerate bounds), exercised against the COBRA/kinetic-model corpus
-  call shapes.
+  degenerate bounds), exercised against representative external M-code call shapes.
   Third wave: `fmincon` (SQP — linearised-constraint QP subproblems, BFGS
   Lagrangian Hessian, L1 merit line search, `[c,ceq]` nonlinear
   constraints, `problem` struct, `lambda.ineqnonlin`/`eqnonlin`) and
@@ -269,6 +268,9 @@
   `maxNumCompThreads`/`parpool` worker configuration, and an optional `gpu`
   feature (`gpuArray`/`gather`/`canUseGPU`/`gpuDevice`) that runs matmul on a
   wgpu compute shader with a transparent CPU fallback.
+- Editor wave (2026-11): MATLAB-style syntax colours and an Excel-style
+  function-signature popup that follows the caret, highlights the current
+  argument and understands local `function` definitions.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,
