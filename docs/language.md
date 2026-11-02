@@ -337,8 +337,8 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
 | Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style; `image` is an alias), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
-| Image I/O | `imread imwrite im2double imshow fspecial` — PNG only, 8-bit gray or RGB; `imread` returns doubles 0–255 (M×N gray, M×N×3 RGB), `imwrite` writes values ≤ 1 as the [0,1] range and larger values as 0–255; `im2double` scales integral 0..255/0..65535 data to [0,1]; `fspecial('average'|'gaussian'|'disk'|'laplacian'|'log'|'motion'|'prewitt'|'sobel'|'unsharp',…)` builds filter kernels; `imshow(A)` displays an M×N gray or M×N×3 matrix as a true-colour raster (y axis reversed like `imagesc`, same [0,1]-vs-0–255 convention as `imwrite`; `imshow(A,[])` scales to the data range, `imshow(A,[lo hi])` clips), `imshow('file.png')` = `imread` + display |
-| 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `mesh(Z)`/`mesh(X,Y,Z)` — orthographic projection under `view` |
+| Image I/O | `imread imwrite im2double imshow fspecial` — PNG and JPEG (8-bit gray or RGB; `imwrite(...,'Quality',q)`); `imread` returns doubles 0–255 (M×N gray, M×N×3 RGB), `imwrite` writes values ≤ 1 as the [0,1] range and larger values as 0–255; `im2double` scales integral 0..255/0..65535 data to [0,1]; `fspecial('average'|'gaussian'|'disk'|'laplacian'|'log'|'motion'|'prewitt'|'sobel'|'unsharp',…)` builds filter kernels; `imshow(A)` displays an M×N gray or M×N×3 matrix as a true-colour raster (y axis reversed like `imagesc`, same [0,1]-vs-0–255 convention as `imwrite`; `imshow(A,[])` scales to the data range, `imshow(A,[lo hi])` clips), `imshow('file.png')` = `imread` + display |
+| 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `mesh(Z)`/`mesh(X,Y,Z)`, `surfc(...)` with base contours, and `lighting flat|gouraud|none`/`light` Lambert shading — orthographic projection under `view` |
 | Log plots | `semilogx semilogy loglog` — nonpositive points are dropped |
 | Grids | `meshgrid` (`[X,Y] = meshgrid(x,y)`), `histcounts` (`[n,e] = histcounts(v,k)`) |
 | Export | `saveas`, `exportgraphics`, `print` — `.svg`/`.png`/`.pdf` by extension or `-dsvg`/`-dpng`/`-dpdf` flag (PNG/PDF rasterised via resvg; headless) |
@@ -399,17 +399,16 @@ Notes:
   `isreal(complex(3,0))` is `1` (MATLAB keeps the class). Relational
   ops on complex compare real parts.
 - Plotting is headless: SVG/PNG/PDF export but no interactive figure
-  window yet; no `contourf`/`contour3`; `get` covers only root
-  (`ScreenSize`/`ScreenDepth`/`Children`) and basic figure properties —
-  `set` covers only root `Default*` storage and the figure props `get`
-  reports — no `camlight`/`lighting`.
+  window yet; `get` covers only root (`ScreenSize`/`ScreenDepth`/`Children`)
+  and basic figure properties - `set` covers only root `Default*` storage
+  and the figure props `get` reports - no `camlight`/`material`.
 - Functions get a fresh scope but not yet `nargin`-style default *outputs*
   (unassigned output args error). Function handles exist (`@name`,
   `@(a,b) expr`, `inline`, `str2func`/`func2str`/`functions`,
   `feval`/`arrayfun`/`cellfun`); closures capture the workspace by value,
   so a handle can't mutate outer variables.
-- `imread`/`imwrite` are PNG-only and `regexp` uses the Rust regex dialect
-  (no look-around or backreferences). `system` is native-only.
+- `regexp` uses the Rust regex dialect (no look-around or backreferences).
+  `system` is native-only.
 - Char arrays are row-only — `char` on a multi-element cellstr needs a
   2-D char matrix, which the `Str` value can't represent yet.
 - The debugger stops at top-level statement granularity: `dbstop in f at N`

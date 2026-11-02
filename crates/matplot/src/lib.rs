@@ -34,7 +34,7 @@ pub struct Series {
 impl Series {
     /// True for kinds drawn by the 3-D projected path.
     fn is_3d(&self) -> bool {
-        matches!(self.kind, SeriesKind::Line3 | SeriesKind::Mesh | SeriesKind::Surf)
+        matches!(self.kind, SeriesKind::Line3 | SeriesKind::Mesh | SeriesKind::Surf | SeriesKind::Contour3 | SeriesKind::Contour3Base)
     }
 }
 
@@ -64,6 +64,12 @@ pub enum SeriesKind {
     Surf,
     /// `mesh` — a 3-D surface wireframe coloured by z.
     Mesh,
+    /// `contourf` - filled contour bands.
+    ContourF,
+    /// `contour3` - iso-lines at their level in 3-D.
+    Contour3,
+    /// `surfc` - iso-lines projected on the base plane.
+    Contour3Base,
     /// `text` — a string anchored at a data point: `x[0]`/`y[0]` carry
     /// the anchor, `labels[0]` the text, `spec.color` the colour.
     Text,
@@ -102,6 +108,15 @@ pub enum Marker {
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
+    fn scale(self, f: f64) -> Self {
+        let f = f.clamp(0.0, 2.0);
+        Rgb(
+            (self.0 as f64 * f).round().clamp(0.0, 255.0) as u8,
+            (self.1 as f64 * f).round().clamp(0.0, 255.0) as u8,
+            (self.2 as f64 * f).round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
     fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
     }
@@ -222,6 +237,8 @@ pub struct Axes {
     pub clim: Option<(f64, f64)>,
     /// `colorbar` — draw the colour scale beside the axes.
     pub colorbar: bool,
+    /// `lighting flat|gouraud` — Lambert-shade surf faces.
+    pub lighting: bool,
     /// `axis ij`/`imagesc` — y axis increases downward (row 1 at top).
     pub yrev: bool,
     /// `box on` (default) — draw the axes frame; `box off` hides it.
@@ -260,6 +277,7 @@ impl Axes {
         f.cmap = self.cmap;
         f.clim = self.clim;
         f.colorbar = self.colorbar;
+        f.lighting = self.lighting;
         f.yrev = self.yrev;
         f.boxed = self.boxed;
         f.xticks = self.xticks.clone();
@@ -295,6 +313,7 @@ impl Default for Axes {
             cmap: Colormap::Parula,
             clim: None,
             colorbar: false,
+            lighting: false,
             yrev: false,
             boxed: true,
             xticks: None,
@@ -357,6 +376,8 @@ pub struct Figure {
     pub clim: Option<(f64, f64)>,
     /// `colorbar` — draw the colour scale beside the axes.
     pub colorbar: bool,
+    /// `lighting flat|gouraud` — Lambert-shade surf faces.
+    pub lighting: bool,
     /// `imagesc`/`axis ij` — y axis increases downward.
     pub yrev: bool,
     /// `box on` (default) — draw the axes frame; `box off` hides it.
@@ -463,6 +484,7 @@ impl Figure {
             cmap: Colormap::Parula,
             clim: None,
             colorbar: false,
+            lighting: false,
             yrev: false,
             boxed: true,
             sub: None,
@@ -503,6 +525,7 @@ impl Figure {
             cmap: self.cmap,
             clim: self.clim,
             colorbar: self.colorbar,
+            lighting: self.lighting,
             yrev: self.yrev,
             boxed: self.boxed,
             xticks: self.xticks.clone(),
@@ -1300,6 +1323,34 @@ preserveAspectRatio=\"none\" href=\"data:image/png;base64,{}\"/>\n",
                     }
                 }
             }
+            SeriesKind::ContourF => {
+                let (cl, ch) = caxis(fig);
+                let span = (ch - cl).abs().max(f64::EPSILON);
+                let rows = s.zshape.0;
+                let cols = s.zshape.1;
+                for r in 0..rows.saturating_sub(1) {
+                    for c in 0..cols.saturating_sub(1) {
+                        let z00 = s.z.get(r.saturating_mul(cols).saturating_add(c)).copied().unwrap_or(f64::NAN);
+                        let z10 = s.z.get((r + 1).saturating_mul(cols).saturating_add(c)).copied().unwrap_or(f64::NAN);
+                        let z01 = s.z.get(r.saturating_mul(cols).saturating_add(c + 1)).copied().unwrap_or(f64::NAN);
+                        let z11 = s.z.get((r + 1).saturating_mul(cols).saturating_add(c + 1)).copied().unwrap_or(f64::NAN);
+                        if !(z00.is_finite() && z10.is_finite() && z01.is_finite() && z11.is_finite()) {
+                            continue;
+                        }
+                        let avg = 0.25 * (z00 + z10 + z01 + z11);
+                        let col = fig.cmap.map(((avg - cl) / span).clamp(0.0, 1.0)).hex();
+                        let (x0, x1) = (s.x.get(c).copied().unwrap_or(0.0), s.x.get(c + 1).copied().unwrap_or(0.0));
+                        let (y0, y1) = (s.y.get(r).copied().unwrap_or(0.0), s.y.get(r + 1).copied().unwrap_or(0.0));
+                        let pts = [(sx(x0), sy(y0)), (sx(x1), sy(y0)), (sx(x1), sy(y1)), (sx(x0), sy(y1))];
+                        if pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
+                            o.push_str(&format!(
+                                "<path d=\"M{:.2},{:.2}L{:.2},{:.2}L{:.2},{:.2}L{:.2},{:.2}Z\" fill=\"{}\" stroke=\"{}\" stroke-width=\"0.4\"/>\n",
+                                pts[0].0, pts[0].1, pts[1].0, pts[1].1, pts[2].0, pts[2].1, pts[3].0, pts[3].1, col, col
+                            ));
+                        }
+                    }
+                }
+            }
             SeriesKind::Contour => {
                 let (cl, ch) = caxis(fig);
                 let cspan = (ch - cl).abs().max(f64::EPSILON);
@@ -1770,6 +1821,26 @@ fn draw_axes3d(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64,
                     }
                 }
             }
+            SeriesKind::Contour3 | SeriesKind::Contour3Base => {
+                let (rows, cols) = s.zshape;
+                if rows < 2 || cols < 2 {
+                    continue;
+                }
+                let base = z0 + 0.01 * (z1 - z0).max(f64::EPSILON);
+                let col = s.spec.color.unwrap_or(CYCLE[0]).hex();
+                let mut d = String::new();
+                for lv in contour_levels(s, cl, ch) {
+                    let z = if s.kind == SeriesKind::Contour3 { lv } else { base };
+                    for (a, b) in contour_segments(s, lv) {
+                        let pa = px(prj(a.0, a.1, z));
+                        let pb = px(prj(b.0, b.1, z));
+                        if pa.0.is_finite() && pa.1.is_finite() && pb.0.is_finite() && pb.1.is_finite() {
+                            d.push_str(&format!("M{:.2},{:.2}L{:.2},{:.2}", pa.0, pa.1, pb.0, pb.1));
+                        }
+                    }
+                }
+                o.push_str(&format!("<path d=\"{d}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"1.1\"/>\n"));
+            }
             SeriesKind::Mesh | SeriesKind::Surf => {
                 let (rows, cols) = s.zshape;
                 let vtx = |r: usize, c: usize| -> Option<(f64, f64, f64)> {
@@ -1831,7 +1902,20 @@ fn draw_axes3d(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64,
                             }
                         }
                         d.push('Z');
-                        let fill = fig.cmap.map((mz / 4.0 - cl) / cspan).hex();
+                        let mut color = fig.cmap.map((mz / 4.0 - cl) / cspan);
+                        if fig.lighting {
+                            if let (Some(a), Some(b), Some(c)) = (vs[0], vs[1], vs[2]) {
+                                let u = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+                                let v = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
+                                let n = (u.1 * v.2 - u.2 * v.1, u.2 * v.0 - u.0 * v.2, u.0 * v.1 - u.1 * v.0);
+                                let len = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt().max(1e-12);
+                                let light = (0.4f64, 0.4f64, 0.8f64);
+                                let ll = (light.0 * light.0 + light.1 * light.1 + light.2 * light.2).sqrt();
+                                let d = ((n.0 * light.0 + n.1 * light.1 + n.2 * light.2) / (len * ll)).abs();
+                                color = color.scale(0.45 + 0.55 * d);
+                            }
+                        }
+                        let fill = color.hex();
                         o.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\" stroke=\"#333333\" stroke-width=\"0.4\" stroke-opacity=\"0.5\"/>\n"));
                     }
                 }

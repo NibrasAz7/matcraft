@@ -94,7 +94,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "files/path",
         "save load type addpath rmpath savepath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir",
     ),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf mesh vline xline saveas exportgraphics print"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar contourf contour3 semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lighting light lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf surfc mesh vline xline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.

@@ -8542,6 +8542,25 @@ impl Session {
                 };
                 Ok(None)
             }
+            "lighting" => {
+                let v = self.eval_args(args)?;
+                let mode = match v.first() {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    Some(_) => return Err(LangError::new("lighting needs a mode string", 0)),
+                    None => return Ok(Some(Value::Str(if self.figure_mut().lighting { "flat" } else { "none" }.into()))),
+                };
+                match mode.as_str() {
+                    "none" => self.figure_mut().lighting = false,
+                    "flat" | "gouraud" | "phong" => self.figure_mut().lighting = true,
+                    other => return Err(LangError::new(format!("lighting: unknown mode '{other}'"), 0)),
+                }
+                Ok(None)
+            }
+            "light" => {
+                let _ = self.eval_args(args)?;
+                self.figure_mut().lighting = true;
+                Ok(None)
+            }
             "caxis" | "clim" => {
                 let v = self.eval_args(args)?;
                 if v.is_empty() {
@@ -8743,8 +8762,8 @@ impl Session {
                 self.figure_mut().push_pie(m.data().to_vec(), labels);
                 Ok(None)
             }
-            "contour" => {
-                // contour(Z[,n|v]) | contour(X,Y,Z[,n|v])
+            "contour" | "contourf" | "contour3" => {
+                // contour/contourf/contour3(Z[,n|v]) | (X,Y,Z[,n|v])
                 let v = self.eval_args(args)?;
                 let (xv, yv, zm, spec_arg): (Vec<f64>, Vec<f64>, Matrix, Option<&Value>) = match v.len() {
                     1 | 2 => {
@@ -8762,7 +8781,7 @@ impl Session {
                             if ym.numel() == zm.rows() { ym.data().to_vec() } else { (0..zm.rows()).map(|r| ym.get(r, 0).unwrap_or(0.0)).collect() };
                         (x, y, zm, v.get(3))
                     }
-                    _ => return Err(LangError::new("contour needs (Z), (Z,n|v) or (X,Y,Z[,n|v])", 0)),
+                    _ => return Err(LangError::new(format!("{name} needs (Z), (Z,n|v) or (X,Y,Z[,n|v])"), 0)),
                 };
                 let (rows, cols) = zm.shape();
                 check_elems(rows.saturating_mul(cols))?;
@@ -8790,7 +8809,12 @@ impl Session {
                 if !self.figure_mut().hold {
                     self.figure_mut().series.clear();
                 }
-                self.figure_mut().push_grid(SeriesKind::Contour, xv, yv, zm.data().to_vec(), rows, cols, levels, matplot::LineSpec::new());
+                let kind = match name {
+                    "contourf" => SeriesKind::ContourF,
+                    "contour3" => SeriesKind::Contour3,
+                    _ => SeriesKind::Contour,
+                };
+                self.figure_mut().push_grid(kind, xv, yv, zm.data().to_vec(), rows, cols, levels, matplot::LineSpec::new());
                 Ok(None)
             }
             "plot3" => {
@@ -8822,9 +8846,9 @@ impl Session {
                 }
                 Ok(None)
             }
-            "surf" | "mesh" => {
-                // surf(Z) | surf(X,Y,Z) — X/Y vectors or meshgrid matrices.
-                let kind = if name == "surf" { SeriesKind::Surf } else { SeriesKind::Mesh };
+            "surf" | "mesh" | "surfc" => {
+                // surf/surfc/mesh(Z) | (X,Y,Z) — vectors or meshgrid matrices.
+                let kind = if matches!(name, "surf" | "surfc") { SeriesKind::Surf } else { SeriesKind::Mesh };
                 let v = self.eval_args(args)?;
                 let zm = match v.len() {
                     1 => v[0].to_matrix()?,
@@ -8865,7 +8889,22 @@ impl Session {
                 if !self.figure_mut().hold {
                     self.figure_mut().series.clear();
                 }
-                self.figure_mut().push_grid(kind, xf, yf, zm.data().to_vec(), rows, cols, Vec::new(), matplot::LineSpec::new());
+                let zdata = zm.data().to_vec();
+                if name == "surfc" {
+                    self.figure_mut().push_grid(
+                        SeriesKind::Surf,
+                        xf.clone(),
+                        yf.clone(),
+                        zdata.clone(),
+                        rows,
+                        cols,
+                        Vec::new(),
+                        matplot::LineSpec::new(),
+                    );
+                    self.figure_mut().push_grid(SeriesKind::Contour3Base, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
+                } else {
+                    self.figure_mut().push_grid(kind, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
+                }
                 Ok(None)
             }
             "daspect" => {
@@ -13470,7 +13509,7 @@ impl Session {
                     _ => return Err(LangError::new("imread needs a filename", 0)),
                 };
                 let bytes = std::fs::read(&fname).map_err(|e| LangError::new(format!("imread: cannot read {fname}: {e}"), 0))?;
-                let (w, h, px, ch) = crate::imgpng::decode(&bytes)?;
+                let (w, h, px, ch) = if bytes.starts_with(&[0xFF, 0xD8]) { decode_jpeg(&bytes)? } else { crate::imgpng::decode(&bytes)? };
                 check_elems(h.saturating_mul(w).saturating_mul(ch))?;
                 if ch == 1 {
                     let mut data = Vec::with_capacity(w * h);
@@ -13519,8 +13558,24 @@ impl Session {
                         }
                     }
                 }
-                let png = crate::imgpng::encode(w, h, &px, ch)?;
-                crate::write_file(std::path::Path::new(&fname), &png)
+                let ext = fname.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                let mut quality = 90u8;
+                let mut i = 2usize;
+                while i + 1 < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        if key.eq_ignore_ascii_case("quality") {
+                            let q = v.get(i + 1).and_then(|x| x.scalar().ok()).unwrap_or(90.0).round();
+                            if !q.is_finite() || !(0.0..=100.0).contains(&q) {
+                                return Err(LangError::new("imwrite: Quality must be between 0 and 100", 0));
+                            }
+                            quality = q as u8;
+                        }
+                    }
+                    i += 2;
+                }
+                let bytes =
+                    if matches!(ext.as_str(), "jpg" | "jpeg") { encode_jpeg(w, h, &px, ch, quality)? } else { crate::imgpng::encode(w, h, &px, ch)? };
+                crate::write_file(std::path::Path::new(&fname), &bytes)
                     .map_err(|e| LangError::new(format!("imwrite: cannot write {fname}: {e}"), 0))?;
                 Ok(None)
             }
@@ -16476,6 +16531,32 @@ fn trapz(x: &Matrix, y: &Matrix) -> f64 {
 /// Histogram bin counts and edges over `nb` equal-width bins.
 /// Pick an output format for `saveas`/`exportgraphics`/`print` and render
 /// the figure to bytes. `fmt` overrides the extension (`-dpng` &c.).
+fn decode_jpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>, usize), LangError> {
+    let img = ::image::load_from_memory_with_format(bytes, ::image::ImageFormat::Jpeg)
+        .map_err(|e| LangError::new(format!("imread: JPEG decode failed: {e}"), 0))?;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    match img {
+        ::image::DynamicImage::ImageLuma8(g) => Ok((w, h, g.into_raw(), 1)),
+        ::image::DynamicImage::ImageRgb8(r) => Ok((w, h, r.into_raw(), 3)),
+        other => {
+            let rgb = other.to_rgb8();
+            Ok((w, h, rgb.into_raw(), 3))
+        }
+    }
+}
+
+fn encode_jpeg(w: usize, h: usize, px: &[u8], ch: usize, quality: u8) -> Result<Vec<u8>, LangError> {
+    if w == 0 || h == 0 || w > u16::MAX as usize || h > u16::MAX as usize {
+        return Err(LangError::new("imwrite: JPEG dimensions must be between 1 and 65535", 0));
+    }
+    let mut out = Vec::new();
+    let color = if ch == 1 { ::image::ExtendedColorType::L8 } else { ::image::ExtendedColorType::Rgb8 };
+    ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode(px, w as u32, h as u32, color)
+        .map_err(|e| LangError::new(format!("imwrite: JPEG encode failed: {e}"), 0))?;
+    Ok(out)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn export_figure(fig: &matplot::Figure, file: &str, fmt: Option<&str>) -> Result<Vec<u8>, LangError> {
     let kind = fmt.map(str::to_string).unwrap_or_else(|| file.rsplit('.').next().unwrap_or("svg").to_ascii_lowercase());
@@ -17138,6 +17219,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "view",
     "colormap",
     "colorbar",
+    "lighting",
+    "light",
     "lines",
     "validatecolor",
     "caxis",
@@ -17150,8 +17233,11 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "daspect",
     "pie",
     "contour",
+    "contourf",
+    "contour3",
     "plot3",
     "surf",
+    "surfc",
     "mesh",
     "saveas",
     "exportgraphics",
@@ -19463,11 +19549,38 @@ legend('sig'); grid on; saveas('{f}')"
         assert_eq!(fig.series[0].levels.len(), 3);
         assert!(matplot::to_svg(fig).contains("<path"));
 
+        s.run("clf; [X,Y]=meshgrid(-2:2,-2:2); contourf(X.^2+Y.^2, 3)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series[0].kind, SeriesKind::ContourF);
+        assert!(matplot::to_svg(fig).matches("fill=\"").count() > 3);
+
+        s.run("clf; [X,Y]=meshgrid(-2:2,-2:2); contour3(X.^2+Y.^2, 3)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series[0].kind, SeriesKind::Contour3);
+        assert!(matplot::to_svg(fig).contains("<path"));
+
         s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surf(X,Y,X.^2+Y.^2)").unwrap();
         let fig = &s.figs[0];
         assert_eq!(fig.series[0].kind, SeriesKind::Surf);
         assert_eq!(fig.series[0].zshape, (3, 3));
         assert!(matplot::to_svg(fig).contains("<path"));
+
+        s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surfc(X,Y,X.^2+Y.^2)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series.len(), 2);
+        assert_eq!(fig.series[0].kind, SeriesKind::Surf);
+        assert_eq!(fig.series[1].kind, SeriesKind::Contour3Base);
+        assert!(matplot::to_svg(fig).contains("<path"));
+
+        s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surf(X,Y,X.^2+Y.^2); lighting flat").unwrap();
+        assert!(s.figs[0].lighting);
+        let lit = matplot::to_svg(&s.figs[0]);
+        s.run("lighting none").unwrap();
+        assert!(!s.figs[0].lighting);
+        let plain = matplot::to_svg(&s.figs[0]);
+        assert_ne!(lit, plain);
+        s.run("light").unwrap();
+        assert!(s.figs[0].lighting);
 
         s.run("clf; mesh(-1:1, -1:1, [1 2 3; 4 5 6; 7 8 9])").unwrap();
         assert_eq!(s.figs[0].series[0].kind, SeriesKind::Mesh);
@@ -19549,6 +19662,28 @@ legend('sig'); grid on; saveas('{f}')"
         assert_eq!(s.get("rp").unwrap().scalar().unwrap(), 1.0);
         assert!((s.get("tp").unwrap().scalar().unwrap() - 0.1).abs() < 1e-12);
         assert!((s.get("dp").unwrap().scalar().unwrap() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn image_jpeg_roundtrip() {
+        let dir = m_dir("jpeg");
+        let rgb = dir.join("color.jpg");
+        let gray = dir.join("gray.jpg");
+        let p = rgb.to_string_lossy().replace('\\', "/");
+        let g = gray.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "A = zeros(8,8,3); for r=1:8, for c=1:8, A(r,c,1)=r*30; A(r,c,2)=c*30; A(r,c,3)=128; end; end; \
+             imwrite(A, '{p}', 'Quality', 95); B = imread('{p}'); sz = size(B); err = max(max(max(abs(B - A)))); \
+             G = round(linspace(0, 255, 16)); G = reshape(G, 4, 4); imwrite(G, '{g}'); H = imread('{g}'); gsz = size(H);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("sz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![8.0, 8.0, 3.0]));
+        assert!(s.get("err").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY) < 15.0);
+        assert_eq!(s.get("gsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![4.0, 4.0]));
+        let bytes = std::fs::read(&rgb).unwrap();
+        assert_eq!(bytes.get(..2), Some(&[0xFF, 0xD8][..]));
+        rm_dir(&dir);
     }
 
     #[test]

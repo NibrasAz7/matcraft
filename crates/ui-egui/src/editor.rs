@@ -506,6 +506,10 @@ const KEYWORDS: &[&str] = &[
 /// field is the display signature, the second a one-line description.
 const SIGNATURES: &[(&str, &str, &str)] = &[
     ("plot", "plot(X, Y, LineSpec)", "Plot columns of Y against X; LineSpec selects colour, marker and line style."),
+    ("contourf", "contourf(Z, N)", "Filled contour plot of grid data."),
+    ("contour3", "contour3(Z, N)", "3-D contour lines at their level."),
+    ("surfc", "surfc(Z)", "Surface plot with base contour lines."),
+    ("lighting", "lighting(Mode)", "Set surface lighting: flat, gouraud or none."),
     ("plot3", "plot3(X, Y, Z, LineSpec)", "Plot 3-D lines through the columns of X, Y and Z."),
     ("scatter", "scatter(X, Y, Size, Color, Marker)", "Draw a scatter plot with optional marker size, colour and shape."),
     ("bar", "bar(Y, Style)", "Draw a bar chart; Style selects grouped, stacked or horizontal bars."),

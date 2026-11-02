@@ -2161,6 +2161,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core 0.5.3",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]
@@ -2518,6 +2520,7 @@ dependencies = [
  "bytemuck",
  "craft-atomic",
  "flate2",
+ "image",
  "matcore",
  "matplot",
  "pollster 0.4.0",

@@ -12,6 +12,7 @@ workspace = true
 matcore = { path = "../matcore" }
 matplot = { path = "../matplot" }
 flate2 = "1.1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 regex = "1"
 serde_json = "1"
 

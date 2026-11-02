@@ -350,6 +350,9 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- Graphics-depth wave (2026-11): filled `contourf`, 3-D `contour3`,
+  `surfc` base contours, Lambert `lighting`/`light` shading for surf, and
+  JPEG read/write through a pure-Rust codec.
 - Statistics-depth wave (2026-11): `tLocationScale` MLE via bounded
   Nelder-Mead, Gaussian-kernel `fitdist` with Silverman bandwidth,
   `chi2gof` with expected-count merging, and a seeded t-SNE embedding
