@@ -9,6 +9,13 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OdeMethod {
+    Rk45,
+    Rk23,
+    Trbdf2,
+}
+
 #[derive(Clone)]
 struct OdeOptions {
     rel_tol: Matrix,
@@ -217,6 +224,30 @@ impl Session {
         Ok((ynew, err, fnew))
     }
 
+    /// Bogacki–Shampine 3(2) step used by `ode23`.
+    fn rk23_step(&mut self, target: &Value, t: f64, y: &[f64], h: f64, mass: Option<&Value>) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), LangError> {
+        let n = y.len();
+        let stage = |sums: &[(f64, &Vec<f64>)]| -> Vec<f64> {
+            (0..n)
+                .map(|i| {
+                    let mut v = y.get(i).copied().unwrap_or(0.0);
+                    for (a, k) in sums {
+                        v += h * *a * k.get(i).copied().unwrap_or(0.0);
+                    }
+                    v
+                })
+                .collect()
+        };
+        let k1 = self.ode_eval(target, t, y, mass)?;
+        let k2 = self.ode_eval(target, t + h / 2.0, &stage(&[(1.0 / 2.0, &k1)]), mass)?;
+        let k3 = self.ode_eval(target, t + 3.0 * h / 4.0, &stage(&[(3.0 / 4.0, &k2)]), mass)?;
+        let ynew = stage(&[(2.0 / 9.0, &k1), (1.0 / 3.0, &k2), (4.0 / 9.0, &k3)]);
+        let fnew = self.ode_eval(target, t + h, &ynew, mass)?;
+        let second = stage(&[(7.0 / 24.0, &k1), (1.0 / 4.0, &k2), (1.0 / 3.0, &k3), (1.0 / 8.0, &fnew)]);
+        let err = ynew.iter().zip(second.iter()).map(|(a, b)| a - b).collect();
+        Ok((ynew, err, fnew))
+    }
+
     fn trbdf2_step(&mut self, target: &Value, t: f64, y: &[f64], h: f64, mass: Option<&Value>) -> Result<(Vec<f64>, Vec<f64>), LangError> {
         let n = y.len();
         let gamma = 2.0 - 2f64.sqrt();
@@ -288,7 +319,7 @@ impl Session {
     fn ode_integrate(
         &mut self,
         target: &Value,
-        stiff: bool,
+        method: OdeMethod,
         t0: f64,
         tf: f64,
         y0: &[f64],
@@ -301,7 +332,7 @@ impl Session {
             return Err(LangError::new("tspan must increase", 0));
         }
         let max_step = opts.max_step.unwrap_or(span / 10.0).max(1e-12);
-        let mut h = opts.initial_step.unwrap_or(if stiff { span * 1e-3 } else { span * 0.01 });
+        let mut h = opts.initial_step.unwrap_or(if method == OdeMethod::Trbdf2 { span * 1e-3 } else { span * 0.01 });
         h = h.min(max_step).min(span);
         let mut t = t0;
         let mut y = y0.to_vec();
@@ -321,15 +352,22 @@ impl Session {
             if h_use <= 1e-15 * span.max(1.0) {
                 return Err(LangError::new("ODE step size underflow", 0));
             }
-            let (ynew, err) = if stiff {
-                let (y1, _) = self.trbdf2_step(target, t, &y, h_use, opts.mass.as_ref())?;
-                let (yh, _) = self.trbdf2_step(target, t, &y, h_use / 2.0, opts.mass.as_ref())?;
-                let (y2, _) = self.trbdf2_step(target, t + h_use / 2.0, &yh, h_use / 2.0, opts.mass.as_ref())?;
-                let e: Vec<f64> = y2.iter().zip(y1.iter()).map(|(a, b)| (a - b) / 3.0).collect();
-                (y2, e)
-            } else {
-                let (yn, e, _) = self.rk45_step(target, t, &y, h_use, opts.mass.as_ref())?;
-                (yn, e)
+            let (ynew, err) = match method {
+                OdeMethod::Trbdf2 => {
+                    let (y1, _) = self.trbdf2_step(target, t, &y, h_use, opts.mass.as_ref())?;
+                    let (yh, _) = self.trbdf2_step(target, t, &y, h_use / 2.0, opts.mass.as_ref())?;
+                    let (y2, _) = self.trbdf2_step(target, t + h_use / 2.0, &yh, h_use / 2.0, opts.mass.as_ref())?;
+                    let e: Vec<f64> = y2.iter().zip(y1.iter()).map(|(a, b)| (a - b) / 3.0).collect();
+                    (y2, e)
+                }
+                OdeMethod::Rk45 => {
+                    let (yn, e, _) = self.rk45_step(target, t, &y, h_use, opts.mass.as_ref())?;
+                    (yn, e)
+                }
+                OdeMethod::Rk23 => {
+                    let (yn, e, _) = self.rk23_step(target, t, &y, h_use, opts.mass.as_ref())?;
+                    (yn, e)
+                }
             };
             let mut scaled = 0.0f64;
             for i in 0..n {
@@ -337,7 +375,10 @@ impl Session {
                     + rt.get(i).copied().unwrap_or(1e-3) * y.get(i).copied().unwrap_or(0.0).abs().max(ynew.get(i).copied().unwrap_or(0.0).abs());
                 scaled = scaled.max(err.get(i).copied().unwrap_or(0.0).abs() / scale);
             }
-            let order = if stiff { 2.0 } else { 4.0 };
+            let order = match method {
+                OdeMethod::Rk45 => 4.0,
+                OdeMethod::Rk23 | OdeMethod::Trbdf2 => 2.0,
+            };
             if scaled <= 1.0 {
                 let t_step = (t + h_use).min(tf);
                 let mut accepted_t = t_step;
@@ -467,7 +508,7 @@ impl Session {
                 }
                 Ok(vec![Value::Mat(out)])
             }
-            "ode45" | "ode15s" => {
+            "ode45" | "ode15s" | "ode23" | "ode23s" => {
                 let target = argv.first().ok_or_else(|| LangError::new(format!("{name} needs an odefun"), 0))?.clone();
                 let span_m = argv.get(1).ok_or_else(|| LangError::new(format!("{name} needs tspan"), 0))?.to_numeric()?;
                 if span_m.numel() < 2 {
@@ -483,8 +524,13 @@ impl Session {
                 }
                 check_elems(y0.len().saturating_mul(y0.len()).saturating_mul(4))?;
                 let opts = options_from_value(argv.get(3))?;
+                let method = match name {
+                    "ode15s" | "ode23s" => OdeMethod::Trbdf2,
+                    "ode23" => OdeMethod::Rk23,
+                    _ => OdeMethod::Rk45,
+                };
                 let (ts, ys, fs, events) =
-                    self.ode_integrate(&target, name == "ode15s", span.first().copied().unwrap_or(0.0), *span.last().unwrap_or(&0.0), &y0, &opts)?;
+                    self.ode_integrate(&target, method, span.first().copied().unwrap_or(0.0), *span.last().unwrap_or(&0.0), &y0, &opts)?;
                 let ie = Matrix::col_vector(events.iter().map(|(i, _, _)| *i as f64).collect());
                 let te = Matrix::col_vector(events.iter().map(|(_, t, _)| *t).collect());
                 let mut ye = Matrix::zeros(events.len(), y0.len());

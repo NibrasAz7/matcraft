@@ -553,6 +553,8 @@ const SIGNATURES: &[(&str, &str, &str)] = &[
     ("conv", "conv(A, B, Shape)", "Convolution of two vectors."),
     ("filter", "filter(B, A, X)", "One-dimensional digital filter."),
     ("ode45", "ode45(OdeFcn, TSpan, Y0, Options)", "Solve a non-stiff ordinary differential equation."),
+    ("ode23", "ode23(OdeFcn, TSpan, Y0, Options)", "Solve a non-stiff ODE with the Bogacki-Shampine 3(2) method."),
+    ("ode23s", "ode23s(OdeFcn, TSpan, Y0, Options)", "Solve a stiff ODE with a second-order stiffly stable method."),
     ("fsolve", "fsolve(Fun, X0, Options)", "Solve a system of nonlinear equations."),
     ("fminsearch", "fminsearch(Fun, X0, Options)", "Derivative-free unconstrained minimisation."),
     ("fminbnd", "fminbnd(Fun, Lower, Upper, Options)", "Minimise a scalar function on a bounded interval."),

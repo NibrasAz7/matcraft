@@ -6904,7 +6904,7 @@ impl Session {
                 let out = self.umap_call(&v, 1)?;
                 Ok(out.into_iter().next())
             }
-            "ode45" | "ode15s" | "odeset" | "odeget" | "deval" => {
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "odeset" | "odeget" | "deval" => {
                 let v = self.eval_args(args)?;
                 let out = self.ode_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -10841,7 +10841,7 @@ impl Session {
                 let v = self.eval_args(args)?;
                 self.umap_call(&v, nout)?
             }
-            "ode45" | "ode15s" | "odeset" | "odeget" | "deval" => {
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "odeset" | "odeget" | "deval" => {
                 let v = self.eval_args(args)?;
                 self.ode_builtin(name, v, nout)?
             }
@@ -16835,6 +16835,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "umap",
     "ode45",
     "ode15s",
+    "ode23",
+    "ode23s",
     "deval",
     "odeset",
     "odeget",
@@ -23253,6 +23255,22 @@ end",
         assert_eq!(scalar(&s, "here"), 1.0);
         assert_eq!(scalar(&s, "nope"), 0.0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ode23_and_ode23s() {
+        let mut s = Session::new();
+        s.run(
+            "f = @(t,y) -y; [t3,y3] = ode23(f, [0 1], 1); e3 = abs(y3(end) - exp(-1)); \
+             g = @(t,y) -100*y; [ts,ys] = ode23s(g, [0 1], 1); es = abs(ys(end));",
+        )
+        .unwrap();
+        let e3 = s.get("e3").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY);
+        assert!(e3 < 1e-3, "ode23 error = {e3}");
+        let es = s.get("es").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY);
+        assert!(es < 1e-6, "ode23s stiff residual = {es}");
+        assert!(s.get("t3").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
+        assert!(s.get("ts").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
     }
 
     #[test]

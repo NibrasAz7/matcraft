@@ -342,6 +342,9 @@
 - MAT opaque-object wave (2026-11): `.mat` v5 `mxOPAQUE_CLASS`
   variables (MCOS references into subsystem data) are recognized and
   rejected with a clear variable/class error instead of being misread.
+- ODE-variant wave (2026-11): `ode23` uses the Bogacki-Shampine 3(2)
+  tableau; `ode23s` reuses the TR-BDF2 stiff engine, with closed-form
+  decay and stiff-decay regression tests.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,

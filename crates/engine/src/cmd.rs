@@ -64,7 +64,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "statistics",
         "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween fitlm optimalleaforder",
     ),
-    ("ode", "ode45 ode15s odeset odeget deval"),
+    ("ode", "ode45 ode15s ode23 ode23s odeset odeget deval"),
     (
         "corpus classes",
         "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count parpool maxNumCompThreads gpuArray gather canUseGPU existsOnGPU gpuDevice parfeval fetchOutputs onCleanup categorical reordercats categories countcats addcats removecats mergecats renamecats isundefined isdatetime isduration istimetable datetime duration seconds",
