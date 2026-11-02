@@ -14,6 +14,7 @@ templates or sample files — ever.
 | `crates/matlang/tests/fixtures/h5_ea_plain.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, one unlimited dimension, extensible-array index |
 | `crates/matlang/tests/fixtures/h5_ea_gzip.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, gzip+shuffle, extensible-array index |
 | `crates/matlang/tests/fixtures/h5_ea_col.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, second dimension unlimited, extensible-array index |
+| `crates/matlang/tests/fixtures/h5_fa_paged.h5` | MatCraft contributors | generated from deterministic 0..9999 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, 2500 fixed-array entries, paged index |
 | `crates/matlang/tests/fixtures/h5_bt2_multi.h5` | MatCraft contributors | generated from deterministic 0..399 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v3, two unlimited dimensions, B-tree v2 index |
 | `crates/matlang/tests/fixtures/h5_vds_src.h5` | MatCraft contributors | generated from deterministic 0..99 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | Virtual-dataset source |
 | `crates/matlang/tests/fixtures/h5_vds.h5` | MatCraft contributors | generated with h5py 3.16 / HDF5 2.0 | CC0-1.0 | Virtual dataset, relative external source, two mappings |

@@ -1294,22 +1294,32 @@ fn collect_fixed_array(
     let page_bits = b.get(addr + 7).copied().unwrap_or(10) as usize;
     let num = len_at(b, addr + 8, ctx);
     let data_addr = off_at(b, addr + 8 + ctx.length_size, ctx);
-    if page_bits < 32 && num > (1usize << page_bits) {
-        return Err(LangError::new("hdf5: paged fixed-array chunk indexes are not supported", 0));
-    }
     if b.get(data_addr..data_addr + 4) != Some(b"FADB") {
         return Err(LangError::new("hdf5: fixed-array data block is missing", 0));
     }
-    let mut p = data_addr + 6;
-    p += ctx.offset_size;
+    let page_nelmts = 1usize << page_bits.min(30);
+    let paged = page_bits < 32 && num > page_nelmts;
+    let header = data_addr + 6 + ctx.offset_size;
+    let bitmap_len = if paged { num.div_ceil(page_nelmts).div_ceil(8) } else { 0 };
+    let pages_base = header.saturating_add(bitmap_len).saturating_add(if paged { 4 } else { 0 });
+    let page_size = page_nelmts.saturating_mul(entry_size).saturating_add(4);
     for i in 0..num.min(grid) {
+        let elem_off = if paged {
+            let page = i / page_nelmts;
+            if b.get(header + page / 8).map(|v| v & (0x80u8 >> (page % 8)) == 0).unwrap_or(true) {
+                continue;
+            }
+            pages_base.saturating_add(page.saturating_mul(page_size)).saturating_add((i % page_nelmts).saturating_mul(entry_size))
+        } else {
+            pages_base.saturating_add(i.saturating_mul(entry_size))
+        };
+        let mut p = elem_off;
         let chunk_addr = off_at(b, p, ctx);
         p += ctx.offset_size;
         let (nbytes, mask) = if client == 1 {
             let n = read_uint(b, p, entry_size.saturating_sub(ctx.offset_size + 4)).unwrap_or(0) as usize;
             p += entry_size.saturating_sub(ctx.offset_size + 4);
             let m = u32_at(b, p).unwrap_or(0);
-            p += 4;
             (n, m)
         } else {
             (raw_size, 0)
@@ -2263,6 +2273,11 @@ mod tests {
     #[test]
     fn read_multi_unlimited_btree_v2() {
         check_fixture(include_bytes!("../tests/fixtures/h5_bt2_multi.h5"), "a", &[20, 20], 400);
+    }
+
+    #[test]
+    fn read_paged_fixed_array() {
+        check_fixture(include_bytes!("../tests/fixtures/h5_fa_paged.h5"), "a", &[100, 100], 10_000);
     }
 
     #[test]
