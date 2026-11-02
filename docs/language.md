@@ -251,8 +251,9 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   MATLAB object files load as class-tagged objects. `save(...,'-mcos')` writes
   scalar objects and object arrays as opaque records plus a subsystem, and
   encodes nested object-valued properties recursively; default `save` keeps
-  the field-based `mxOBJECT` encoding. Cyclic handle-object graphs are depth
-  guarded and report an error rather than recursing forever.
+  the field-based `mxOBJECT` encoding. Cyclic handle-object graphs are
+  preserved through shared handle shells, so `a.next.next` reads back as `a`
+  instead of erroring.
 - `builtin('name', …)` calls a raw built-in implementation, bypassing
   user functions and class overloads. It supports multi-output builtins
   (`[r,c] = builtin('size', x)`) and numeric operator aliases such as

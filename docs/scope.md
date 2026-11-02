@@ -21,7 +21,6 @@ These are tracked as post-1.0 depth work, not as incomplete blocks.
 
 | Area | Status | Reason |
 | --- | --- | --- |
-| MCOS cyclic handle graphs | Depth guarded | Cyclic handle-object graphs exceed the reader depth guard and report an error; acyclic scalar/array/nested graphs are supported. |
 | Deployment | macOS/Linux device QA, signing/notarization, public web hosting | Requires external machines, certificates and hosting credentials. |
 
 ## Evidence

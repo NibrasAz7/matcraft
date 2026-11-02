@@ -350,6 +350,9 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- MCOS-cycle wave (2026-11): the reader resolves object ids through a
+  shared handle-shell cache, so cyclic and shared references survive
+  `save(...,'-mcos')`/`load` without recursion errors.
 - Graphics-depth wave (2026-11): filled `contourf`, 3-D `contour3`,
   `surfc` base contours, Lambert `lighting`/`light` shading for surf, and
   JPEG read/write through a pure-Rust codec.

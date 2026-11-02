@@ -388,6 +388,21 @@ impl MObject {
     }
 
     /// Rebuild a scalar object loaded from a MAT-file.
+    /// An empty handle-backed object used while resolving cyclic MCOS
+    /// graphs: the store is shared, so references created before the fields
+    /// are filled see the completed object.
+    pub(crate) fn handle_shell(class_name: String) -> Self {
+        MObject::new(class_name, StructArray::new(), true)
+    }
+
+    /// Replace the shared/owned property store of a shell object.
+    pub(crate) fn replace_props(&mut self, props: StructArray) {
+        match &mut self.props {
+            ObjStore::Owned(s) => *s = props,
+            ObjStore::Shared(s) => *s.borrow_mut() = props,
+        }
+    }
+
     pub(crate) fn from_saved(class_name: String, props: StructArray) -> Self {
         MObject::new(class_name, props, false)
     }
@@ -21868,6 +21883,35 @@ end",
         let bytes = std::fs::read(&file).unwrap();
         let off = bytes.get(116..124).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).unwrap_or(0);
         assert!(off > 128, "MCOS subsystem offset = {off}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_cycle() {
+        let dir = m_dir("mcoscycle");
+        let file = dir.join("cycle.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef CycleNode < handle
+                properties
+                    value = 0
+                    next
+                end
+            end",
+        )
+        .unwrap();
+        s.run(&format!(
+            "a = CycleNode(); a.value = 1; b = CycleNode(); b.value = 2; a.next = b; b.next = a; \
+             save('{path}', 'a', '-mcos'); clear a b; load('{path}'); \
+             c1 = a.value; c2 = a.next.value; c3 = a.next.next.value; c4 = a.next.next.next.value; cclass = class(a.next);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("c1"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("c2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("c3"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("c4"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("cclass"), Some(&Value::Str("CycleNode".into())));
         rm_dir(&dir);
     }
 

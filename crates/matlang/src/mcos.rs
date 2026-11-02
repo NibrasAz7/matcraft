@@ -275,6 +275,7 @@ pub(crate) struct Ctx {
     dyn_props: Vec<u32>,
     prop_vals: Vec<Raw>,
     defaults: Vec<Raw>,
+    cache: std::cell::RefCell<std::collections::HashMap<u32, MObject>>,
 }
 
 impl Ctx {
@@ -361,7 +362,16 @@ impl Ctx {
             Some(Raw::Cell { items, .. }) => items.clone(),
             _ => Vec::new(),
         };
-        Ok(Ctx { names, classes, objects, obj_props, dyn_props, prop_vals, defaults })
+        Ok(Ctx {
+            names,
+            classes,
+            objects,
+            obj_props,
+            dyn_props,
+            prop_vals,
+            defaults,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        })
     }
 
     fn class_name(&self, class_id: u32) -> Result<String, String> {
@@ -407,9 +417,14 @@ impl Ctx {
     }
 
     fn build_object(&self, object_id: u32, depth: usize) -> Result<Value, String> {
+        if let Some(existing) = self.cache.borrow().get(&object_id) {
+            return Ok(Value::Object(existing.clone()));
+        }
         let meta = self.object_meta(object_id)?;
         let class_id = meta.first().copied().unwrap_or(0);
         let class = self.class_name(class_id)?;
+        let shell = MObject::handle_shell(class.clone());
+        self.cache.borrow_mut().insert(object_id, shell.clone());
         let mut props = StructArray::new();
         if let Some(Raw::Struct(def)) = self.defaults.get(class_id as usize) {
             if def.rows.saturating_mul(def.cols) > 0 {
@@ -441,7 +456,9 @@ impl Ctx {
             }
         }
         let _ = &self.dyn_props;
-        Ok(Value::Object(MObject::from_saved(class, props)))
+        let mut object = shell;
+        object.replace_props(props);
+        Ok(Value::Object(object))
     }
 
     fn raw_value(&self, raw: &Raw, depth: usize) -> Result<Value, String> {
