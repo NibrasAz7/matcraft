@@ -44,6 +44,8 @@ pub enum SeriesKind {
     Scatter,
     Stem,
     Bar,
+    /// Horizontal bar: `x` carries the lengths, `y` the bar positions.
+    BarH,
     /// Filled polygon from the curve down to y = 0.
     Area,
     /// Piecewise-constant step line (hold each y until the next x).
@@ -224,6 +226,15 @@ pub struct Axes {
     pub yrev: bool,
     /// `box on` (default) — draw the axes frame; `box off` hides it.
     pub boxed: bool,
+    /// Explicit tick positions and labels (`xticks`/`xticklabels`).
+    pub xticks: Option<Vec<f64>>,
+    pub yticks: Option<Vec<f64>>,
+    pub xticklabels: Option<Vec<String>>,
+    pub yticklabels: Option<Vec<String>>,
+    pub xtickangle: Option<f64>,
+    pub ytickangle: Option<f64>,
+    /// `colororder` palette; `None` = the default seven-colour cycle.
+    pub palette: Option<Vec<Rgb>>,
     pub drawn: usize,
 }
 
@@ -251,6 +262,13 @@ impl Axes {
         f.colorbar = self.colorbar;
         f.yrev = self.yrev;
         f.boxed = self.boxed;
+        f.xticks = self.xticks.clone();
+        f.yticks = self.yticks.clone();
+        f.xticklabels = self.xticklabels.clone();
+        f.yticklabels = self.yticklabels.clone();
+        f.xtickangle = self.xtickangle;
+        f.ytickangle = self.ytickangle;
+        f.palette = self.palette.clone();
         f.drawn = self.drawn;
         f
     }
@@ -279,6 +297,13 @@ impl Default for Axes {
             colorbar: false,
             yrev: false,
             boxed: true,
+            xticks: None,
+            yticks: None,
+            xticklabels: None,
+            yticklabels: None,
+            xtickangle: None,
+            ytickangle: None,
+            palette: None,
             drawn: 0,
         }
     }
@@ -338,6 +363,17 @@ pub struct Figure {
     pub boxed: bool,
     /// `subplot` tiling; when set, `to_svg` renders one axes per tile.
     pub sub: Option<Subplot>,
+    /// `sgtitle` — a figure-wide title drawn above the axes/tiles.
+    pub sgtitle: Option<String>,
+    /// Explicit tick positions and labels.
+    pub xticks: Option<Vec<f64>>,
+    pub yticks: Option<Vec<f64>>,
+    pub xticklabels: Option<Vec<String>>,
+    pub yticklabels: Option<Vec<String>>,
+    pub xtickangle: Option<f64>,
+    pub ytickangle: Option<f64>,
+    /// `colororder` palette; `None` = the default seven-colour cycle.
+    pub palette: Option<Vec<Rgb>>,
     /// Series drawn so far; drives the default colour cycle.
     drawn: usize,
 }
@@ -430,6 +466,14 @@ impl Figure {
             yrev: false,
             boxed: true,
             sub: None,
+            sgtitle: None,
+            xticks: None,
+            yticks: None,
+            xticklabels: None,
+            yticklabels: None,
+            xtickangle: None,
+            ytickangle: None,
+            palette: None,
             drawn: 0,
         }
     }
@@ -461,6 +505,13 @@ impl Figure {
             colorbar: self.colorbar,
             yrev: self.yrev,
             boxed: self.boxed,
+            xticks: self.xticks.clone(),
+            yticks: self.yticks.clone(),
+            xticklabels: self.xticklabels.clone(),
+            yticklabels: self.yticklabels.clone(),
+            xtickangle: self.xtickangle,
+            ytickangle: self.ytickangle,
+            palette: self.palette.clone(),
             drawn: self.drawn,
         }
     }
@@ -486,6 +537,13 @@ impl Figure {
         self.colorbar = a.colorbar;
         self.yrev = a.yrev;
         self.boxed = a.boxed;
+        self.xticks = a.xticks.clone();
+        self.yticks = a.yticks.clone();
+        self.xticklabels = a.xticklabels.clone();
+        self.yticklabels = a.yticklabels.clone();
+        self.xtickangle = a.xtickangle;
+        self.ytickangle = a.ytickangle;
+        self.palette = a.palette.clone();
         self.drawn = a.drawn;
     }
 
@@ -562,11 +620,19 @@ impl Figure {
             || self.grid
             || self.xlog
             || self.ylog
+            || self.xticks.is_some()
+            || self.yticks.is_some()
+            || self.xticklabels.is_some()
+            || self.yticklabels.is_some()
+            || self.palette.is_some()
     }
 
     /// Colour for the next series when no explicit spec colour was given.
     fn next_color(&mut self) -> Rgb {
-        let c = CYCLE[self.drawn % CYCLE.len()];
+        let c = match &self.palette {
+            Some(p) if !p.is_empty() => p[self.drawn % p.len()],
+            _ => CYCLE[self.drawn % CYCLE.len()],
+        };
         self.drawn += 1;
         c
     }
@@ -583,7 +649,9 @@ impl Figure {
         }
         // Non-line kinds default to no connecting dash; stairs and area do
         // draw their outline so they keep the solid default.
-        if matches!(kind, SeriesKind::Scatter | SeriesKind::Stem | SeriesKind::Bar | SeriesKind::ErrorBar) && spec.dash == DashStyle::Solid {
+        if matches!(kind, SeriesKind::Scatter | SeriesKind::Stem | SeriesKind::Bar | SeriesKind::BarH | SeriesKind::ErrorBar)
+            && spec.dash == DashStyle::Solid
+        {
             spec.dash = DashStyle::None;
         }
         self.series.push(Series { kind, x, y, z: Vec::new(), zshape: (0, 0), levels: Vec::new(), labels: Vec::new(), err, rgba: None, spec });
@@ -781,6 +849,10 @@ fn view2d(fig: &Figure) -> (f64, f64, f64, f64) {
             ymin = ymin.min(0.0);
             ymax = ymax.max(0.0);
         }
+        if !fig.xlog && s.kind == SeriesKind::BarH {
+            xmin = xmin.min(0.0);
+            xmax = xmax.max(0.0);
+        }
     }
     let (x0, x1) = limits(xmin, xmax, fig.xlim.map(|(a, b)| (tx(a), tx(b))));
     let (y0, y1) = limits(ymin, ymax, fig.ylim.map(|(a, b)| (ty(a), ty(b))));
@@ -933,6 +1005,13 @@ viewBox=\"0 0 {W:.0} {H:.0}\" font-family=\"Helvetica, Arial, sans-serif\">\n"
             draw_axes(&mut o, &fv, ax, ay, aw, ah, &format!("ax{}", sub.tiles.len()));
         }
     }
+    if let Some(t) = &fig.sgtitle {
+        o.push_str(&format!(
+            "<text x=\"{:.2}\" y=\"18\" font-size=\"14\" font-weight=\"bold\" fill=\"#1a1a1a\" text-anchor=\"middle\">{}</text>\n",
+            W / 2.0,
+            esc(t)
+        ));
+    }
     o.push_str("</svg>\n");
     o
 }
@@ -975,10 +1054,36 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
     // Grid + ticks. Positions are in transformed space; log axes get one
     // decade per tick with a `1e{k}` label.
     let tick_col = "#1a1a1a";
-    let xticks: Vec<(f64, String)> =
-        if fig.xlog { log_ticks(x0, x1) } else { ticks(x0, x1, TICKS).into_iter().map(|t| (t, tick_label(t))).collect() };
-    let yticks: Vec<(f64, String)> =
-        if fig.ylog { log_ticks(y0, y1) } else { ticks(y0, y1, TICKS).into_iter().map(|t| (t, tick_label(t))).collect() };
+    let auto_ticks = |explicit: &Option<Vec<f64>>, labels: &Option<Vec<String>>, lo: f64, hi: f64, log: bool| -> Vec<(f64, String)> {
+        let mut out: Vec<(f64, String)> = if let Some(vals) = explicit {
+            vals.iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let p = if log { v.log10() } else { v };
+                    let lab =
+                        labels.as_ref().and_then(|l| l.get(i)).cloned().unwrap_or_else(|| if log { format!("1e{p:.0}") } else { tick_label(v) });
+                    (p, lab)
+                })
+                .collect()
+        } else if log {
+            log_ticks(lo, hi)
+        } else {
+            ticks(lo, hi, TICKS).into_iter().map(|t| (t, tick_label(t))).collect()
+        };
+        out.retain(|(p, _)| p.is_finite() && *p >= lo - 1e-9 && *p <= hi + 1e-9);
+        if explicit.is_none() {
+            if let Some(labels) = labels {
+                for (i, (_, lab)) in out.iter_mut().enumerate() {
+                    if let Some(repl) = labels.get(i) {
+                        *lab = repl.clone();
+                    }
+                }
+            }
+        }
+        out
+    };
+    let xticks = auto_ticks(&fig.xticks, &fig.xticklabels, x0, x1, fig.xlog);
+    let yticks = auto_ticks(&fig.yticks, &fig.yticklabels, y0, y1, fig.ylog);
     for (t, lab) in &xticks {
         let p = ax + (t - x0) / xspan * aw;
         if fig.grid {
@@ -989,8 +1094,9 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
             ay + ah,
             ay + ah + 5.0
         ));
+        let tf = fig.xtickangle.map(|a| format!(" transform=\"rotate({} {p:.2} {:.2})\"", -a, ay + ah + 18.0)).unwrap_or_default();
         o.push_str(&format!(
-            "<text x=\"{p:.2}\" y=\"{:.2}\" font-size=\"11\" fill=\"{tick_col}\" text-anchor=\"middle\">{}</text>\n",
+            "<text x=\"{p:.2}\" y=\"{:.2}\" font-size=\"11\" fill=\"{tick_col}\" text-anchor=\"middle\"{tf}>{}</text>\n",
             ay + ah + 18.0,
             esc(lab)
         ));
@@ -1001,8 +1107,9 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
             o.push_str(&format!("<line x1=\"{ax:.2}\" y1=\"{p:.2}\" x2=\"{:.2}\" y2=\"{p:.2}\" stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n", ax + aw));
         }
         o.push_str(&format!("<line x1=\"{:.2}\" y1=\"{p:.2}\" x2=\"{ax:.2}\" y2=\"{p:.2}\" stroke=\"{tick_col}\" stroke-width=\"1\"/>\n", ax - 5.0));
+        let tf = fig.ytickangle.map(|a| format!(" transform=\"rotate({} {:.2} {:.2})\"", -a, ax - 8.0, p + 4.0)).unwrap_or_default();
         o.push_str(&format!(
-            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"11\" fill=\"{tick_col}\" text-anchor=\"end\">{}</text>\n",
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"11\" fill=\"{tick_col}\" text-anchor=\"end\"{tf}>{}</text>\n",
             ax - 8.0,
             p + 4.0,
             esc(lab)
@@ -1050,6 +1157,24 @@ fill=\"none\" stroke=\"{tick_col}\" stroke-width=\"1.2\"/>\n"
                             "<rect x=\"{:.2}\" y=\"{yt:.2}\" width=\"{bw_px:.2}\" height=\"{hh:.2}\" \
 fill=\"{col}\" fill-opacity=\"0.75\" stroke=\"{col}\" stroke-width=\"1\"/>\n",
                             cx - bw_px / 2.0
+                        ));
+                    }
+                }
+            }
+            SeriesKind::BarH => {
+                let mut gap = f64::INFINITY;
+                for i in 1..n {
+                    gap = gap.min((s.y[i] - s.y[i - 1]).abs());
+                }
+                let bh = if gap.is_finite() { gap * 0.8 } else { (y1 - y0) * 0.05 };
+                let bh_px = (bh / yspan * ah).max(1.0);
+                let base = sx(0.0).clamp(ax, ax + aw);
+                for i in 0..n {
+                    if let Some((val, pos)) = pt(i) {
+                        let (xl, w) = if val <= base { (val, base - val) } else { (base, val - base) };
+                        o.push_str(&format!(
+                            "<rect x=\"{xl:.2}\" y=\"{:.2}\" width=\"{w:.2}\" height=\"{bh_px:.2}\" fill=\"{col}\" fill-opacity=\"0.75\" stroke=\"{col}\" stroke-width=\"1\"/>\n",
+                            pos - bh_px / 2.0
                         ));
                     }
                 }

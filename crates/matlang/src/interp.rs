@@ -21,6 +21,8 @@ mod corpus;
 mod ga;
 mod hdf5;
 mod image;
+mod maps;
+mod mathx;
 mod netcdf;
 mod ode;
 mod optim;
@@ -979,6 +981,17 @@ pub struct Session {
     /// Root-object defaults written via `set(0,'Default...',v)` — read back
     /// through `get(0,'Default...')`.
     defaults: HashMap<String, Value>,
+    /// `diary` target file and whether logging is active.
+    diary_file: Option<std::path::PathBuf>,
+    diary_active: bool,
+    /// Set when `diary` is called in the current run so a final `off` still
+    /// flushes output produced earlier in that run.
+    diary_touched: bool,
+    /// Per-figure application data (`setappdata`/`getappdata`).
+    appdata: HashMap<(usize, String), Value>,
+    /// `tiledlayout` grid and next tile index.
+    tile_layout: Option<(usize, usize)>,
+    tile_next: usize,
 }
 
 impl Session {
@@ -1015,6 +1028,12 @@ impl Session {
             cur_func_key: None,
             imports: Vec::new(),
             defaults: HashMap::new(),
+            diary_file: None,
+            diary_active: false,
+            diary_touched: false,
+            appdata: HashMap::new(),
+            tile_layout: None,
+            tile_next: 0,
         }
     }
 
@@ -1208,7 +1227,15 @@ impl Session {
         self.hoist_functions(&bare, "");
         let mut out = String::new();
         match self.exec_lines("", &stmts, false, &mut out) {
-            Ok(()) => Ok(out),
+            Ok(()) => {
+                if self.diary_active || self.diary_touched {
+                    if let Some(path) = &self.diary_file {
+                        diary_write_to(path, &out);
+                    }
+                }
+                self.diary_touched = false;
+                Ok(out)
+            }
             Err(e) => {
                 if e.id == DEBUG_PAUSE_ID {
                     // Echo produced before the pause survives — it rejoins
@@ -2180,7 +2207,35 @@ impl Session {
                 // argument list, not subscripts (MATLAB resolves by
                 // declaration).
                 if let Expr::Field(b, fname) = base.as_ref() {
+                    if fname == "Map" {
+                        if let Expr::Ident(ns) = b.as_ref() {
+                            if ns == "containers" {
+                                let argv = self.eval_args(args)?;
+                                return Ok(Some(maps::new_from_args(&argv)?));
+                            }
+                        }
+                    }
                     let base_val = self.eval(b)?;
+                    if let Value::Object(o) = &base_val {
+                        if o.class_name == "containers.Map" {
+                            match fname.as_str() {
+                                "isKey" => {
+                                    let argv = self.eval_args(args)?;
+                                    let key = argv.first().ok_or_else(|| LangError::new("isKey needs a key", 0))?;
+                                    return Ok(Some(Value::Num(if maps::is_key(o, key) { 1.0 } else { 0.0 })));
+                                }
+                                "remove" => {
+                                    let argv = self.eval_args(args)?;
+                                    let key = argv.first().ok_or_else(|| LangError::new("remove needs a key", 0))?;
+                                    let _ = maps::remove(o, key);
+                                    return Ok(None);
+                                }
+                                "keys" if args.is_empty() => return Ok(Some(maps::keys(o))),
+                                "values" if args.is_empty() => return Ok(Some(maps::values(o))),
+                                _ => {}
+                            }
+                        }
+                    }
                     // Figure handles are numeric here, but M-code uses the
                     // graphics-object method form (`f.findobj('Type','text')`).
                     if fname == "findobj" {
@@ -2389,6 +2444,22 @@ impl Session {
             };
             let ca = self.cell_brace_apply(ca, index, v)?;
             self.vars.insert(name.to_string(), Value::Cell(ca));
+            return Ok(());
+        }
+        let map = match self.vars.get(name) {
+            Some(Value::Object(o)) if o.class_name == "containers.Map" => Some(o.clone()),
+            _ => None,
+        };
+        if let Some(o) = map {
+            if index.len() != 1 {
+                return Err(LangError::new("containers.Map assignment needs one key", 0));
+            }
+            let key = self.eval(&index[0])?;
+            if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+                let _ = maps::remove(&o, &key);
+            } else {
+                maps::set(&o, key, v);
+            }
             return Ok(());
         }
         if matches!(self.vars.get(name), Some(Value::Cell(_))) || matches!(v, Value::Cell(_)) {
@@ -2697,6 +2768,20 @@ impl Session {
     /// cell elements via `cell_paren_apply`; otherwise it's a numeric
     /// `assign_into` write.
     fn paren_apply(&mut self, target: Value, index: &[Expr], v: Value) -> Result<Value, LangError> {
+        if let Value::Object(o) = &target {
+            if o.class_name == "containers.Map" {
+                if index.len() != 1 {
+                    return Err(LangError::new("containers.Map assignment needs one key", 0));
+                }
+                let key = self.eval(&index[0])?;
+                if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+                    let _ = maps::remove(o, &key);
+                } else {
+                    maps::set(o, key, v);
+                }
+                return Ok(target);
+            }
+        }
         if let Value::Struct(sa) = target {
             let mut sa = sa;
             let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel())?;
@@ -2986,6 +3071,13 @@ impl Session {
         if let Value::Object(o) = target {
             if o.class_name == "table" {
                 return self.table_index(o, args);
+            }
+            if o.class_name == "containers.Map" {
+                if args.len() != 1 {
+                    return Err(LangError::new("containers.Map indexing needs one key", 0));
+                }
+                let key = self.eval(&args[0])?;
+                return maps::get(o, &key);
             }
             return Err(LangError::new("indexing into an object is not supported (object arrays are not implemented)", 0));
         }
@@ -3503,11 +3595,21 @@ impl Session {
             }
             "numel" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::len(o) as f64)));
+                    }
+                }
                 let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
                 Ok(Some(Value::Num(dims.iter().product::<usize>() as f64)))
             }
             "length" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::len(o) as f64)));
+                    }
+                }
                 let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
                 Ok(Some(Value::Num(dims.iter().copied().max().unwrap_or(0) as f64)))
             }
@@ -5443,6 +5545,7 @@ impl Session {
                 let v = self.eval_args(args)?;
                 let e = match v.first() {
                     Some(Value::Object(o)) if o.class_name == "table" => table_num_rows(o) == 0,
+                    Some(Value::Object(o)) if o.class_name == "containers.Map" => maps::len(o) == 0,
                     Some(x) => x.dims_vec().iter().product::<usize>() == 0,
                     None => true,
                 };
@@ -5678,7 +5781,8 @@ impl Session {
                 let out = self.stats_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
             }
-            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" => {
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
+            | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" => {
                 let v = self.eval_args(args)?;
                 let out = self.xlsx_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -5716,6 +5820,60 @@ impl Session {
                 Ok(out.into_iter().next())
             }
             "table" => self.table_call(args),
+            "count" => {
+                let v = self.eval_args(args)?;
+                if let (Some(Value::Object(o)), Some(key)) = (v.first(), v.get(1)) {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::count(o, key) as f64)));
+                    }
+                }
+                if let (Some(Value::Str(s)), Some(Value::Str(p))) = (v.first(), v.get(1)) {
+                    if p.is_empty() {
+                        return Ok(Some(Value::Num(0.0)));
+                    }
+                    let mut n = 0usize;
+                    let mut start = 0usize;
+                    while start <= s.len() {
+                        match s.get(start..).and_then(|x| x.find(p)) {
+                            Some(i) => {
+                                n += 1;
+                                start += i + p.len().max(1);
+                            }
+                            None => break,
+                        }
+                    }
+                    return Ok(Some(Value::Num(n as f64)));
+                }
+                Err(LangError::new("count needs a map or two strings", 0))
+            }
+            "isKey" | "keys" | "values" | "remove" => {
+                let v = self.eval_args(args)?;
+                let Some(Value::Object(o)) = v.first() else {
+                    return Err(LangError::new(format!("{name} needs a containers.Map"), 0));
+                };
+                if o.class_name != "containers.Map" {
+                    return Err(LangError::new(format!("{name} needs a containers.Map"), 0));
+                }
+                match name {
+                    "keys" => Ok(Some(maps::keys(o))),
+                    "values" => Ok(Some(maps::values(o))),
+                    "isKey" => {
+                        let key = v.get(1).ok_or_else(|| LangError::new("isKey needs a key", 0))?;
+                        Ok(Some(Value::Num(if maps::is_key(o, key) { 1.0 } else { 0.0 })))
+                    }
+                    _ => {
+                        let key = v.get(1).ok_or_else(|| LangError::new("remove needs a key", 0))?;
+                        let _ = maps::remove(o, key);
+                        Ok(None)
+                    }
+                }
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "pdist" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient"
+            | "expm" | "isbetween" | "isoutlier" | "partialcorr" | "linkage" => {
+                let v = self.eval_args(args)?;
+                let out = self.mathx_builtin(name, v)?;
+                Ok(out.into_iter().next())
+            }
             "anova1" | "anova2" | "multcompare" | "friedman" => {
                 let v = self.eval_args(args)?;
                 let out = self.anova_builtin(name, v, 1)?;
@@ -6516,15 +6674,74 @@ impl Session {
             }
             // --- extra strings --------------------------------------------------
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
-            | "regexpi" | "regexprep" | "erase" | "replace" => {
+            | "regexpi" | "regexprep" | "erase" | "replace" | "findstr" | "extractBefore" | "extractAfter" | "insertBefore" | "isstrprop"
+            | "isletter" | "compose" | "splitlines" | "readlines" => {
                 let outs = self.str_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
             // --- environment / system -------------------------------------------
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "dos" | "unix" | "savepath" | "fileparts"
-            | "copyfile" | "movefile" | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename"
-            | "license" | "ver" | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help"
-            | "doc" | "class" | "inline" | "optimset" | "optimoptions" | "optimget" | "nargchk" => {
+            "version"
+            | "computer"
+            | "ispc"
+            | "isunix"
+            | "ismac"
+            | "getenv"
+            | "setenv"
+            | "system"
+            | "dos"
+            | "unix"
+            | "savepath"
+            | "fileparts"
+            | "copyfile"
+            | "movefile"
+            | "rmdir"
+            | "isdir"
+            | "isfile"
+            | "tempdir"
+            | "tempname"
+            | "evalc"
+            | "evalin"
+            | "assignin"
+            | "mfilename"
+            | "jsondecode"
+            | "jsonencode"
+            | "importdata"
+            | "detectImportOptions"
+            | "rethrow"
+            | "verLessThan"
+            | "inputname"
+            | "validateattributes"
+            | "validatestring"
+            | "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal"
+            | "license"
+            | "ver"
+            | "drawnow"
+            | "beep"
+            | "waitbar"
+            | "input"
+            | "ishandle"
+            | "findobj"
+            | "findall"
+            | "ishold"
+            | "gca"
+            | "help"
+            | "diary"
+            | "doc"
+            | "class"
+            | "inline"
+            | "optimset"
+            | "optimoptions"
+            | "optimget"
+            | "nargchk" => {
                 let outs = self.sys_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
@@ -7531,6 +7748,343 @@ impl Session {
                 self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
                 Ok(None)
             }
+            "axes" => {
+                let v = self.eval_args(args)?;
+                if let Some(Value::Num(n)) = v.first() {
+                    if *n >= 1.0 {
+                        self.cur_fig = *n as usize;
+                    }
+                }
+                let _ = self.figure_mut();
+                Ok(Some(Value::Num(self.cur_fig as f64)))
+            }
+            "xticks" | "yticks" => {
+                let v = self.eval_args(args)?;
+                let slot = if name == "xticks" { &mut self.figure_mut().xticks } else { &mut self.figure_mut().yticks };
+                if let Some(x) = v.first() {
+                    let m = x.to_matrix()?;
+                    if m.numel() == 0 {
+                        *slot = None;
+                    } else {
+                        *slot = Some(m.data().to_vec());
+                    }
+                }
+                Ok(Some(Value::Mat(Matrix::row_vector(slot.clone().unwrap_or_default()))))
+            }
+            "xticklabels" | "yticklabels" => {
+                let v = self.eval_args(args)?;
+                let labels: Vec<String> = match v.first() {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(s)) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                if name == "xticklabels" {
+                    self.figure_mut().xticklabels = if labels.is_empty() { None } else { Some(labels.clone()) };
+                } else {
+                    self.figure_mut().yticklabels = if labels.is_empty() { None } else { Some(labels.clone()) };
+                }
+                Ok(Some(Value::Cell(CellArray::row(labels.into_iter().map(Value::Str).collect()))))
+            }
+            "xtickangle" | "ytickangle" => {
+                let v = self.eval_args(args)?;
+                let angle = v.first().map(|x| x.scalar()).transpose()?;
+                if name == "xtickangle" {
+                    self.figure_mut().xtickangle = angle;
+                } else {
+                    self.figure_mut().ytickangle = angle;
+                }
+                Ok(Some(Value::Num(angle.unwrap_or(0.0))))
+            }
+            "sgtitle" => {
+                let v = self.eval_args(args)?;
+                let text = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                self.figure_mut().sgtitle = if text.is_empty() { None } else { Some(text) };
+                Ok(None)
+            }
+            "tiledlayout" => {
+                let v = self.eval_args(args)?;
+                let nums: Vec<usize> = v
+                    .iter()
+                    .take_while(|x| matches!(x, Value::Num(_) | Value::Mat(_)))
+                    .filter_map(|x| x.scalar().ok())
+                    .map(|x| x.max(1.0) as usize)
+                    .collect();
+                let (rows, cols) = if nums.len() >= 3 {
+                    self.cur_fig = nums[0].max(1);
+                    (nums[1], nums[2])
+                } else if nums.len() >= 2 {
+                    (nums[0], nums[1])
+                } else {
+                    (1, 1)
+                };
+                self.tile_layout = Some((rows, cols));
+                self.tile_next = 0;
+                let mut props = StructArray::new();
+                props.set_field(0, "Rows", Value::Num(rows as f64))?;
+                props.set_field(0, "Cols", Value::Num(cols as f64))?;
+                props.set_field(0, "NextTile", Value::Num(1.0))?;
+                props.set_field(0, "Figure", Value::Num(self.cur_fig.max(1) as f64))?;
+                Ok(Some(Value::Object(MObject::new("TiledChartLayout".into(), props, true))))
+            }
+            "nexttile" => {
+                let v = self.eval_args(args)?;
+                let mut rows = self.tile_layout.map(|l| l.0).unwrap_or(1);
+                let mut cols = self.tile_layout.map(|l| l.1).unwrap_or(1);
+                let mut next = self.tile_next + 1;
+                let mut layout_obj: Option<MObject> = None;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "TiledChartLayout" {
+                        rows = o.prop("Rows").and_then(|x| x.scalar().ok()).unwrap_or(rows as f64) as usize;
+                        cols = o.prop("Cols").and_then(|x| x.scalar().ok()).unwrap_or(cols as f64) as usize;
+                        next = o.prop("NextTile").and_then(|x| x.scalar().ok()).unwrap_or(1.0).max(1.0) as usize;
+                        layout_obj = Some(o.clone());
+                    }
+                }
+                if let Some(idx) = v.get(1).and_then(|x| x.scalar().ok()) {
+                    next = idx.max(1.0) as usize;
+                }
+                let cell = next.min(rows.saturating_mul(cols).max(1));
+                self.figure_mut().subplot(rows, cols, &[cell]);
+                if let Some(mut o) = layout_obj {
+                    o.set_prop("NextTile", Value::Num((cell + 1) as f64));
+                } else {
+                    self.tile_next = cell;
+                }
+                Ok(Some(Value::Num(self.cur_fig as f64)))
+            }
+            "yline" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("yline needs y positions", 0))?.to_matrix()?;
+                let spec = v
+                    .iter()
+                    .skip(1)
+                    .find_map(|val| match val {
+                        Value::Str(s) => Some(matplot::LineSpec::parse(s)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let (x0, x1) = {
+                    let fig = self.figure_mut();
+                    match fig.xlim {
+                        Some(l) => l,
+                        None => {
+                            let (a, b, _, _) = matplot::view_limits(fig);
+                            if a.is_finite() && b.is_finite() {
+                                (a, b)
+                            } else {
+                                (0.0, 1.0)
+                            }
+                        }
+                    }
+                };
+                let fig = self.figure_mut();
+                let mut n = 0.0;
+                for y in m.data() {
+                    if !y.is_finite() {
+                        continue;
+                    }
+                    fig.push(SeriesKind::Line, vec![x0, x1], vec![*y, *y], spec.clone());
+                    n += 1.0;
+                }
+                Ok(Some(Value::Num(n)))
+            }
+            "barh" => {
+                let v = self.eval_args(args)?;
+                let (values, positions) = match v.len() {
+                    1 => {
+                        let y = v[0].to_matrix()?;
+                        (y, None)
+                    }
+                    _ => {
+                        let x = v[0].to_matrix()?;
+                        let y = v[1].to_matrix()?;
+                        (y, Some(x))
+                    }
+                };
+                if !self.figure_mut().hold {
+                    self.figure_mut().series.clear();
+                }
+                let rows = values.rows();
+                let cols = values.cols();
+                let pos: Vec<f64> = match positions {
+                    Some(p) if p.numel() >= rows => (0..rows).map(|r| p.get_linear(r).unwrap_or(r as f64 + 1.0)).collect(),
+                    _ => (1..=rows).map(|r| r as f64).collect(),
+                };
+                for c in 0..cols {
+                    let vals: Vec<f64> = (0..rows).map(|r| values.get(r, c).unwrap_or(f64::NAN)).collect();
+                    let shift = if cols > 1 { (c as f64 - (cols as f64 - 1.0) / 2.0) * 0.8 / cols as f64 } else { 0.0 };
+                    let ypos: Vec<f64> = pos.iter().map(|&p| p + shift).collect();
+                    self.figure_mut().push(SeriesKind::BarH, vals, ypos, matplot::LineSpec::new());
+                }
+                Ok(None)
+            }
+            "annotation" => {
+                let _ = self.eval_args(args)?;
+                Ok(Some(Value::Num(1.0)))
+            }
+            "gobjects" => {
+                let v = self.eval_args(args)?;
+                let (r, c) = match v.len() {
+                    0 => (1, 1),
+                    1 => {
+                        let n = v[0].scalar()?.max(0.0) as usize;
+                        (1, n)
+                    }
+                    _ => (v[0].scalar()?.max(0.0) as usize, v[1].scalar()?.max(0.0) as usize),
+                };
+                Ok(Some(Value::Mat(Matrix::zeros(r, c))))
+            }
+            "isprop" => {
+                let v = self.eval_args(args)?;
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let yes = match v.first() {
+                    Some(Value::Object(o)) => o.has_prop(&prop),
+                    Some(Value::Num(_)) => matches!(
+                        prop.as_str(),
+                        "position"
+                            | "color"
+                            | "parent"
+                            | "type"
+                            | "string"
+                            | "xdata"
+                            | "ydata"
+                            | "linewidth"
+                            | "fontsize"
+                            | "visible"
+                            | "children"
+                            | "tag"
+                            | "userdata"
+                            | "xlim"
+                            | "ylim"
+                            | "title"
+                            | "xlabel"
+                            | "ylabel"
+                            | "nextplot"
+                    ),
+                    _ => false,
+                };
+                Ok(Some(Value::Num(if yes { 1.0 } else { 0.0 })))
+            }
+            "isgraphics" => {
+                let v = self.eval_args(args)?;
+                let yes = match v.first() {
+                    Some(Value::Num(n)) => n.is_finite() && *n >= 0.0,
+                    Some(Value::Object(o)) => !matches!(o.class_name.as_str(), "table" | "containers.Map"),
+                    _ => false,
+                };
+                Ok(Some(Value::Num(if yes { 1.0 } else { 0.0 })))
+            }
+            "allchild" => Ok(Some(Value::Cell(CellArray::new(0, 0)))),
+            "ancestor" => {
+                let v = self.eval_args(args)?;
+                Ok(v.first().cloned())
+            }
+            "getappdata" => {
+                let v = self.eval_args(args)?;
+                let fig = v.first().and_then(|x| x.scalar().ok()).unwrap_or(0.0).max(0.0) as usize;
+                let key = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Ok(None),
+                };
+                Ok(self.appdata.get(&(fig, key)).cloned())
+            }
+            "setappdata" => {
+                let v = self.eval_args(args)?;
+                let fig = v.first().and_then(|x| x.scalar().ok()).unwrap_or(0.0).max(0.0) as usize;
+                if let (Some(Value::Str(name)), Some(value)) = (v.get(1), v.get(2)) {
+                    self.appdata.insert((fig, name.clone()), value.clone());
+                }
+                Ok(None)
+            }
+            "gcp" => Ok(Some(Value::Mat(Matrix::row_vector(vec![0.0, 0.0, 0.0])))),
+            "cla" => {
+                let fig = self.figure_mut();
+                fig.series.clear();
+                fig.legend.clear();
+                fig.title = None;
+                fig.xlabel = None;
+                fig.ylabel = None;
+                Ok(None)
+            }
+            "colororder" => {
+                let v = self.eval_args(args)?;
+                if let Some(x) = v.iter().rev().find(|x| matches!(x, Value::Mat(_) | Value::Num(_))) {
+                    let m = x.to_matrix()?;
+                    if m.cols() >= 3 {
+                        let palette: Vec<matplot::Rgb> = (0..m.rows())
+                            .map(|r| {
+                                matplot::Rgb(
+                                    (m.get(r, 0).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (m.get(r, 1).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (m.get(r, 2).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                )
+                            })
+                            .collect();
+                        self.figure_mut().palette = Some(palette);
+                    }
+                }
+                Ok(None)
+            }
+            "getpixelposition" => Ok(Some(Value::Mat(Matrix::row_vector(vec![0.0, 0.0, 560.0, 420.0])))),
+            "savefig" => {
+                let v = self.eval_args(args)?;
+                let file = v
+                    .iter()
+                    .rev()
+                    .find_map(|x| match x {
+                        Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| LangError::new("savefig needs a filename", 0))?;
+                let ext = file.rsplit('.').next().unwrap_or("fig").to_ascii_lowercase();
+                let fmt = if ext == "fig" { "svg".to_string() } else { ext };
+                let bytes = export_figure(self.figure_mut(), &file, Some(&fmt))?;
+                crate::write_file(std::path::Path::new(&file), &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
+                self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
+                Ok(None)
+            }
+            "hsv" | "parula" | "cool" => {
+                let v = self.eval_args(args)?;
+                let n = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(64.0).max(1.0) as usize;
+                let mut out = Matrix::zeros(n, 3);
+                for i in 0..n {
+                    let t = if n > 1 { i as f64 / (n - 1) as f64 } else { 0.0 };
+                    let rgb = match name {
+                        "parula" => matplot::Colormap::Parula.map(t),
+                        "cool" => matplot::Rgb((t * 255.0) as u8, ((1.0 - t) * 255.0) as u8, 255),
+                        _ => {
+                            let h = t * 6.0;
+                            let x = 1.0 - (h % 2.0 - 1.0).abs();
+                            let (r, g, b) = match h as usize {
+                                0 => (1.0, x, 0.0),
+                                1 => (x, 1.0, 0.0),
+                                2 => (0.0, 1.0, x),
+                                3 => (0.0, x, 1.0),
+                                4 => (x, 0.0, 1.0),
+                                _ => (1.0, 0.0, x),
+                            };
+                            matplot::Rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                        }
+                    };
+                    let _ = out.set(i, 0, rgb.0 as f64 / 255.0);
+                    let _ = out.set(i, 1, rgb.1 as f64 / 255.0);
+                    let _ = out.set(i, 2, rgb.2 as f64 / 255.0);
+                }
+                Ok(Some(Value::Mat(out)))
+            }
             _ => Err(LangError::new(format!("unknown function or variable '{name}'"), 0)),
         }
     }
@@ -8425,10 +8979,68 @@ impl Session {
             }
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
             | "regexpi" | "regexprep" | "erase" | "replace" => self.str_call(name, args)?,
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "dos" | "unix" | "savepath" | "fileparts"
-            | "copyfile" | "movefile" | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename"
-            | "license" | "ver" | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help"
-            | "doc" | "class" | "inline" | "optimset" | "optimoptions" | "optimget" | "nargchk" => self.sys_call(name, args)?,
+            "version"
+            | "computer"
+            | "ispc"
+            | "isunix"
+            | "ismac"
+            | "getenv"
+            | "setenv"
+            | "system"
+            | "dos"
+            | "unix"
+            | "savepath"
+            | "fileparts"
+            | "copyfile"
+            | "movefile"
+            | "rmdir"
+            | "isdir"
+            | "isfile"
+            | "tempdir"
+            | "tempname"
+            | "evalc"
+            | "evalin"
+            | "assignin"
+            | "mfilename"
+            | "jsondecode"
+            | "jsonencode"
+            | "importdata"
+            | "detectImportOptions"
+            | "rethrow"
+            | "verLessThan"
+            | "inputname"
+            | "validateattributes"
+            | "validatestring"
+            | "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal"
+            | "license"
+            | "ver"
+            | "drawnow"
+            | "beep"
+            | "waitbar"
+            | "input"
+            | "ishandle"
+            | "findobj"
+            | "findall"
+            | "ishold"
+            | "gca"
+            | "help"
+            | "diary"
+            | "doc"
+            | "class"
+            | "inline"
+            | "optimset"
+            | "optimoptions"
+            | "optimget"
+            | "nargchk" => self.sys_call(name, args)?,
             "cov" | "prctile" | "quantile" | "hist" | "histc" => self.stat_call(name, args)?,
             "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
@@ -8452,7 +9064,8 @@ impl Session {
                 let v = self.eval_args(args)?;
                 self.stats_builtin(name, v, nout)?
             }
-            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" => {
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
+            | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" => {
                 let v = self.eval_args(args)?;
                 self.xlsx_builtin(name, v, nout)?
             }
@@ -8476,6 +9089,11 @@ impl Session {
             "ode45" | "ode15s" | "odeset" | "odeget" => {
                 let v = self.eval_args(args)?;
                 self.ode_builtin(name, v, nout)?
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "pdist" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient"
+            | "expm" | "isbetween" | "isoutlier" | "partialcorr" | "linkage" => {
+                let v = self.eval_args(args)?;
+                self.mathx_builtin(name, v)?
             }
             "anova1" | "anova2" | "multcompare" | "friedman" => {
                 let v = self.eval_args(args)?;
@@ -9665,6 +10283,133 @@ impl Session {
                     _ => Err(LangError::new(format!("{name} needs a string or cellstr"), 0)),
                 }
             }
+            "findstr" => {
+                let a = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("findstr needs two strings", 0)),
+                };
+                let b = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("findstr needs two strings", 0)),
+                };
+                let (hay, needle) = if a.chars().count() >= b.chars().count() { (a, b) } else { (b, a) };
+                let mut hits = Vec::new();
+                if !needle.is_empty() {
+                    let mut start = 0usize;
+                    while start <= hay.len() {
+                        match hay.get(start..).and_then(|s| s.find(&needle)) {
+                            Some(p) => {
+                                hits.push((start + p + 1) as f64);
+                                start += p + 1;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::row_vector(hits))])
+            }
+            "extractBefore" | "extractAfter" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string"), 0)),
+                };
+                let (pos, plen) = match v.get(1) {
+                    Some(Value::Str(p)) => match s.find(p) {
+                        Some(i) => (i, p.len()),
+                        None => (s.len(), 0),
+                    },
+                    Some(x) => {
+                        let n = x.scalar()?.max(1.0) as usize;
+                        let byte = s.char_indices().nth(n.saturating_sub(1)).map(|(i, _)| i).unwrap_or(s.len());
+                        (byte, 0)
+                    }
+                    None => return Err(LangError::new(format!("{name} needs a pattern or position"), 0)),
+                };
+                let out = if name == "extractBefore" {
+                    s.get(..pos).unwrap_or("").to_string()
+                } else {
+                    s.get(pos.saturating_add(plen)..).unwrap_or("").to_string()
+                };
+                Ok(vec![Value::Str(out)])
+            }
+            "insertBefore" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("insertBefore needs a string", 0)),
+                };
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new("insertBefore needs a pattern", 0)),
+                };
+                let ins = match v.get(2) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => String::new(),
+                };
+                let out = match s.find(&pat) {
+                    Some(i) => format!("{}{}{}", s.get(..i).unwrap_or(""), ins, s.get(i..).unwrap_or("")),
+                    None => s,
+                };
+                Ok(vec![Value::Str(out)])
+            }
+            "isstrprop" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isstrprop needs a string", 0)),
+                };
+                let prop = match v.get(1) {
+                    Some(Value::Str(p)) => p.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let data: Vec<f64> = s
+                    .chars()
+                    .map(|c| {
+                        let ok = match prop.as_str() {
+                            "alpha" | "letter" => c.is_alphabetic(),
+                            "digit" => c.is_ascii_digit(),
+                            "alphanum" => c.is_alphanumeric(),
+                            "lower" => c.is_lowercase(),
+                            "upper" => c.is_uppercase(),
+                            "space" | "wspace" => c.is_whitespace(),
+                            "punct" => c.is_ascii_punctuation(),
+                            "cntrl" => c.is_control(),
+                            "graph" => !c.is_whitespace() && !c.is_control(),
+                            "print" => !c.is_control(),
+                            _ => false,
+                        };
+                        if ok {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                Ok(vec![Value::Mat(Matrix::row_vector(data))])
+            }
+            "isletter" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isletter needs a string", 0)),
+                };
+                let data: Vec<f64> = s.chars().map(|c| if c.is_alphabetic() { 1.0 } else { 0.0 }).collect();
+                Ok(vec![Value::Mat(Matrix::row_vector(data))])
+            }
+            "compose" => {
+                let (f, rest) = split_format_args(&v)?;
+                Ok(vec![Value::Str(sprintf_impl(&f, &rest)?)])
+            }
+            "splitlines" | "readlines" => {
+                let text = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string or file"), 0)),
+                };
+                let text = if name == "readlines" {
+                    std::fs::read_to_string(text.trim()).map_err(|e| LangError::new(format!("readlines: {e}"), 0))?
+                } else {
+                    text
+                };
+                let lines: Vec<Value> = text.lines().map(|l| Value::Str(l.trim_end_matches('\r').to_string())).collect();
+                Ok(vec![Value::Cell(CellArray::col(lines))])
+            }
             "strtok" => {
                 let s = match v.first() {
                     Some(Value::Str(s)) => s.clone(),
@@ -9906,6 +10651,159 @@ impl Session {
             }
         };
         match name {
+            "diary" => {
+                self.diary_touched = true;
+                match v.first() {
+                    None => self.diary_active = !self.diary_active,
+                    Some(Value::Str(s)) if s.eq_ignore_ascii_case("on") => self.diary_active = true,
+                    Some(Value::Str(s)) if s.eq_ignore_ascii_case("off") => self.diary_active = false,
+                    Some(Value::Str(s)) => {
+                        self.diary_file = Some(std::path::PathBuf::from(s));
+                        self.diary_active = true;
+                    }
+                    Some(_) => return Err(LangError::new("diary needs 'on', 'off' or a file name", 0)),
+                }
+                if self.diary_active && self.diary_file.is_none() {
+                    self.diary_file = Some(std::path::PathBuf::from("diary.txt"));
+                }
+                Ok(vec![])
+            }
+            "jsondecode" => {
+                let text = sarg(0).ok_or_else(|| LangError::new("jsondecode needs a string", 0))?;
+                let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| LangError::new(format!("jsondecode: {e}"), 0))?;
+                Ok(vec![json_to_value(&parsed)])
+            }
+            "jsonencode" => {
+                let value = v.first().ok_or_else(|| LangError::new("jsonencode needs a value", 0))?;
+                let json = value_to_json(value)?;
+                Ok(vec![Value::Str(serde_json::to_string(&json).unwrap_or_default())])
+            }
+            "importdata" => {
+                let path = sarg(0).ok_or_else(|| LangError::new("importdata needs a file name", 0))?;
+                Ok(vec![importdata_value(path)?])
+            }
+            "detectImportOptions" => {
+                let path = sarg(0).ok_or_else(|| LangError::new("detectImportOptions needs a file name", 0))?;
+                let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "FileType".to_string(),
+                    Value::Str(if matches!(ext.as_str(), "csv" | "tsv" | "txt" | "dat") { "text".into() } else { "spreadsheet".into() }),
+                );
+                m.insert("Delimiter".to_string(), Value::Str(if ext == "tsv" { "\t".into() } else { ",".into() }));
+                m.insert("ReadVariableNames".to_string(), Value::Num(1.0));
+                m.insert("VariableNamingRule".to_string(), Value::Str("modify".into()));
+                m.insert("TextType".to_string(), Value::Str("char".into()));
+                Ok(vec![Value::Struct(StructArray::from_map(m))])
+            }
+            "rethrow" => {
+                let msg = match v.first() {
+                    Some(Value::Struct(s)) => s
+                        .field_at(0, "message")
+                        .and_then(|x| match x {
+                            Value::Str(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "rethrown error".to_string()),
+                    Some(Value::Object(o)) => o
+                        .prop("message")
+                        .and_then(|x| match x {
+                            Value::Str(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "rethrown error".to_string()),
+                    _ => "rethrown error".to_string(),
+                };
+                Err(LangError::new(msg, 0))
+            }
+            "verLessThan" => Ok(vec![Value::Num(0.0)]),
+            "inputname" => Ok(vec![Value::Str(String::new())]),
+            "validateattributes" => {
+                let a = v.first().ok_or_else(|| LangError::new("validateattributes needs a value", 0))?;
+                let attrs = match v.get(2) {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let scalar = a.to_matrix().map(|m| m.numel() == 1).unwrap_or(false);
+                for attr in &attrs {
+                    let ok = match attr.as_str() {
+                        "scalar" => scalar,
+                        "nonempty" => a.to_matrix().map(|m| m.numel() > 0).unwrap_or(true),
+                        "positive" => a.to_matrix().map(|m| m.data().iter().all(|&x| x > 0.0)).unwrap_or(false),
+                        "nonnegative" => a.to_matrix().map(|m| m.data().iter().all(|&x| x >= 0.0)).unwrap_or(false),
+                        "finite" => a.to_matrix().map(|m| m.data().iter().all(|x| x.is_finite())).unwrap_or(false),
+                        "integer" => a.to_matrix().map(|m| m.data().iter().all(|x| x.fract() == 0.0)).unwrap_or(false),
+                        "real" => a.to_matrix().map(|m| m.data().iter().all(|x| x.is_finite())).unwrap_or(false),
+                        "2d" => a.to_matrix().map(|m| m.is_matrix()).unwrap_or(false),
+                        _ => true,
+                    };
+                    if !ok {
+                        return Err(LangError::new(format!("validateattributes: value failed '{attr}'"), 0));
+                    }
+                }
+                Ok(vec![])
+            }
+            "validatestring" => {
+                let s = sarg(0).ok_or_else(|| LangError::new("validatestring needs a string", 0))?;
+                let valid: Vec<String> = match v.get(1) {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(x) => Some(x.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(x)) => vec![x.clone()],
+                    _ => Vec::new(),
+                };
+                let hit = valid.iter().find(|x| x.eq_ignore_ascii_case(s)).cloned().or_else(|| {
+                    let lower = s.to_ascii_lowercase();
+                    let hits: Vec<String> = valid.iter().filter(|x| x.to_ascii_lowercase().starts_with(&lower)).cloned().collect();
+                    if hits.len() == 1 {
+                        hits.into_iter().next()
+                    } else {
+                        None
+                    }
+                });
+                match hit {
+                    Some(x) => Ok(vec![Value::Str(x)]),
+                    None => Err(LangError::new(format!("validatestring: '{s}' is not a valid option"), 0)),
+                }
+            }
+            "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal" => {
+                let a = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                let m = a.to_matrix();
+                let ok = match name {
+                    "mustBeNonempty" => m.as_ref().map(|x| x.numel() > 0).unwrap_or(true),
+                    "mustBePositive" => m.as_ref().map(|x| x.data().iter().all(|&v| v > 0.0)).unwrap_or(false),
+                    "mustBeInteger" => m.as_ref().map(|x| x.data().iter().all(|v| v.fract() == 0.0)).unwrap_or(false),
+                    "mustBeScalarOrEmpty" => m.as_ref().map(|x| x.numel() <= 1).unwrap_or(false),
+                    "mustBeFinite" | "mustBeReal" => m.as_ref().map(|x| x.data().iter().all(|v| v.is_finite())).unwrap_or(false),
+                    "mustBeText" => matches!(a, Value::Str(_) | Value::Cell(_)),
+                    _ => true,
+                };
+                if !ok {
+                    return Err(LangError::new(format!("{name}: validation failed"), 0));
+                }
+                Ok(vec![])
+            }
             "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
             "ver" => {
                 // struct with Name/Version/Release fields.
@@ -12385,6 +13283,131 @@ impl IndexSpec {
 /// An evaluated index value → a list of 1-based indices into a dimension
 /// of `dim_len`. Carries the logical-mask heuristic and strict integer
 /// validation shared by every indexing path.
+fn json_to_value(j: &serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::Mat(Matrix::zeros(0, 0)),
+        serde_json::Value::Bool(b) => Value::Num(if *b { 1.0 } else { 0.0 }),
+        serde_json::Value::Number(n) => Value::Num(n.as_f64().unwrap_or(f64::NAN)),
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(a) => {
+            if a.iter().all(|x| x.is_number()) {
+                let data: Vec<f64> = a.iter().map(|x| x.as_f64().unwrap_or(f64::NAN)).collect();
+                Value::Mat(Matrix::col_vector(data))
+            } else if a.iter().all(|x| x.is_object()) {
+                let mut sa = StructArray::with_dims(a.len(), 1);
+                for (i, item) in a.iter().enumerate() {
+                    if let serde_json::Value::Object(m) = item {
+                        for (k, v) in m {
+                            let _ = sa.set_field(i, k, json_to_value(v));
+                        }
+                    }
+                }
+                Value::Struct(sa)
+            } else {
+                Value::Cell(CellArray::col(a.iter().map(json_to_value).collect()))
+            }
+        }
+        serde_json::Value::Object(m) => {
+            let mut sa = StructArray::new();
+            for (k, v) in m {
+                let _ = sa.set_field(0, k, json_to_value(v));
+            }
+            Value::Struct(sa)
+        }
+    }
+}
+
+fn value_to_json(v: &Value) -> Result<serde_json::Value, LangError> {
+    Ok(match v {
+        Value::Num(x) => serde_json::json!(x),
+        Value::Mat(m) if m.numel() == 1 => serde_json::json!(m.data().first().copied().unwrap_or(0.0)),
+        Value::Mat(m) => {
+            let rows: Vec<serde_json::Value> = (0..m.rows())
+                .map(|r| serde_json::Value::Array((0..m.cols()).map(|c| serde_json::json!(m.get(r, c).unwrap_or(0.0))).collect()))
+                .collect();
+            serde_json::Value::Array(rows)
+        }
+        Value::Str(s) => serde_json::Value::String(s.clone()),
+        Value::Cell(c) => serde_json::Value::Array(c.items.iter().map(value_to_json).collect::<Result<_, _>>()?),
+        Value::Struct(s) => {
+            if s.rows().saturating_mul(s.cols()) <= 1 {
+                let mut map = serde_json::Map::new();
+                for name in s.field_names() {
+                    if let Some(x) = s.field_at(0, &name) {
+                        map.insert(name, value_to_json(x)?);
+                    }
+                }
+                serde_json::Value::Object(map)
+            } else {
+                let mut out = Vec::new();
+                for i in 0..s.rows().saturating_mul(s.cols()) {
+                    let mut map = serde_json::Map::new();
+                    for name in s.field_names() {
+                        if let Some(x) = s.field_at(i, &name) {
+                            map.insert(name, value_to_json(x)?);
+                        }
+                    }
+                    out.push(serde_json::Value::Object(map));
+                }
+                serde_json::Value::Array(out)
+            }
+        }
+        Value::Object(o) if o.class_name == "table" => {
+            let mut map = serde_json::Map::new();
+            for name in table_var_names(o) {
+                if let Some(x) = o.prop(&name) {
+                    map.insert(name, value_to_json(&x)?);
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Object(o) => serde_json::json!(format!("{} object", o.class_name)),
+        Value::Cplx(_) => return Err(LangError::new("jsonencode: complex numbers are not supported", 0)),
+        Value::Sparse(_) => return Err(LangError::new("jsonencode: sparse arrays are not supported", 0)),
+        Value::Func(_) => return Err(LangError::new("jsonencode: function handles are not supported", 0)),
+    })
+}
+
+fn importdata_value(path: &str) -> Result<Value, LangError> {
+    let text = std::fs::read_to_string(path).map_err(|e| LangError::new(format!("importdata: {e}"), 0))?;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut all_numeric = true;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('%') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == ',' || c == '\t').filter(|s| !s.is_empty()).collect();
+        let nums: Vec<f64> = parts.iter().map(|s| s.parse::<f64>().unwrap_or(f64::NAN)).collect();
+        if nums.iter().any(|x| x.is_nan()) {
+            all_numeric = false;
+        }
+        rows.push(nums);
+    }
+    if all_numeric && !rows.is_empty() {
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut m = Matrix::zeros(rows.len(), cols);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &x) in row.iter().enumerate() {
+                let _ = m.set(r, c, x);
+            }
+        }
+        Ok(mat_or_num(m))
+    } else {
+        Ok(Value::Cell(CellArray::col(text.lines().map(|l| Value::Str(l.to_string())).collect())))
+    }
+}
+
+fn diary_write_to(path: &std::path::Path, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
 fn table_var_names(o: &MObject) -> Vec<String> {
     o.prop("Properties")
         .and_then(|p| match p {
@@ -13787,6 +14810,27 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "isstring",
     "table",
     "table2array",
+    "nchoosek",
+    "gammaln",
+    "hygecdf",
+    "tabulate",
+    "corr",
+    "pdist",
+    "squareform",
+    "vecnorm",
+    "blkdiag",
+    "mat2cell",
+    "gradient",
+    "expm",
+    "isbetween",
+    "isoutlier",
+    "partialcorr",
+    "linkage",
+    "isKey",
+    "count",
+    "keys",
+    "values",
+    "remove",
     "anova1",
     "anova2",
     "multcompare",
@@ -13800,6 +14844,13 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "height",
     "width",
     "istable",
+    "table2cell",
+    "cell2table",
+    "struct2table",
+    "struct2cell",
+    "cell2struct",
+    "addvars",
+    "setvartype",
     "rgb2gray",
     "imresize",
     "imfilter",
@@ -13913,6 +14964,34 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cellfun",
     "lasterror",
     "figure",
+    "axes",
+    "xticks",
+    "yticks",
+    "xticklabels",
+    "yticklabels",
+    "xtickangle",
+    "ytickangle",
+    "sgtitle",
+    "tiledlayout",
+    "nexttile",
+    "yline",
+    "barh",
+    "annotation",
+    "gobjects",
+    "isprop",
+    "isgraphics",
+    "allchild",
+    "ancestor",
+    "getappdata",
+    "setappdata",
+    "gcp",
+    "cla",
+    "colororder",
+    "getpixelposition",
+    "savefig",
+    "hsv",
+    "parula",
+    "cool",
     "gcf",
     "clf",
     "close",
@@ -14035,6 +15114,15 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "regexprep",
     "erase",
     "replace",
+    "findstr",
+    "extractBefore",
+    "extractAfter",
+    "insertBefore",
+    "isstrprop",
+    "isletter",
+    "compose",
+    "splitlines",
+    "readlines",
     "version",
     "computer",
     "ispc",
@@ -14059,6 +15147,26 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "assignin",
     "mfilename",
     "license",
+    "diary",
+    "jsondecode",
+    "jsonencode",
+    "importdata",
+    "detectImportOptions",
+    "rethrow",
+    "verLessThan",
+    "inputname",
+    "validateattributes",
+    "validatestring",
+    "mustBeNumeric",
+    "mustBeNonempty",
+    "mustBePositive",
+    "mustBeInteger",
+    "mustBeMember",
+    "mustBeText",
+    "mustBeA",
+    "mustBeScalarOrEmpty",
+    "mustBeFinite",
+    "mustBeReal",
     "ver",
     "drawnow",
     "beep",
@@ -19677,6 +20785,102 @@ end",
         std::fs::write(dir.join("mfp.m"), "function p = mfp()\np = mfilename('fullpath');\nend\n").unwrap();
         s.run("mp = mfp();").unwrap();
         assert!(matches!(s.get("mp"), Some(Value::Str(p)) if p.ends_with("mfp.m")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maps_graphics_tables_text_json_and_math() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_extra_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // containers.Map
+        s.run("m = containers.Map('KeyType','char','ValueType','double'); m('a')=1; m('b')=2; mc=m.Count; mk=m.isKey('a'); m.k=1; keys1=m.keys(); vals1=m.values(); m.remove('b'); mc2=m.Count;")
+            .unwrap();
+        assert_eq!(scalar(&s, "mc"), 2.0);
+        assert_eq!(scalar(&s, "mk"), 1.0);
+        assert_eq!(scalar(&s, "mc2"), 1.0);
+        assert_eq!(s.get("keys1").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2)), Some(true));
+
+        // diary
+        let diary = dir.join("diary.txt");
+        let dpath = diary.to_string_lossy().replace('\\', "/");
+        s.run(&format!("diary('{dpath}'); disp('diary payload'); diary off;")).unwrap();
+        let logged = std::fs::read_to_string(&diary).unwrap_or_default();
+        assert!(logged.contains("diary payload"), "diary content: {logged:?}");
+
+        // graphics: random data, ticks/labels, tiles, barh, yline, handles, appdata
+        let svg = dir.join("gfx.svg");
+        let spath = svg.to_string_lossy().replace('\\', "/");
+        s.run(&format!(
+            "figure; t=tiledlayout(2,2); nexttile; plot(1:8, rand(1,8)); xticks(1:4); xticklabels({{'A','B','C','D'}}); xtickangle(30); yline(0.5); nexttile; barh([3 1 2]); nexttile; bar(rand(4,1)); nexttile; scatter(rand(10,1),rand(10,1)); sgtitle('compat title'); h=gobjects(2,1); ip=isprop(h(1),'Position'); ig=isgraphics(h(1)); setappdata(1,'k',42); av=getappdata(1,'k'); saveas('{spath}');"
+        ))
+        .unwrap();
+        assert_eq!(scalar(&s, "ip"), 1.0);
+        assert_eq!(scalar(&s, "ig"), 1.0);
+        assert_eq!(scalar(&s, "av"), 42.0);
+        let svg_text = std::fs::read_to_string(&svg).unwrap_or_default();
+        assert!(svg_text.contains("compat title"));
+        assert!(svg_text.contains(">A<"));
+        assert!(svg_text.matches("stroke-width=\"1.2\"").count() >= 2);
+        assert!(svg_text.contains("fill-opacity=\"0.75\""));
+
+        // table conversions and editing
+        s.run("T=table([1;2;3],{'a';'b';'c'},'VariableNames',{'x','name'}); C=table2cell(T); T2=cell2table(C,'VariableNames',{'x','name'}); S=struct('x',[1;2],'name',{'a';'b'}); T3=struct2table(S); C2=struct2cell(S); D=cell2struct({'a',1;'b',2},{'name','v'},2); T4=addvars(T,[4;5;6],'NewVariableNames',{'z'}); T5=setvartype(T,{'x'},'char'); h2=height(T2); h3=height(T3); w4=width(T4);")
+            .unwrap();
+        assert_eq!(scalar(&s, "h2"), 3.0);
+        assert_eq!(scalar(&s, "h3"), 2.0);
+        assert_eq!(scalar(&s, "w4"), 3.0);
+        assert_eq!(s.get("C2").unwrap().dims(), (2, 1));
+        assert_eq!(s.get("D").map(|v| matches!(v, Value::Struct(st) if st.rows() == 2)), Some(true));
+        assert!(matches!(s.get("T5"), Some(Value::Object(o)) if o.prop("x").map(|v| matches!(v, Value::Cell(_))).unwrap_or(false)));
+
+        // text helpers
+        s.run("f=findstr('ababa','aba'); eb=extractBefore('hello.world','.'); ea=extractAfter('hello.world','.'); ib=insertBefore('abc','b','X'); il=isletter('a1B'); ip=isstrprop('a1 ','alpha'); sl=splitlines(sprintf('one\\ntwo\\n')); co=compose('%d',5);")
+            .unwrap();
+        assert_eq!(s.get("f").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        assert_eq!(s.get("eb"), Some(&Value::Str("hello".into())));
+        assert_eq!(s.get("ea"), Some(&Value::Str("world".into())));
+        assert_eq!(s.get("ib"), Some(&Value::Str("aXbc".into())));
+        assert_eq!(s.get("il").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 1.0]));
+        assert_eq!(s.get("ip").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 0.0]));
+        assert_eq!(s.get("sl").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2)), Some(true));
+        assert_eq!(s.get("co"), Some(&Value::Str("5".into())));
+
+        // JSON
+        s.run("j=jsonencode(struct('a',1,'b',{{'x','y'}})); d=jsondecode(j); da=d.a; db=d.b{1}; jn=jsondecode('[1,2,3]');").unwrap();
+        assert_eq!(scalar(&s, "da"), 1.0);
+        assert_eq!(s.get("db"), Some(&Value::Str("x".into())));
+        assert_eq!(s.get("jn").unwrap().dims(), (3, 1));
+
+        // math helpers
+        s.run("nk=nchoosek(5,2); nv=nchoosek([1 2 3],2); gl=gammaln(5); hc=hygecdf(2,50,5,10); tb=tabulate([1 1 2]); cr=corr([1 2 3;2 4 6;3 6 9]); pd=pdist([0 0;3 4;6 8]); sq=squareform(pd); vn=vecnorm([3 4;6 8]); bd=blkdiag([1 2;3 4],5); mc=mat2cell(ones(2,3),[1 1],[1 2]); gr=gradient([1 4 9]); ex=expm([0 1;0 0]);")
+            .unwrap();
+        assert_eq!(scalar(&s, "nk"), 10.0);
+        assert_eq!(s.get("nv").unwrap().dims(), (3, 2));
+        assert!((scalar(&s, "gl") - 24f64.ln()).abs() < 1e-9);
+        assert!((scalar(&s, "hc") - 0.951_739_696_8).abs() < 1e-6);
+        assert_eq!(s.get("tb").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("cr").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("sq").unwrap().dims(), (3, 3));
+        let vn = s.get("vn").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        assert!((vn[0] - 6.708_203_932_5).abs() < 1e-9 && (vn[1] - 8.944_271_91).abs() < 1e-9);
+        assert_eq!(s.get("bd").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("mc").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("gr").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0, 4.0, 5.0]));
+        assert_eq!(s.get("ex").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 1.0, 1.0]));
+
+        s.run("ib=isbetween([1 5 10],2,8); io=isoutlier([1 2 3 100]); lk=linkage(pdist([0 0;1 0;0 1;5 5])); pc=partialcorr([1 2 4;2 5 3;3 1 6;4 7 2;5 4 8]);")
+            .unwrap();
+        assert_eq!(s.get("ib").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0, 1.0, 0.0]));
+        assert_eq!(s.get("io").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(s.get("lk").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("pc").unwrap().dims(), (3, 3));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -603,6 +603,283 @@ fn table_grid(v: &Value, write_names: bool) -> Result<Grid, LangError> {
     Ok(grid)
 }
 
+fn table_rows_of(v: &Value) -> Result<usize, LangError> {
+    match v {
+        Value::Object(o) if o.class_name == "table" => Ok(o
+            .prop("Properties")
+            .and_then(|p| match p {
+                Value::Struct(s) => s.field_at(0, "NumRows").cloned(),
+                _ => None,
+            })
+            .and_then(|x| x.scalar().ok())
+            .unwrap_or(0.0)
+            .max(0.0) as usize),
+        _ => Err(LangError::new("expected a table", 0)),
+    }
+}
+
+fn table_names_of(v: &Value) -> Vec<String> {
+    table_variable_names(v)
+}
+
+fn variable_at(v: &Value, row: usize) -> Value {
+    match v {
+        Value::Num(x) => Value::Num(*x),
+        Value::Mat(m) if m.numel() == 1 => Value::Num(m.data().first().copied().unwrap_or(0.0)),
+        Value::Mat(m) => Value::Num(m.get_linear(row).unwrap_or(f64::NAN)),
+        Value::Cell(c) => c.get_linear(row).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+        Value::Str(s) => Value::Str(s.clone()),
+        other => other.clone(),
+    }
+}
+
+fn table2cell_value(v: &Value) -> Result<Value, LangError> {
+    let names = table_names_of(v);
+    let rows = table_rows_of(v)?;
+    let mut items = Vec::with_capacity(rows.saturating_mul(names.len()));
+    for name in &names {
+        let col = table_field(v, name).ok_or_else(|| LangError::new(format!("table is missing variable '{name}'"), 0))?;
+        for r in 0..rows {
+            items.push(variable_at(&col, r));
+        }
+    }
+    Ok(Value::Cell(CellArray::from_col_major(rows, names.len(), items)))
+}
+
+fn column_from_cells(items: &[Value], rows: usize) -> Value {
+    let numeric = items.iter().all(|x| matches!(x, Value::Num(_) | Value::Mat(_)));
+    if numeric {
+        let mut m = Matrix::zeros(rows, 1);
+        for (r, item) in items.iter().take(rows).enumerate() {
+            let x = match item {
+                Value::Num(x) => *x,
+                Value::Mat(mm) => mm.data().first().copied().unwrap_or(f64::NAN),
+                _ => f64::NAN,
+            };
+            let _ = m.set(r, 0, x);
+        }
+        Value::Mat(m)
+    } else {
+        Value::Cell(CellArray::col(items.iter().take(rows).cloned().collect()))
+    }
+}
+
+fn cell2table_value(c: &Value, names: Vec<String>) -> Result<Value, LangError> {
+    let (rows, cols, items) = match c {
+        Value::Cell(c) => (c.rows, c.cols, c.items.clone()),
+        Value::Mat(m) => (m.rows(), m.cols(), m.data().iter().map(|&x| Value::Num(x)).collect()),
+        _ => return Err(LangError::new("cell2table needs a cell array", 0)),
+    };
+    let names = if names.len() == cols { names } else { (1..=cols).map(|i| format!("Var{i}")).collect() };
+    let mut props = StructArray::new();
+    for (c, name) in names.iter().enumerate() {
+        let mut col = Vec::with_capacity(rows);
+        for r in 0..rows {
+            col.push(items.get(c * rows + r).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+        }
+        props.set_field(0, name, column_from_cells(&col, rows))?;
+    }
+    props.set_field(0, "Properties", table_properties(names, rows))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn struct2table_value(v: &Value) -> Result<Value, LangError> {
+    let s = match v {
+        Value::Struct(s) => s,
+        _ => return Err(LangError::new("struct2table needs a struct", 0)),
+    };
+    let names = s.field_names();
+    let multi = s.rows().saturating_mul(s.cols()) > 1;
+    let rows = if multi {
+        s.rows().saturating_mul(s.cols())
+    } else {
+        names.iter().map(|n| table_field(v, n).map(|x| field_len(&x)).unwrap_or(0)).max().unwrap_or(0).max(1)
+    };
+    let mut props = StructArray::new();
+    for name in &names {
+        let value = table_field(v, name).ok_or_else(|| LangError::new(format!("struct is missing field '{name}'"), 0))?;
+        let col = if multi {
+            let vals = s.field_values(name).unwrap_or_default();
+            column_from_cells(&vals, rows)
+        } else if match &value {
+            Value::Mat(m) => m.rows(),
+            Value::Cell(c) => c.rows,
+            _ => 1,
+        } == rows
+        {
+            value
+        } else if let Value::Mat(m) = &value {
+            if m.numel() == 1 {
+                let mut out = Matrix::zeros(rows, 1);
+                for r in 0..rows {
+                    let _ = out.set(r, 0, m.data().first().copied().unwrap_or(0.0));
+                }
+                Value::Mat(out)
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        props.set_field(0, name, col)?;
+    }
+    props.set_field(0, "Properties", table_properties(names, rows))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn struct2cell_value(v: &Value) -> Result<Value, LangError> {
+    let s = match v {
+        Value::Struct(s) => s,
+        _ => return Err(LangError::new("struct2cell needs a struct", 0)),
+    };
+    let names = s.field_names();
+    let mut items = Vec::with_capacity(names.len());
+    for name in names {
+        items.push(
+            s.field_values(&name)
+                .and_then(|mut x| if x.len() == 1 { x.pop() } else { Some(Value::Cell(CellArray::col(x))) })
+                .unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+        );
+    }
+    Ok(Value::Cell(CellArray::col(items)))
+}
+
+fn cell2struct_value(c: &Value, fields: &[String], dim: usize) -> Result<Value, LangError> {
+    let ca = match c {
+        Value::Cell(c) => c,
+        _ => return Err(LangError::new("cell2struct needs a cell array", 0)),
+    };
+    let (groups, elems) = if dim == 1 { (ca.rows, ca.cols) } else { (ca.cols, ca.rows) };
+    if fields.len() != groups {
+        return Err(LangError::new("cell2struct: field count must match the selected dimension", 0));
+    }
+    if elems <= 1 {
+        let mut props = StructArray::new();
+        for (g, name) in fields.iter().enumerate() {
+            let item = if dim == 1 { ca.get(g, 0) } else { ca.get(0, g) };
+            props.set_field(0, name, item.cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+        }
+        return Ok(Value::Struct(props));
+    }
+    let mut props = StructArray::with_dims(elems, 1);
+    for e in 0..elems {
+        for (g, name) in fields.iter().enumerate() {
+            let item = if dim == 1 { ca.get(g, e) } else { ca.get(e, g) };
+            props.set_field(e, name, item.cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+        }
+    }
+    Ok(Value::Struct(props))
+}
+
+fn parse_name_list(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::Cell(c)) => c
+            .items
+            .iter()
+            .filter_map(|x| match x {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(Value::Str(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn addvars_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let Value::Object(o) = t else { return Err(LangError::new("addvars needs a table", 0)) };
+    let mut names = table_names_of(t);
+    let mut values: Vec<Value> = Vec::new();
+    let mut explicit: Option<Vec<String>> = None;
+    let mut i = 1usize;
+    while i < argv.len() {
+        if let Value::Str(key) = &argv[i] {
+            if key.eq_ignore_ascii_case("NewVariableNames") || key.eq_ignore_ascii_case("Before") || key.eq_ignore_ascii_case("After") {
+                if key.eq_ignore_ascii_case("NewVariableNames") {
+                    explicit = Some(parse_name_list(argv.get(i + 1)));
+                }
+                i += 2;
+                continue;
+            }
+        }
+        values.push(argv[i].clone());
+        i += 1;
+    }
+    let new_names = explicit.unwrap_or_else(|| (0..values.len()).map(|k| format!("Var{}", names.len() + k + 1)).collect());
+    let rows = values.first().map(field_len).unwrap_or_else(|| table_rows_of(t).unwrap_or(0)).max(1);
+    let mut out = StructArray::new();
+    for name in &names {
+        out.set_field(0, name, o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+    }
+    for (k, value) in values.iter().enumerate() {
+        let name = new_names.get(k).cloned().unwrap_or_else(|| format!("Var{}", names.len() + k + 1));
+        out.set_field(0, &name, value.clone())?;
+        names.push(name);
+    }
+    out.set_field(0, "Properties", table_properties(names, rows))?;
+    Ok(Value::Object(MObject::owned("table".into(), out)))
+}
+
+fn setvartype_table(t: &Value, argv: &[Value]) -> Result<Value, LangError> {
+    let Value::Object(o) = t else { return Err(LangError::new("setvartype needs a table", 0)) };
+    let selected = parse_name_list(argv.get(1));
+    let kind = match argv.get(2) {
+        Some(Value::Str(s)) => s.to_ascii_lowercase(),
+        _ => "double".to_string(),
+    };
+    let names = table_names_of(t);
+    let mut out = StructArray::new();
+    for name in &names {
+        let value = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let new = if selected.is_empty() || selected.iter().any(|s| s == name) {
+            match kind.as_str() {
+                "double" | "single" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" => match &value {
+                    Value::Mat(_) | Value::Num(_) => value.clone(),
+                    Value::Cell(c) => {
+                        let mut m = Matrix::zeros(c.rows, 1);
+                        for r in 0..c.rows {
+                            let x = match c.get(r, 0) {
+                                Some(Value::Str(s)) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
+                                Some(Value::Num(x)) => *x,
+                                _ => f64::NAN,
+                            };
+                            let _ = m.set(r, 0, x);
+                        }
+                        Value::Mat(m)
+                    }
+                    _ => value.clone(),
+                },
+                "char" | "string" | "categorical" => match &value {
+                    Value::Mat(m) => {
+                        let mut items = Vec::with_capacity(m.numel());
+                        for i in 0..m.numel() {
+                            items.push(Value::Str(format!("{}", m.get_linear(i).unwrap_or(0.0))));
+                        }
+                        Value::Cell(CellArray::col(items))
+                    }
+                    _ => value.clone(),
+                },
+                "logical" => match &value {
+                    Value::Mat(m) => {
+                        let mut out = Matrix::zeros(m.rows(), m.cols());
+                        for i in 0..m.numel() {
+                            out.set_linear(i, if m.get_linear(i).unwrap_or(0.0) != 0.0 { 1.0 } else { 0.0 });
+                        }
+                        Value::Mat(out)
+                    }
+                    _ => value.clone(),
+                },
+                _ => value.clone(),
+            }
+        } else {
+            value
+        };
+        out.set_field(0, name, new)?;
+    }
+    out.set_field(0, "Properties", table_properties(names, table_rows_of(t)?))?;
+    Ok(Value::Object(MObject::owned("table".into(), out)))
+}
+
 impl Session {
     pub(super) fn xlsx_builtin(&mut self, name: &str, argv: Vec<Value>, nout: usize) -> Result<Vec<Value>, LangError> {
         match name {
@@ -612,6 +889,27 @@ impl Session {
             "writecell" => self.writecell_call(&argv),
             "readtable" => self.readtable_call(&argv),
             "writetable" => self.writetable_call(&argv),
+            "table2cell" => Ok(vec![table2cell_value(argv.first().ok_or_else(|| LangError::new("table2cell needs a table", 0))?)?]),
+            "cell2table" => {
+                let c = argv.first().ok_or_else(|| LangError::new("cell2table needs a cell array", 0))?;
+                let mut names = Vec::new();
+                if let Some(Value::Str(k)) = argv.get(1) {
+                    if k.eq_ignore_ascii_case("VariableNames") {
+                        names = parse_name_list(argv.get(2));
+                    }
+                }
+                Ok(vec![cell2table_value(c, names)?])
+            }
+            "struct2table" => Ok(vec![struct2table_value(argv.first().ok_or_else(|| LangError::new("struct2table needs a struct", 0))?)?]),
+            "struct2cell" => Ok(vec![struct2cell_value(argv.first().ok_or_else(|| LangError::new("struct2cell needs a struct", 0))?)?]),
+            "cell2struct" => {
+                let c = argv.first().ok_or_else(|| LangError::new("cell2struct needs a cell array", 0))?;
+                let fields = parse_name_list(argv.get(1));
+                let dim = argv.get(2).and_then(|v| v.scalar().ok()).unwrap_or(1.0).max(1.0) as usize;
+                Ok(vec![cell2struct_value(c, &fields, dim)?])
+            }
+            "addvars" => Ok(vec![addvars_table(argv.first().ok_or_else(|| LangError::new("addvars needs a table", 0))?, &argv)?]),
+            "setvartype" => Ok(vec![setvartype_table(argv.first().ok_or_else(|| LangError::new("setvartype needs a table", 0))?, &argv)?]),
             "height" => Ok(vec![Value::Num(height_of(argv.first())? as f64)]),
             "width" => Ok(vec![Value::Num(width_of(argv.first())? as f64)]),
             "istable" => Ok(vec![Value::Num(matches!(argv.first(), Some(Value::Object(o)) if o.class_name == "table") as u8 as f64)]),

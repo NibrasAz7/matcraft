@@ -2517,6 +2517,7 @@ dependencies = [
  "matcore",
  "matplot",
  "regex",
+ "serde_json",
 ]
 
 [[package]]

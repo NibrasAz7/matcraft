@@ -13,6 +13,7 @@ matcore = { path = "../matcore" }
 matplot = { path = "../matplot" }
 flate2 = "1.1"
 regex = "1"
+serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-atomic = { path = "../../../craft-libs/crates/atomic" }

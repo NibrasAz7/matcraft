@@ -265,6 +265,15 @@
   (row `out*m+inp`) using `C(jwI-A)^-1B+D`; SISO shapes are unchanged.
   Cross-checked against analytic diagonal and shared-input state-space
   responses. `examples/control.m` demonstrates it.
+- Graphics/table/math compatibility wave (2026-11): explicit axes
+  tick/label/angle controls, `sgtitle`, `tiledlayout`/`nexttile`, `barh`,
+  `yline`, graphics-handle helpers and `savefig`; table conversion/editing
+  helpers; `containers.Map`; `diary`; text extract/insert/predicate helpers;
+  JSON/import helpers; validation and `rethrow`; `corr`, `tabulate`,
+  `gammaln`, `hygecdf`, `nchoosek`, `pdist`, `squareform`, `linkage`,
+  `partialcorr`, `isoutlier`, `isbetween`; `expm`, `vecnorm`, `blkdiag`,
+  `mat2cell` and `gradient`. Tested with synthetic data and existing
+  workflows.
 - Corpus compatibility wave (2026-11): MATLAB implicit expansion,
   delimited-text `readtable`/`writetable`, table subsetting/`sortrows`/dot
   assignment, cellstr `str2double`/`strcmp`, `erase`/`replace`,
