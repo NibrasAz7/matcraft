@@ -22650,7 +22650,8 @@ end",
         assert!((scalar(&s, "p") + 120.0).abs() < 1e-9);
 
         // PIDF adds a derivative filter.
-        s.run("G = tf(1, [1 1]); [Cf, fi] = pidtune(G, 'PIDF', 3); tfv = fi.Tf; pmf = fi.PhaseMargin; [mf, pf] = bode(series(G, Cf), 3);").unwrap();
+        s.run("Gf = tf(1, [1 2 1]); [Cf, fi] = pidtune(Gf, 'PIDF', 3); tfv = fi.Tf; pmf = fi.PhaseMargin; [mf, pf] = bode(series(Gf, Cf), 3);")
+            .unwrap();
         assert!(scalar(&s, "tfv") > 0.0);
         assert!((scalar(&s, "pmf") - 60.0).abs() < 1e-6, "PIDF phase margin = {}", scalar(&s, "pmf"));
         assert!((scalar(&s, "mf") - 1.0).abs() < 0.02, "PIDF open-loop magnitude = {}", scalar(&s, "mf"));

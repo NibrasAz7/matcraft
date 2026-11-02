@@ -967,7 +967,7 @@ impl Session {
         let pg = g.im.atan2(g.re);
         // Controller phase needed to leave the open loop at the 60 degree target.
         let target = -std::f64::consts::PI + 60.0f64.to_radians() - pg;
-        let tf = if kind == "pidf" { 1.0 / (10.0 * wc) } else { 0.0 };
+        let mut tf = if kind == "pidf" { 1.0 / (10.0 * wc) } else { 0.0 };
         let (ti0, td0) = match kind.as_str() {
             "p" => (0.0, 0.0),
             "pi" => {
@@ -1006,6 +1006,11 @@ impl Session {
                 }
             }
         };
+        // A PIDF that needs no derivative action is just PI; dropping the
+        // filter keeps the evaluated response and the saved TF consistent.
+        if kind == "pidf" && td0 <= 0.0 {
+            tf = 0.0;
+        }
         let ki0 = if kind == "p" || kind == "pd" || ti0 <= 0.0 { 0.0 } else { 1.0 / ti0 };
         let kd0 = if kind == "p" || kind == "pi" { 0.0 } else { td0 };
         let c0 = pid_response(wc, 1.0, ki0, kd0, tf);
