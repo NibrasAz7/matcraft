@@ -1,8 +1,10 @@
-//! Minimal NetCDF classic (CDF-1/CDF-2) reader and CDF-1 writer.
+//! NetCDF reader and CDF-1 writer.
 //!
-//! Supports numeric variables, dimensions, global/variable attributes
-//! (read and skipped), big-endian storage and non-record variables. NetCDF-4
-//! files are HDF5 containers and are rejected here (use the HDF5 builtins).
+//! Classic files (CDF-1/CDF-2) use the tagged big-endian format; NetCDF-4
+//! files are HDF5 containers and are mapped through the HDF5 reader using
+//! dimension-scale datasets (`_Netcdf4Dimid`, `_Netcdf4Coordinates`).
+//! Writes always produce classic CDF-1, including when the source was a
+//! NetCDF-4 container.
 
 use crate::LangError;
 
@@ -157,14 +159,86 @@ fn skip_attrs(r: &mut Reader<'_>) -> Result<(), LangError> {
     Ok(())
 }
 
+/// Map a NetCDF-4/HDF5 container to the classic `NetCdf` model.
+///
+/// NetCDF-C stores each dimension as a dimension-scale dataset carrying
+/// `_Netcdf4Dimid` (and `CLASS = DIMENSION_SCALE`); variables carry
+/// `_Netcdf4Coordinates`, an array of the dimension ids in axis order.
+/// Pure dimensions use a `NAME` sentinel and are not exposed as variables,
+/// while coordinate variables (a dataset that is both a dimension and a
+/// variable) are.
+fn from_hdf5(file: &crate::hdf5::H5File) -> Result<NetCdf, LangError> {
+    use crate::hdf5::H5AttrValue;
+    fn attr_str<'a>(ds: &'a crate::hdf5::H5Dataset, name: &str) -> Option<&'a str> {
+        ds.attrs.iter().find(|(k, _)| k == name).and_then(|(_, v)| match v {
+            H5AttrValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+    fn attr_ints<'a>(ds: &'a crate::hdf5::H5Dataset, name: &str) -> Option<&'a [i64]> {
+        ds.attrs.iter().find(|(k, _)| k == name).and_then(|(_, v)| match v {
+            H5AttrValue::Ints(v) => Some(v.as_slice()),
+            _ => None,
+        })
+    }
+    let sentinel = "This is a netCDF dimension but not a netCDF variable.";
+    let mut identified: Vec<(i64, String, usize)> = Vec::new();
+    for ds in &file.datasets {
+        let Some(ids) = attr_ints(ds, "_Netcdf4Dimid") else { continue };
+        let Some(&id) = ids.first() else { continue };
+        let name = attr_str(ds, "NAME").filter(|n| !n.starts_with(sentinel)).map(str::to_string).unwrap_or_else(|| ds.name.clone());
+        let size = ds.dims.first().copied().unwrap_or(1);
+        identified.push((id, name, size));
+    }
+    identified.sort_by_key(|(id, _, _)| *id);
+    identified.dedup_by_key(|(id, _, _)| *id);
+    let dims: Vec<(String, usize)> = identified.iter().map(|(_, n, s)| (n.clone(), *s)).collect();
+    let dim_name = |id: i64| -> String {
+        identified.iter().find(|(i, _, _)| *i == id).map(|(_, n, _)| n.clone()).unwrap_or_else(|| format!("dim{}", id.saturating_add(1)))
+    };
+    let infer = |shape: &[usize]| -> Vec<String> {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &n)| {
+                let hits: Vec<&str> = dims.iter().filter(|(_, s)| *s == n).map(|(name, _)| name.as_str()).collect();
+                if hits.len() == 1 {
+                    hits[0].to_string()
+                } else {
+                    format!("dim{}", axis + 1)
+                }
+            })
+            .collect()
+    };
+    let mut vars = Vec::new();
+    for ds in &file.datasets {
+        let is_dimension = attr_str(ds, "CLASS").is_some_and(|c| c == "DIMENSION_SCALE");
+        let pure_dimension = is_dimension && attr_str(ds, "NAME").is_some_and(|n| n.starts_with(sentinel));
+        if pure_dimension {
+            continue;
+        }
+        let dim_names = match attr_ints(ds, "_Netcdf4Coordinates") {
+            Some(ids) if !ids.is_empty() => ids.iter().map(|&id| dim_name(id)).collect(),
+            _ => infer(&ds.dims),
+        };
+        vars.push(NcVar { name: ds.name.clone(), dim_names, shape: ds.dims.clone(), kind: NcType::Double, data: ds.data.clone() });
+    }
+    Ok(NetCdf { dims, vars })
+}
+
 pub(crate) fn read(path: &std::path::Path) -> Result<NetCdf, LangError> {
     let bytes = std::fs::read(path).map_err(|e| LangError::new(format!("netcdf: cannot read {}: {e}", path.display()), 0))?;
     read_bytes(&bytes)
 }
 
 pub(crate) fn read_bytes(bytes: &[u8]) -> Result<NetCdf, LangError> {
+    let h5 = |off: usize| bytes.get(off..off + 8) == Some(b"\x89HDF\r\n\x1a\n");
+    if h5(0) || h5(512) {
+        let file = crate::hdf5::read_bytes(bytes)?;
+        return from_hdf5(&file);
+    }
     if bytes.get(0..3) != Some(b"CDF") {
-        return Err(LangError::new("netcdf: not a classic NetCDF file (NetCDF-4/HDF5 is not supported here)", 0));
+        return Err(LangError::new("netcdf: not a NetCDF classic or NetCDF-4/HDF5 file", 0));
     }
     let version = *bytes.get(3).ok_or_else(|| LangError::new("netcdf: truncated header", 0))?;
     if version != 1 && version != 2 {
@@ -347,4 +421,28 @@ pub(crate) fn write_bytes(nc: &NetCdf) -> Result<Vec<u8>, LangError> {
         out.extend(std::iter::repeat_n(0u8, pad));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_netcdf4_hdf5_container() {
+        let nc = read_bytes(include_bytes!("../tests/fixtures/netcdf4_sample.nc")).unwrap();
+        assert_eq!(nc.dims, vec![("time".to_string(), 4), ("lat".to_string(), 3)]);
+        let temp = nc.vars.iter().find(|v| v.name == "temp").unwrap();
+        assert_eq!(temp.dim_names, vec!["time", "lat"]);
+        assert_eq!(temp.shape, vec![4, 3]);
+        assert_eq!(temp.data, (1..=12).map(|v| v as f64).collect::<Vec<_>>());
+        let lat = nc.vars.iter().find(|v| v.name == "lat").unwrap();
+        assert_eq!(lat.dim_names, vec!["lat"]);
+        assert_eq!(lat.data, vec![10.0, 20.0, 30.0]);
+        let scale = nc.vars.iter().find(|v| v.name == "scale").unwrap();
+        assert!(scale.shape.is_empty());
+        assert_eq!(scale.data, vec![2.5]);
+        let quality = nc.vars.iter().find(|v| v.name == "quality").unwrap();
+        assert_eq!(quality.data, (0..12).map(|v| v as f64).collect::<Vec<_>>());
+        assert!(!nc.vars.iter().any(|v| v.name == "time"));
+    }
 }

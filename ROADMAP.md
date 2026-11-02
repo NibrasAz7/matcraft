@@ -324,6 +324,11 @@
   wider library compatibility, `h5create(...,'SuperblockVersion',3)` opts
   into v3, and read/write round trips preserve the file's format. A
   writer-produced v2 fixture is read back with the native reader and h5py.
+- NetCDF-4 wave (2026-11): `nc*` reads NetCDF-4/HDF5 containers through
+  the HDF5 reader, mapping dimension-scale datasets (`_Netcdf4Dimid`,
+  `CLASS`) and variable `_Netcdf4Coordinates` into the classic dimension/
+  variable model. A netCDF-C 4.10 fixture covers 2-D, 1-D coordinate,
+  scalar and integer variables; classic CDF-1 writes remain the output path.
 - Canny/bicubic wave (2026-11): Keys bicubic `imresize` (`a=-0.5`,
   column-major output fixed) and Canny `edge` (Gaussian smoothing, Sobel
   gradients, subpixel non-maximum suppression, double-threshold hysteresis,

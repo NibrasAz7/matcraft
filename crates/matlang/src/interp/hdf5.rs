@@ -142,7 +142,7 @@ fn matrix_to_dataset(name: String, m: &Matrix) -> H5Dataset {
             }
         }
     }
-    H5Dataset { name, dims, data }
+    H5Dataset { name, dims, data, attrs: Vec::new() }
 }
 
 fn shape_arg(v: &Value) -> Result<Vec<usize>, LangError> {
@@ -231,7 +231,7 @@ impl Session {
                     return Err(LangError::new("h5create: dataset already exists", 0));
                 }
                 let count = dims.iter().fold(1usize, |a, &b| a.saturating_mul(b));
-                file.datasets.push(H5Dataset { name: ds_name, dims, data: vec![0.0; count] });
+                file.datasets.push(H5Dataset { name: ds_name, dims, data: vec![0.0; count], attrs: Vec::new() });
                 if let Some(v) = superblock_version_option(&argv, 3)? {
                     file.superblock_version = v;
                 }

@@ -21990,6 +21990,36 @@ end",
     }
 
     #[test]
+    fn netcdf4_hdf5_builtins() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/netcdf4_sample.nc");
+        let p = path.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "t = ncread('{p}', 'temp'); l = ncread('{p}', 'lat'); c = ncread('{p}', 'scale'); \
+             q = ncread('{p}', 'quality'); sub = ncread('{p}', 'temp', [2 2], [2 2], [1 1]); \
+             info = ncinfo('{p}'); dn1 = info.Dimensions(1).Name; dn2 = info.Dimensions(2).Name; nv = numel(info.Variables);"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.get("t").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((4, 3, vec![1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0]))
+        );
+        assert_eq!(s.get("l").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![10.0, 20.0, 30.0]));
+        assert_eq!(s.get("c"), Some(&Value::Num(2.5)));
+        assert_eq!(
+            s.get("q").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()),
+            Some(vec![0.0, 3.0, 6.0, 9.0, 1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0])
+        );
+        assert_eq!(
+            s.get("sub").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((2, 2, vec![5.0, 8.0, 6.0, 9.0]))
+        );
+        assert_eq!(s.get("dn1"), Some(&Value::Str("time".into())));
+        assert_eq!(s.get("dn2"), Some(&Value::Str("lat".into())));
+        assert_eq!(s.get("nv"), Some(&Value::Num(4.0)));
+    }
+
+    #[test]
     fn hdf5_netcdf_io() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);

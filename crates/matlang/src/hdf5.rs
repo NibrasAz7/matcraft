@@ -17,11 +17,19 @@ const BTREE_NODE_SIZE: usize = 544;
 const SNOD_NODE_SIZE: usize = 8 + 2 * 4 * 40;
 
 #[derive(Clone, Debug)]
+pub(crate) enum H5AttrValue {
+    Str(String),
+    Ints(Vec<i64>),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct H5Dataset {
     pub name: String,
     pub dims: Vec<usize>,
     /// Row-major numeric payload.
     pub data: Vec<f64>,
+    /// Decoded numeric/string attributes (NetCDF-4 dimension metadata).
+    pub attrs: Vec<(String, H5AttrValue)>,
 }
 
 #[derive(Clone, Debug)]
@@ -728,7 +736,6 @@ pub(crate) fn read(path: &std::path::Path) -> Result<H5File, LangError> {
     read_bytes_with(&bytes, base, 0)
 }
 
-#[cfg(test)]
 pub(crate) fn read_bytes(b: &[u8]) -> Result<H5File, LangError> {
     read_bytes_with(b, None, 0)
 }
@@ -1101,15 +1108,120 @@ fn parse_filters(data: &[u8]) -> Result<Vec<H5Filter>, LangError> {
     Ok(filters)
 }
 
+/// Decode one HDF5 attribute message (type 0x000C). Version 1 aligns its
+/// name/datatype/dataspace blocks to 8 bytes; versions 2 and 3 do not, and
+/// version 3 adds a character-encoding byte before the name.
+fn parse_attribute(b: &[u8], ctx: H5Ctx, range: std::ops::Range<usize>) -> Option<(String, H5AttrValue)> {
+    let d = b.get(range)?;
+    let version = *d.first()?;
+    let (name_size, dtype_size, space_size, name_off): (usize, usize, usize, usize) = match version {
+        1 => (u16_at(d, 2)? as usize, u16_at(d, 4)? as usize, u16_at(d, 6)? as usize, 8),
+        2 => (u16_at(d, 2)? as usize, u16_at(d, 4)? as usize, u16_at(d, 6)? as usize, 8),
+        3 => (u16_at(d, 2)? as usize, u16_at(d, 4)? as usize, u16_at(d, 6)? as usize, 9),
+        _ => return None,
+    };
+    if name_size > 4096 || dtype_size > 4096 || space_size > 4096 {
+        return None;
+    }
+    let name_bytes = d.get(name_off..name_off.checked_add(name_size)?)?;
+    let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').to_string();
+    let dtype_off = if version == 1 { name_off + pad8(name_size) } else { name_off + name_size };
+    let space_off = if version == 1 { dtype_off + pad8(dtype_size) } else { dtype_off + dtype_size };
+    let data_off = if version == 1 { space_off + pad8(space_size) } else { space_off + space_size };
+    let dtype = d.get(dtype_off..dtype_off.checked_add(dtype_size)?)?;
+    let space = d.get(space_off..space_off.checked_add(space_size)?)?;
+    let count = attribute_count(space, ctx)?;
+    let raw = d.get(data_off..)?;
+    let value = decode_attribute(dtype, count, raw)?;
+    Some((name, value))
+}
+
+fn attribute_count(space: &[u8], _ctx: H5Ctx) -> Option<usize> {
+    let version = *space.first()?;
+    let rank = *space.get(1)? as usize;
+    if rank > 32 {
+        return None;
+    }
+    if rank == 0 {
+        return Some(1);
+    }
+    let base = if version >= 2 { 4 } else { 8 };
+    let mut count = 1usize;
+    for i in 0..rank {
+        let d = read_uint(space, base + i * 8, 8)? as usize;
+        count = count.checked_mul(d)?;
+    }
+    (count <= 1_000_000).then_some(count)
+}
+
+fn attr_uint(raw: &[u8], off: usize, size: usize, big_endian: bool) -> Option<u64> {
+    let s = raw.get(off..off.checked_add(size)?)?;
+    let mut v = 0u64;
+    if big_endian {
+        for &b in s {
+            v = (v << 8) | b as u64;
+        }
+    } else {
+        for &b in s.iter().rev() {
+            v = (v << 8) | b as u64;
+        }
+    }
+    Some(v)
+}
+
+fn sign_extend(v: u64, bits: usize) -> i64 {
+    if bits == 0 || bits >= 64 {
+        return v as i64;
+    }
+    let shift = 64 - bits;
+    ((v << shift) as i64) >> shift
+}
+
+fn decode_attribute(dtype: &[u8], count: usize, raw: &[u8]) -> Option<H5AttrValue> {
+    let class = dtype.first()? & 0x0F;
+    let flags = *dtype.get(1)?;
+    let size = u32_at(dtype, 4)? as usize;
+    if size == 0 || size > 1024 || count.saturating_mul(size) > raw.len() {
+        return None;
+    }
+    let big_endian = flags & 0x01 != 0;
+    match class {
+        0 => {
+            let signed = flags & 0x08 != 0;
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let v = attr_uint(raw, i.saturating_mul(size), size, big_endian)?;
+                out.push(if signed { sign_extend(v, size.saturating_mul(8)) } else { v as i64 });
+            }
+            Some(H5AttrValue::Ints(out))
+        }
+        1 => {
+            // Floating-point attributes are not needed for NetCDF-4
+            // structural metadata.
+            None
+        }
+        3 => {
+            // Fixed-length string; only scalar strings are meaningful here.
+            let bytes = raw.get(..count.saturating_mul(size).min(raw.len()))?;
+            let text = String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string();
+            Some(H5AttrValue::Str(text))
+        }
+        _ => None,
+    }
+}
+
 fn parse_dataset(b: &[u8], ctx: H5Ctx, rctx: &H5ReadCtx, addr: usize, name: String) -> Result<Option<H5Dataset>, LangError> {
     let mut dims: Vec<usize> = Vec::new();
     let mut max_dims: Vec<usize> = Vec::new();
+    let mut has_space = false;
     let mut kind = 0u8;
     let mut size = 0usize;
     let mut layout_raw: Option<Vec<u8>> = None;
     let mut filters: Vec<H5Filter> = Vec::new();
+    let mut attrs: Vec<(String, H5AttrValue)> = Vec::new();
     walk_object_header(b, addr, ctx, &mut |typ, data, _| {
         if typ == 0x0001 {
+            has_space = true;
             let version = b.get(data.start).copied().unwrap_or(1);
             let rank = b.get(data.start + 1).copied().unwrap_or(0) as usize;
             let flags = b.get(data.start + 2).copied().unwrap_or(0);
@@ -1132,10 +1244,14 @@ fn parse_dataset(b: &[u8], ctx: H5Ctx, rctx: &H5ReadCtx, addr: usize, name: Stri
             layout_raw = Some(b.get(data).unwrap_or(&[]).to_vec());
         } else if typ == 0x000b {
             filters = parse_filters(b.get(data).unwrap_or(&[]))?;
+        } else if typ == 0x000c {
+            if let Some((aname, avalue)) = parse_attribute(b, ctx, data.clone()) {
+                attrs.push((aname, avalue));
+            }
         }
         Ok(())
     })?;
-    if dims.is_empty() || size == 0 {
+    if !has_space || size == 0 {
         return Ok(None);
     }
     let layout = match layout_raw.as_deref() {
@@ -1164,7 +1280,7 @@ fn parse_dataset(b: &[u8], ctx: H5Ctx, rctx: &H5ReadCtx, addr: usize, name: Stri
         }
         None => return Ok(None),
     };
-    Ok(Some(H5Dataset { name, dims, data }))
+    Ok(Some(H5Dataset { name, dims, data, attrs }))
 }
 
 fn decode_values(raw: &[u8], count: usize, kind: u8, size: usize) -> Vec<f64> {
@@ -2203,7 +2319,7 @@ mod tests {
     fn roundtrip_v2_superblock_writer() {
         let data: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
         let mut f = H5File::default();
-        f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone() });
+        f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone(), attrs: Vec::new() });
         let bytes = write_bytes(&f).unwrap();
         assert_eq!(bytes.get(8), Some(&2));
         assert_eq!(u32_at(&bytes, 44), Some(lookup3(&bytes[..44])));
@@ -2218,7 +2334,7 @@ mod tests {
     fn roundtrip_v3_superblock_writer() {
         let data: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
         let mut f = H5File { superblock_version: 3, ..H5File::default() };
-        f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone() });
+        f.datasets.push(H5Dataset { name: "grid".into(), dims: vec![100, 100], data: data.clone(), attrs: Vec::new() });
         let bytes = write_bytes(&f).unwrap();
         assert_eq!(bytes.get(8), Some(&3));
         assert_eq!(u32_at(&bytes, 44), Some(lookup3(&bytes[..44])));
@@ -2234,7 +2350,7 @@ mod tests {
         let n = 2049usize;
         let data: Vec<f64> = (0..n * n).map(|i| (i % 997) as f64).collect();
         let mut f = H5File::default();
-        f.datasets.push(H5Dataset { name: "large".into(), dims: vec![n, n], data: data.clone() });
+        f.datasets.push(H5Dataset { name: "large".into(), dims: vec![n, n], data: data.clone(), attrs: Vec::new() });
         let bytes = write_bytes(&f).unwrap();
         let back = read_bytes(&bytes).unwrap();
         assert_eq!(back.datasets.len(), 1);
@@ -2247,8 +2363,8 @@ mod tests {
     #[test]
     fn roundtrip_two_datasets() {
         let mut f = H5File::default();
-        f.datasets.push(H5Dataset { name: "a".into(), dims: vec![2, 3], data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0] });
-        f.datasets.push(H5Dataset { name: "b".into(), dims: vec![4], data: vec![9.0, 8.0, 7.0, 6.0] });
+        f.datasets.push(H5Dataset { name: "a".into(), dims: vec![2, 3], data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], attrs: Vec::new() });
+        f.datasets.push(H5Dataset { name: "b".into(), dims: vec![4], data: vec![9.0, 8.0, 7.0, 6.0], attrs: Vec::new() });
         let bytes = write_bytes(&f).unwrap();
         let back = read_bytes(&bytes).unwrap();
         assert_eq!(back.datasets.len(), 2);
