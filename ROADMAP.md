@@ -347,6 +347,9 @@
   writes scalar objects, object arrays and nested object-valued properties as
   opaque records plus a subsystem, with fixture-backed reader tests and writer
   round trips.
+- Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
+  keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
+  `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
 - ODE-variant wave (2026-11): `ode23` uses the Bogacki-Shampine 3(2)
   tableau; `ode23s` reuses the TR-BDF2 stiff engine, with closed-form
   decay and stiff-decay regression tests.

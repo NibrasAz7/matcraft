@@ -22579,6 +22579,39 @@ end",
     }
 
     #[test]
+    fn control_complex_zpk() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "G = zpk([-1+2i -1-2i], [-3 -4], 2); [n, d] = tfdata(G); [z, p, k] = zpkdata(G); \
+             zs = real(sum(z)); zp = real(prod(z)); ps = real(sum(p)); pp = real(prod(p)); \
+             H = zpk(tf([1 2], [1 2 5])); ph = pole(H); phr = real(ph); phi = imag(ph);",
+        )
+        .unwrap();
+        assert_eq!(vec(&s, "n"), vec![2.0, 4.0, 10.0]);
+        assert_eq!(vec(&s, "d"), vec![1.0, 7.0, 12.0]);
+        assert!((scalar(&s, "zs") + 2.0).abs() < 1e-9);
+        assert!((scalar(&s, "zp") - 5.0).abs() < 1e-9);
+        assert!((scalar(&s, "ps") + 7.0).abs() < 1e-9);
+        assert!((scalar(&s, "pp") - 12.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "k"), 2.0);
+        let phr = vec(&s, "phr");
+        let phi = vec(&s, "phi");
+        assert!(phr.iter().all(|x| (x + 1.0).abs() < 1e-9), "pole real parts = {phr:?}");
+        assert_eq!(phi.iter().filter(|x| x.abs() > 1e-9).count(), 2, "complex pole pair = {phi:?}");
+
+        // Unpaired complex roots cannot produce a real tf numerator.
+        s.run("try, tf(zpk([-1+2i], [-3], 1)); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("conjugate pairs"), "complex zpk error = {m}");
+        } else {
+            panic!("unpaired complex zero did not error");
+        }
+    }
+
+    #[test]
     fn control_depth() {
         let mut s = Session::new();
         let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };

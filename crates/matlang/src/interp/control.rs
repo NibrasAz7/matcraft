@@ -71,12 +71,28 @@ fn make_ss(a: Matrix, b: Matrix, c: Matrix, d: Matrix, ts: f64) -> Result<Value,
     make_object("ss", vec![("A", Value::Mat(a)), ("B", Value::Mat(b)), ("C", Value::Mat(c)), ("D", Value::Mat(d)), ("Ts", Value::Num(ts))])
 }
 
-fn make_zpk(z: Vec<f64>, p: Vec<f64>, k: f64, variable: &str, ts: f64) -> Result<Value, LangError> {
+fn roots_value(r: &[CNum]) -> Result<Value, LangError> {
+    if r.iter().all(|z| z.im.abs() <= 1e-12) {
+        Ok(mat_or_num(Matrix::col_vector(r.iter().map(|z| z.re).collect())))
+    } else {
+        Ok(cmat_or_value(CMatrix::from_col_major(r.len(), 1, r.to_vec()).map_err(lang)?))
+    }
+}
+
+fn complex_rows(v: &Value, what: &str) -> Result<Vec<CNum>, LangError> {
+    let m = v.to_cmatrix().map_err(|_| LangError::new(format!("{what} must be numeric"), 0))?;
+    if m.rows() > 1 && m.cols() > 1 {
+        return Err(LangError::new(format!("{what} must be a vector"), 0));
+    }
+    Ok(m.data().to_vec())
+}
+
+fn make_zpk(z: Vec<CNum>, p: Vec<CNum>, k: f64, variable: &str, ts: f64) -> Result<Value, LangError> {
     make_object(
         "zpk",
         vec![
-            ("Z", Value::Mat(Matrix::col_vector(z))),
-            ("P", Value::Mat(Matrix::col_vector(p))),
+            ("Z", roots_value(&z)?),
+            ("P", roots_value(&p)?),
             ("K", Value::Num(k)),
             ("Variable", Value::Str(variable.to_string())),
             ("Ts", Value::Num(ts)),
@@ -116,8 +132,8 @@ fn tf_parts(v: &Value) -> Result<(Vec<f64>, Vec<f64>), LangError> {
         }
         Value::Object(o) if o.class_name == "zpk" => {
             let (z, p, k) = zpk_data(o)?;
-            let num: Vec<f64> = poly_from_roots(&z).into_iter().map(|v| v * k).collect();
-            let den = poly_from_roots(&p);
+            let num = real_poly("zero", &z)?.into_iter().map(|v| v * k).collect();
+            let den = real_poly("pole", &p)?;
             Ok((num, den))
         }
         Value::Num(x) => Ok((vec![*x], vec![1.0])),
@@ -134,9 +150,9 @@ fn ss_data(o: &MObject) -> Result<(Matrix, Matrix, Matrix, Matrix), LangError> {
     Ok((a, b, c, d))
 }
 
-fn zpk_data(o: &MObject) -> Result<(Vec<f64>, Vec<f64>, f64), LangError> {
-    let z = o.prop("Z").ok_or_else(|| LangError::new("zpk object has no Z", 0))?.to_matrix()?.data().to_vec();
-    let p = o.prop("P").ok_or_else(|| LangError::new("zpk object has no P", 0))?.to_matrix()?.data().to_vec();
+fn zpk_data(o: &MObject) -> Result<(Vec<CNum>, Vec<CNum>, f64), LangError> {
+    let z = o.prop("Z").ok_or_else(|| LangError::new("zpk object has no Z", 0))?.to_cmatrix()?.data().to_vec();
+    let p = o.prop("P").ok_or_else(|| LangError::new("zpk object has no P", 0))?.to_cmatrix()?.data().to_vec();
     let k = o.prop("K").ok_or_else(|| LangError::new("zpk object has no K", 0))?.scalar()?;
     Ok((z, p, k))
 }
@@ -151,21 +167,29 @@ fn ss_parts(v: &Value) -> Result<(Matrix, Matrix, Matrix, Matrix), LangError> {
     }
 }
 
-fn poly_from_roots(roots: &[f64]) -> Vec<f64> {
-    let mut c = vec![1.0];
+fn poly_from_roots(roots: &[CNum]) -> Vec<CNum> {
+    let mut c = vec![CNum::real(1.0)];
     for &root in roots {
-        let mut next = vec![0.0; c.len().saturating_add(1)];
+        let mut next = vec![CNum::real(0.0); c.len().saturating_add(1)];
         for (i, &a) in c.iter().enumerate() {
             if let Some(slot) = next.get_mut(i) {
-                *slot += a;
+                *slot = *slot + a;
             }
             if let Some(slot) = next.get_mut(i.saturating_add(1)) {
-                *slot -= a * root;
+                *slot = *slot - a * root;
             }
         }
         c = next;
     }
     c
+}
+
+fn real_poly(what: &str, roots: &[CNum]) -> Result<Vec<f64>, LangError> {
+    let c = poly_from_roots(roots);
+    if c.iter().any(|z| z.im.abs() > 1e-9) {
+        return Err(LangError::new(format!("{what}s must occur in complex-conjugate pairs to produce a real transfer function"), 0));
+    }
+    Ok(c.iter().map(|z| z.re).collect())
 }
 
 fn conv(a: &[f64], b: &[f64]) -> Vec<f64> {
@@ -271,14 +295,9 @@ fn ss_to_tf_parts(a: &Matrix, b: &Matrix, c: &Matrix, d: &Matrix) -> Result<(Vec
     Ok((trim_zeros(num), den))
 }
 
-fn tf_to_zpk_parts(num: &[f64], den: &[f64]) -> Result<(Vec<f64>, Vec<f64>, f64), LangError> {
-    let zc = roots(&row(num))?;
-    let pc = roots(&row(den))?;
-    if zc.iter().chain(pc.iter()).any(|z| !z.is_real()) {
-        return Err(LangError::new("zpk conversion of complex zeros/poles is not supported yet", 0));
-    }
-    let z: Vec<f64> = zc.iter().map(|z| z.re).collect();
-    let p: Vec<f64> = pc.iter().map(|z| z.re).collect();
+fn tf_to_zpk_parts(num: &[f64], den: &[f64]) -> Result<(Vec<CNum>, Vec<CNum>, f64), LangError> {
+    let z = roots(&row(num))?;
+    let p = roots(&row(den))?;
     let k = num.first().copied().unwrap_or(0.0) / den.first().copied().unwrap_or(1.0);
     Ok((z, p, k))
 }
@@ -540,8 +559,8 @@ impl Session {
         if argv.len() < 3 {
             return Err(LangError::new("zpk needs zeros, poles and gain", 0));
         }
-        let z = value_rows(&argv[0])?;
-        let p = value_rows(&argv[1])?;
+        let z = complex_rows(&argv[0], "zeros")?;
+        let p = complex_rows(&argv[1], "poles")?;
         let k = scalar_arg(&argv[2], "gain")?;
         Ok(vec![make_zpk(z, p, k, "s", 0.0)?])
     }
@@ -578,9 +597,9 @@ impl Session {
             tf_to_zpk_parts(&num, &den)?
         };
         if nout >= 3 {
-            Ok(vec![Value::Mat(Matrix::col_vector(z)), Value::Mat(Matrix::col_vector(p)), Value::Num(k)])
+            Ok(vec![roots_value(&z)?, roots_value(&p)?, Value::Num(k)])
         } else {
-            Ok(vec![Value::Cell(CellArray::row(vec![Value::Mat(Matrix::col_vector(z)), Value::Mat(Matrix::col_vector(p)), Value::Num(k)]))])
+            Ok(vec![Value::Cell(CellArray::row(vec![roots_value(&z)?, roots_value(&p)?, Value::Num(k)]))])
         }
     }
 
@@ -945,7 +964,7 @@ fn system_poles(v: &Value) -> Result<Vec<CNum>, LangError> {
     match v {
         Value::Object(o) if o.class_name == "zpk" => {
             let (_, p, _) = zpk_data(o)?;
-            Ok(p.iter().map(|&x| CNum::real(x)).collect())
+            Ok(p)
         }
         Value::Object(o) if o.class_name == "ss" => {
             let (a, _, _, _) = ss_data(o)?;
@@ -1048,7 +1067,7 @@ fn pole_value(argv: &[Value]) -> Result<Value, LangError> {
     match v {
         Value::Object(o) if o.class_name == "zpk" => {
             let (_, p, _) = zpk_data(o)?;
-            Ok(real_roots_value(&p))
+            roots_value(&p)
         }
         Value::Object(o) if o.class_name == "ss" => {
             let (a, _, _, _) = ss_data(o)?;
@@ -1068,7 +1087,7 @@ fn zero_value(argv: &[Value]) -> Result<Value, LangError> {
     match v {
         Value::Object(o) if o.class_name == "zpk" => {
             let (z, _, _) = zpk_data(o)?;
-            Ok(real_roots_value(&z))
+            roots_value(&z)
         }
         _ => {
             let (num, _) = tf_parts(v)?;
@@ -1078,21 +1097,24 @@ fn zero_value(argv: &[Value]) -> Result<Value, LangError> {
     }
 }
 
-fn real_roots_value(r: &[f64]) -> Value {
-    mat_or_num(Matrix::col_vector(r.to_vec()))
-}
-
 fn dcgain_value(argv: &[Value]) -> Result<Value, LangError> {
     let v = argv.first().ok_or_else(|| LangError::new("dcgain needs a system", 0))?;
     if let Value::Object(o) = v {
         if o.class_name == "zpk" {
             let (z, p, k) = zpk_data(o)?;
-            if p.contains(&0.0) {
+            if p.iter().any(|x| x.re.abs() < 1e-12 && x.im.abs() < 1e-12) {
                 return Ok(Value::Num(f64::INFINITY));
             }
-            let nz: f64 = z.iter().map(|x| -*x).product::<f64>();
-            let np: f64 = p.iter().map(|x| -*x).product::<f64>();
-            return Ok(Value::Num(k * nz / np));
+            let mut nz = CNum::real(1.0);
+            for &x in &z {
+                nz = nz * (-x);
+            }
+            let mut np = CNum::real(1.0);
+            for &x in &p {
+                np = np * (-x);
+            }
+            let g = nz.div(np) * CNum::real(k);
+            return Ok(cmat_or_value(CMatrix::from_col_major(1, 1, vec![g]).map_err(lang)?));
         }
     }
     let (num, den) = tf_parts(v)?;
