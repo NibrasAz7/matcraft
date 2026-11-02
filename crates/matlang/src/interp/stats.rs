@@ -512,6 +512,7 @@ impl Session {
             "signrank" | "ranksum" | "kruskalwallis" => self.rank_test_call(name, &argv, nout),
             "ttest" => self.ttest_call(&argv, nout),
             "ttest2" => self.ttest2_call(&argv, nout),
+            "chi2gof" => self.chi2gof_call(&argv, nout),
             "kstest" => self.kstest_call(&argv, nout),
             "adtest" => self.adtest_call(&argv, nout),
             "pca" => self.pca_call(&argv, nout),
@@ -725,8 +726,209 @@ impl Session {
                 }
                 Ok(vec![make_dist("prob.LognormalDistribution", "Lognormal", &[("mu", lmu), ("sigma", lsigma)])?])
             }
+            "tlocationscale" | "tls" => {
+                if x.len() < 3 {
+                    return Err(LangError::new("fitdist: tLocationScale needs at least three observations", 0));
+                }
+                let (mu, sigma, nu) = tls_fit(&x)?;
+                Ok(vec![make_dist("prob.tLocationScaleDistribution", "tLocationScale", &[("mu", mu), ("sigma", sigma), ("nu", nu)])?])
+            }
+            "kernel" | "kde" => {
+                if x.len() < 2 {
+                    return Err(LangError::new("fitdist: Kernel needs at least two observations", 0));
+                }
+                let bandwidth = kernel_bandwidth(&x);
+                if bandwidth.is_nan() || bandwidth <= 0.0 || !bandwidth.is_finite() {
+                    return Err(LangError::new("fitdist: Kernel bandwidth is degenerate", 0));
+                }
+                Ok(vec![make_kernel_dist(&x, bandwidth)?])
+            }
             other => Err(LangError::new(format!("fitdist: unsupported distribution '{other}'"), 0)),
         }
+    }
+
+    /// `[h,p,stats] = chi2gof(x, ...)` - Pearson chi-square goodness-of-fit.
+    /// The default null model is normal with mean/variance estimated from the
+    /// data; `'CDF'` supplies a user CDF and `'NParams'` the number of fitted
+    /// parameters. Bins default to equal-probability normal bins and are
+    /// merged until every expected count reaches `'EMin'`.
+    fn chi2gof_call(&mut self, argv: &[Value], nout: usize) -> Result<Vec<Value>, LangError> {
+        let xm = argv.first().ok_or_else(|| LangError::new("chi2gof needs data", 0))?.to_numeric()?;
+        let mut x: Vec<f64> = xm.data().iter().copied().filter(|v| v.is_finite()).collect();
+        if x.len() < 2 {
+            return Err(LangError::new("chi2gof needs at least two finite observations", 0));
+        }
+        x.sort_by(f64::total_cmp);
+        let n = x.len() as f64;
+        let mut nbins = 10usize;
+        let mut alpha = 0.05f64;
+        let mut emin = 5.0f64;
+        let mut nparams: Option<usize> = None;
+        let mut cdf_target: Option<Value> = None;
+        let mut user_edges: Option<Vec<f64>> = None;
+        let mut i = 1usize;
+        while i < argv.len() {
+            let key = match &argv[i] {
+                Value::Str(s) => s.to_ascii_lowercase(),
+                _ => return Err(LangError::new("chi2gof options must be name/value pairs", 0)),
+            };
+            let value = argv.get(i + 1).ok_or_else(|| LangError::new(format!("chi2gof: missing value for '{key}'"), 0))?;
+            match key.as_str() {
+                "nbin" | "nbins" => {
+                    let v = value.scalar()?.round();
+                    if !v.is_finite() || v < 2.0 || v > 1000.0 {
+                        return Err(LangError::new("chi2gof: NBins must be between 2 and 1000", 0));
+                    }
+                    nbins = v as usize;
+                }
+                "alpha" => {
+                    let v = value.scalar()?;
+                    if !(0.0..1.0).contains(&v) || v.is_nan() {
+                        return Err(LangError::new("chi2gof: Alpha must lie in (0,1)", 0));
+                    }
+                    alpha = v;
+                }
+                "emin" => {
+                    let v = value.scalar()?;
+                    if !v.is_finite() || v < 0.0 {
+                        return Err(LangError::new("chi2gof: EMin must be nonnegative", 0));
+                    }
+                    emin = v;
+                }
+                "nparams" => {
+                    let v = value.scalar()?.round();
+                    if !v.is_finite() || v < 0.0 || v > 100.0 {
+                        return Err(LangError::new("chi2gof: NParams must be a small nonnegative integer", 0));
+                    }
+                    nparams = Some(v as usize);
+                }
+                "cdf" => cdf_target = Some(value.clone()),
+                "edges" => {
+                    let m = value.to_numeric()?;
+                    if m.numel() < 2 {
+                        return Err(LangError::new("chi2gof: Edges needs at least two values", 0));
+                    }
+                    let e = m.data().to_vec();
+                    if e.windows(2).any(|w| w.get(1).copied().unwrap_or(0.0) <= w.first().copied().unwrap_or(0.0)) {
+                        return Err(LangError::new("chi2gof: Edges must be strictly increasing", 0));
+                    }
+                    user_edges = Some(e);
+                }
+                other => return Err(LangError::new(format!("chi2gof: unknown option '{other}'"), 0)),
+            }
+            i += 2;
+        }
+        let default_normal = cdf_target.is_none() && user_edges.is_none();
+        let (mu, sigma) = if default_normal {
+            let mean = x.iter().sum::<f64>() / n;
+            let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+            let sd = var.sqrt();
+            if sd.is_nan() || sd <= 0.0 {
+                return Err(LangError::new("chi2gof: data has zero variance", 0));
+            }
+            (mean, sd)
+        } else {
+            (0.0, 1.0)
+        };
+        let cdf_values = |s: &mut Session, vals: &[f64]| -> Result<Vec<f64>, LangError> {
+            if let Some(target) = &cdf_target {
+                let out = s.call_feval_target(target, vec![Value::Mat(Matrix::col_vector(vals.to_vec()))], 1)?;
+                let m = out.first().ok_or_else(|| LangError::new("chi2gof: CDF returned no value", 0))?.to_numeric()?;
+                if m.numel() != vals.len() {
+                    return Err(LangError::new("chi2gof: CDF must return one value per input", 0));
+                }
+                Ok(m.data().to_vec())
+            } else {
+                Ok(vals.iter().map(|v| stats::norm_cdf(*v, mu, sigma)).collect())
+            }
+        };
+        let edges = match user_edges {
+            Some(e) => e,
+            None if default_normal => {
+                let mut e = Vec::with_capacity(nbins + 1);
+                for k in 0..=nbins {
+                    let p = k as f64 / nbins as f64;
+                    e.push(mu + sigma * stats::norm_inv(p, 0.0, 1.0));
+                }
+                e
+            }
+            None => {
+                let lo = x.first().copied().unwrap_or(0.0);
+                let hi = x.last().copied().unwrap_or(1.0);
+                (0..=nbins).map(|k| lo + (hi - lo) * k as f64 / nbins as f64).collect()
+            }
+        };
+        let bins = edges.len().saturating_sub(1);
+        let mut observed = vec![0usize; bins];
+        for &v in &x {
+            let mut idx = edges.partition_point(|e| *e <= v).saturating_sub(1);
+            if idx >= bins {
+                idx = bins.saturating_sub(1);
+            }
+            if let Some(slot) = observed.get_mut(idx) {
+                *slot += 1;
+            }
+        }
+        let cdf_edges = cdf_values(self, &edges)?;
+        let mut expected = Vec::with_capacity(bins);
+        for k in 0..bins {
+            let lo = cdf_edges.get(k).copied().unwrap_or(0.0);
+            let hi = cdf_edges.get(k + 1).copied().unwrap_or(1.0);
+            expected.push(((hi - lo).max(0.0) * n).max(1e-12));
+        }
+        // Merge adjacent bins until the expected count reaches EMin.
+        let mut merged_edges = vec![edges.first().copied().unwrap_or(0.0)];
+        let mut o_merged: Vec<f64> = Vec::new();
+        let mut e_merged: Vec<f64> = Vec::new();
+        let mut o_acc = 0.0f64;
+        let mut e_acc = 0.0f64;
+        for k in 0..bins {
+            o_acc += observed.get(k).copied().unwrap_or(0) as f64;
+            e_acc += expected.get(k).copied().unwrap_or(0.0);
+            let last = k + 1 == bins;
+            if e_acc >= emin || last {
+                if last && e_acc < emin && !e_merged.is_empty() {
+                    if let Some(slot) = o_merged.last_mut() {
+                        *slot += o_acc;
+                    }
+                    if let Some(slot) = e_merged.last_mut() {
+                        *slot += e_acc;
+                    }
+                    if let Some(slot) = merged_edges.last_mut() {
+                        *slot = edges.get(k + 1).copied().unwrap_or(*slot);
+                    }
+                } else {
+                    o_merged.push(o_acc);
+                    e_merged.push(e_acc.max(1e-12));
+                    merged_edges.push(edges.get(k + 1).copied().unwrap_or(0.0));
+                }
+                o_acc = 0.0;
+                e_acc = 0.0;
+            }
+        }
+        let used = o_merged.len();
+        let params = nparams.unwrap_or(if default_normal { 2 } else { 0 });
+        if used < 2 || used <= params + 1 {
+            return Err(LangError::new("chi2gof: too few bins after merging for the estimated parameters", 0));
+        }
+        let chi2stat: f64 = o_merged
+            .iter()
+            .zip(e_merged.iter())
+            .map(|(o, e)| {
+                let d = o - e;
+                d * d / e.max(1e-12)
+            })
+            .sum();
+        let df = (used - 1 - params) as f64;
+        let p = (1.0 - stats::chi2_cdf(chi2stat, df)).clamp(0.0, 1.0);
+        let h = if p < alpha { 1.0 } else { 0.0 };
+        let mut st = StructArray::new();
+        st.set_field(0, "chi2stat", Value::Num(chi2stat))?;
+        st.set_field(0, "df", Value::Num(df))?;
+        st.set_field(0, "edges", Value::Mat(Matrix::row_vector(merged_edges)))?;
+        st.set_field(0, "O", Value::Mat(Matrix::row_vector(o_merged)))?;
+        st.set_field(0, "E", Value::Mat(Matrix::row_vector(e_merged)))?;
+        Ok(truncate_outputs(vec![Value::Num(h), Value::Num(p), Value::Struct(st)], nout))
     }
 
     fn prob_call(&mut self, name: &str, argv: &[Value]) -> Result<Vec<Value>, LangError> {
@@ -1637,6 +1839,8 @@ enum ProbParams {
     Poisson { lambda: f64 },
     Weibull { a: f64, b: f64 },
     Lognormal { mu: f64, sigma: f64 },
+    TLocationScale { mu: f64, sigma: f64, nu: f64 },
+    Kernel { data: Vec<f64>, bandwidth: f64 },
 }
 
 impl ProbParams {
@@ -1676,6 +1880,21 @@ impl ProbParams {
                 }
                 Ok(ProbParams::Lognormal { mu, sigma })
             }
+            "prob.tLocationScaleDistribution" => {
+                let (mu, sigma, nu) = (num("mu")?, num("sigma")?, num("nu")?);
+                if sigma.is_nan() || sigma <= 0.0 || nu.is_nan() || nu <= 0.0 {
+                    return Err(LangError::new("tLocationScale sigma and nu must be positive", 0));
+                }
+                Ok(ProbParams::TLocationScale { mu, sigma, nu })
+            }
+            "prob.KernelDistribution" => {
+                let bandwidth = num("Bandwidth")?;
+                let data = o.prop("Sample").ok_or_else(|| LangError::new("Kernel distribution has no Sample", 0))?.to_numeric()?.data().to_vec();
+                if bandwidth.is_nan() || bandwidth <= 0.0 || data.is_empty() {
+                    return Err(LangError::new("Kernel distribution has invalid bandwidth or sample", 0));
+                }
+                Ok(ProbParams::Kernel { data, bandwidth })
+            }
             other => Err(LangError::new(format!("unsupported distribution class '{other}'"), 0)),
         }
     }
@@ -1689,6 +1908,11 @@ impl ProbParams {
             ProbParams::Poisson { lambda } => stats::poisson_pdf(x, lambda),
             ProbParams::Weibull { a, b } => stats::weibull_pdf(x, a, b),
             ProbParams::Lognormal { mu, sigma } => stats::logn_pdf(x, mu, sigma),
+            ProbParams::TLocationScale { mu, sigma, nu } => stats::tls_pdf(x, mu, sigma, nu),
+            ProbParams::Kernel { ref data, bandwidth } => {
+                let h = bandwidth.max(1e-12);
+                data.iter().map(|v| stats::norm_pdf((x - v) / h, 0.0, 1.0)).sum::<f64>() / (data.len() as f64 * h)
+            }
         }
     }
 
@@ -1701,6 +1925,11 @@ impl ProbParams {
             ProbParams::Poisson { lambda } => stats::poisson_cdf(x, lambda),
             ProbParams::Weibull { a, b } => stats::weibull_cdf(x, a, b),
             ProbParams::Lognormal { mu, sigma } => stats::logn_cdf(x, mu, sigma),
+            ProbParams::TLocationScale { mu, sigma, nu } => stats::tls_cdf(x, mu, sigma, nu),
+            ProbParams::Kernel { ref data, bandwidth } => {
+                let h = bandwidth.max(1e-12);
+                data.iter().map(|v| stats::norm_cdf((x - v) / h, 0.0, 1.0)).sum::<f64>() / data.len() as f64
+            }
         }
     }
 
@@ -1713,6 +1942,8 @@ impl ProbParams {
             ProbParams::Poisson { lambda } => stats::poisson_inv(p, lambda),
             ProbParams::Weibull { a, b } => stats::weibull_inv(p, a, b),
             ProbParams::Lognormal { mu, sigma } => stats::logn_inv(p, mu, sigma),
+            ProbParams::TLocationScale { mu, sigma, nu } => stats::tls_inv(p, mu, sigma, nu),
+            ProbParams::Kernel { ref data, bandwidth } => kernel_inv(data, bandwidth, p),
         }
     }
 
@@ -1725,6 +1956,14 @@ impl ProbParams {
             ProbParams::Poisson { lambda } => lambda,
             ProbParams::Weibull { a, b } => b * stats::gammaln(1.0 + 1.0 / a).exp(),
             ProbParams::Lognormal { mu, sigma } => (mu + 0.5 * sigma * sigma).exp(),
+            ProbParams::TLocationScale { mu, sigma: _, nu } => {
+                if nu > 1.0 {
+                    mu
+                } else {
+                    f64::NAN
+                }
+            }
+            ProbParams::Kernel { ref data, .. } => data.iter().sum::<f64>() / data.len().max(1) as f64,
         }
     }
 
@@ -1741,6 +1980,20 @@ impl ProbParams {
                 b * b * (g2 - g1 * g1)
             }
             ProbParams::Lognormal { mu, sigma } => ((sigma * sigma).exp() - 1.0) * (2.0 * mu + sigma * sigma).exp(),
+            ProbParams::TLocationScale { sigma, nu, .. } => {
+                if nu > 2.0 {
+                    sigma * sigma * nu / (nu - 2.0)
+                } else if nu > 1.0 {
+                    f64::INFINITY
+                } else {
+                    f64::NAN
+                }
+            }
+            ProbParams::Kernel { ref data, bandwidth } => {
+                let mean = data.iter().sum::<f64>() / data.len().max(1) as f64;
+                let var = data.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / data.len().max(1) as f64;
+                var + bandwidth * bandwidth
+            }
         }
     }
 
@@ -1761,6 +2014,14 @@ impl ProbParams {
             ProbParams::Poisson { lambda } => poisson_sample(s, lambda),
             ProbParams::Weibull { a, b } => stats::weibull_inv(s.next_f64().clamp(1e-12, 1.0 - 1e-12), a, b),
             ProbParams::Lognormal { mu, sigma } => (mu + sigma * normal_sample(s)).exp(),
+            ProbParams::TLocationScale { mu, sigma, nu } => {
+                let chi2 = gamma_sample(s, 0.5 * nu, 2.0);
+                mu + sigma * normal_sample(s) / (chi2 / nu).max(1e-12).sqrt()
+            }
+            ProbParams::Kernel { ref data, bandwidth } => {
+                let pick = ((s.next_f64() * data.len() as f64) as usize).min(data.len().saturating_sub(1));
+                data.get(pick).copied().unwrap_or(0.0) + bandwidth * normal_sample(s)
+            }
         }
     }
 }
@@ -1788,6 +2049,175 @@ fn gamma_sample(s: &mut Session, a: f64, b: f64) -> f64 {
         }
     }
     a * b
+}
+
+#[allow(clippy::needless_range_loop)]
+fn nelder_mead<F: Fn(&[f64; 3]) -> f64>(start: [f64; 3], step: [f64; 3], f: F) -> [f64; 3] {
+    let mut simplex: Vec<([f64; 3], f64)> = Vec::with_capacity(4);
+    simplex.push((start, f(&start)));
+    for i in 0..3 {
+        let mut p = start;
+        p[i] += step[i];
+        simplex.push((p, f(&p)));
+    }
+    for _ in 0..500 {
+        simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let spread = simplex.iter().map(|(p, _)| *p).fold([0.0f64; 3], |mut acc, p| {
+            for i in 0..3 {
+                acc[i] = acc[i].max((p[i] - simplex[0].0[i]).abs());
+            }
+            acc
+        });
+        if simplex[3].1 - simplex[0].1 < 1e-12 && spread.iter().all(|v| *v < 1e-8) {
+            break;
+        }
+        let mut centroid = [0.0f64; 3];
+        for (p, _) in simplex.iter().take(3) {
+            for i in 0..3 {
+                centroid[i] += p[i] / 3.0;
+            }
+        }
+        let worst = simplex[3].0;
+        let reflect: [f64; 3] = std::array::from_fn(|i| centroid[i] + (centroid[i] - worst[i]));
+        let fr = f(&reflect);
+        if fr < simplex[0].1 {
+            let expand: [f64; 3] = std::array::from_fn(|i| centroid[i] + 2.0 * (centroid[i] - worst[i]));
+            let fe = f(&expand);
+            simplex[3] = if fe < fr { (expand, fe) } else { (reflect, fr) };
+        } else if fr < simplex[2].1 {
+            simplex[3] = (reflect, fr);
+        } else {
+            let outside = fr < simplex[3].1;
+            let contract: [f64; 3] = if outside {
+                std::array::from_fn(|i| centroid[i] + 0.5 * (reflect[i] - centroid[i]))
+            } else {
+                std::array::from_fn(|i| centroid[i] + 0.5 * (worst[i] - centroid[i]))
+            };
+            let fc = f(&contract);
+            if fc < simplex[3].1.min(fr) {
+                simplex[3] = (contract, fc);
+            } else {
+                for k in 1..4 {
+                    let mut p = simplex[k].0;
+                    for i in 0..3 {
+                        p[i] = simplex[0].0[i] + 0.5 * (p[i] - simplex[0].0[i]);
+                    }
+                    simplex[k] = (p, f(&p));
+                }
+            }
+        }
+    }
+    simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+    simplex[0].0
+}
+
+fn tls_fit(x: &[f64]) -> Result<(f64, f64, f64), LangError> {
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+    let sigma0 = var.sqrt().max(1e-3);
+    let nll = |p: &[f64; 3]| -> f64 {
+        if !p[1].is_finite() || !p[2].is_finite() || p[1] < -15.0 || p[1] > 15.0 || p[2] < -8.0 || p[2] > 8.0 {
+            return 1e300;
+        }
+        let mu = p[0];
+        let sigma = p[1].exp();
+        let nu = p[2].exp();
+        if !sigma.is_finite() || sigma <= 0.0 || !nu.is_finite() || nu <= 0.0 {
+            return 1e300;
+        }
+        let mut tail = 0.0f64;
+        for &v in x {
+            let z = (v - mu) / sigma;
+            tail += (1.0 + z * z / nu).ln();
+        }
+        let value = n * (sigma.ln() + 0.5 * (nu * std::f64::consts::PI).ln() + stats::gammaln(0.5 * nu) - stats::gammaln(0.5 * (nu + 1.0)))
+            + 0.5 * (nu + 1.0) * tail;
+        if value.is_finite() {
+            value
+        } else {
+            1e300
+        }
+    };
+    let start = [mean, sigma0.ln(), 5.0f64.ln()];
+    let step = [sigma0.max(1e-3), 0.5, 0.5];
+    let best = nelder_mead(start, step, nll);
+    let sigma = best[1].exp();
+    let nu = best[2].exp();
+    if !best[0].is_finite() || !sigma.is_finite() || sigma <= 0.0 || !nu.is_finite() || nu <= 0.0 {
+        return Err(LangError::new("fitdist: tLocationScale fit failed", 0));
+    }
+    Ok((best[0], sigma, nu))
+}
+
+fn kernel_bandwidth(x: &[f64]) -> f64 {
+    let n = x.len().max(1) as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+    let sd = var.sqrt();
+    let mut sorted = x.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let iqr = quantile_sorted(&sorted, 0.75) - quantile_sorted(&sorted, 0.25);
+    let mut scale = sd.min(iqr / 1.34);
+    if !scale.is_finite() || scale <= 0.0 {
+        scale = sd;
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return f64::NAN;
+    }
+    1.06 * scale * n.powf(-0.2)
+}
+
+fn kernel_cdf(data: &[f64], bandwidth: f64, x: f64) -> f64 {
+    let h = bandwidth.max(1e-12);
+    data.iter().map(|v| stats::norm_cdf((x - v) / h, 0.0, 1.0)).sum::<f64>() / data.len().max(1) as f64
+}
+
+fn kernel_inv(data: &[f64], bandwidth: f64, p: f64) -> f64 {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) || data.is_empty() {
+        return f64::NAN;
+    }
+    if p == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p == 1.0 {
+        return f64::INFINITY;
+    }
+    let h = bandwidth.max(1e-12);
+    let lo_data = data.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi_data = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut lo = lo_data - 20.0 * h;
+    let mut hi = hi_data + 20.0 * h;
+    for _ in 0..40 {
+        if kernel_cdf(data, h, lo) <= p {
+            break;
+        }
+        lo -= 20.0 * h;
+    }
+    for _ in 0..40 {
+        if kernel_cdf(data, h, hi) >= p {
+            break;
+        }
+        hi += 20.0 * h;
+    }
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if kernel_cdf(data, h, mid) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn make_kernel_dist(data: &[f64], bandwidth: f64) -> Result<Value, LangError> {
+    let mut s = StructArray::new();
+    s.set_field(0, "DistributionName", Value::Str("Kernel".into()))?;
+    s.set_field(0, "Kernel", Value::Str("normal".into()))?;
+    s.set_field(0, "Bandwidth", Value::Num(bandwidth))?;
+    s.set_field(0, "Sample", Value::Mat(Matrix::col_vector(data.to_vec())))?;
+    Ok(Value::Object(MObject::owned("prob.KernelDistribution".into(), s)))
 }
 
 fn weibull_fit(x: &[f64]) -> Result<(f64, f64), LangError> {

@@ -350,6 +350,10 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- Statistics-depth wave (2026-11): `tLocationScale` MLE via bounded
+  Nelder-Mead, Gaussian-kernel `fitdist` with Silverman bandwidth,
+  `chi2gof` with expected-count merging, and a seeded t-SNE embedding
+  with a KL loss output.
 - Weibull/lognormal wave (2026-11): `wblpdf`/`wblcdf`/`wblinv`/
   `wblrnd` and `lognpdf`/`logncdf`/`logninv`/`lognrnd`, plus MLE
   `fitdist` objects with moment reducers. Reference values are checked

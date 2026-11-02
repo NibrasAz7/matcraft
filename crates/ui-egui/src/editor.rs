@@ -559,6 +559,8 @@ const SIGNATURES: &[(&str, &str, &str)] = &[
     ("wblpdf", "wblpdf(X, A, B)", "Weibull probability density."),
     ("lognpdf", "lognpdf(X, Mu, Sigma)", "Lognormal probability density."),
     ("fitdist", "fitdist(X, DistName)", "Fit a probability distribution to data."),
+    ("chi2gof", "chi2gof(X, Name, Value, ...)", "Chi-square goodness-of-fit test."),
+    ("tsne", "tsne(X, Name, Value, ...)", "t-SNE embedding of observations."),
     ("pid", "pid(Kp, Ki, Kd, Tf)", "Create a PID controller transfer function."),
     ("pidtune", "pidtune(Sys, Type, Wc)", "Tune a P/PI/PD/PID/PIDF controller for a SISO plant."),
     ("fsolve", "fsolve(Fun, X0, Options)", "Solve a system of nonlinear equations."),

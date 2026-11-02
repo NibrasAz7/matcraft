@@ -29,6 +29,7 @@ mod netcdf;
 mod ode;
 mod optim;
 mod stats;
+mod tsne;
 mod umap;
 mod xlsx;
 
@@ -6877,9 +6878,9 @@ impl Session {
             "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
             | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
             | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
-            | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf" | "chi2cdf"
-            | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random" | "cmdscale"
-            | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
+            | "kstest" | "adtest" | "chi2gof" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf"
+            | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random"
+            | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
                 let v = self.eval_args(args)?;
                 let out = self.stats_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -6911,6 +6912,11 @@ impl Session {
             "umap" => {
                 let v = self.eval_args(args)?;
                 let out = self.umap_call(&v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "tsne" => {
+                let v = self.eval_args(args)?;
+                let out = self.tsne_call(&v, 1)?;
                 Ok(out.into_iter().next())
             }
             "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
@@ -10820,9 +10826,9 @@ impl Session {
             "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
             | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
             | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
-            | "kstest" | "adtest" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf" | "chi2cdf"
-            | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random" | "cmdscale"
-            | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
+            | "kstest" | "adtest" | "chi2gof" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf"
+            | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random"
+            | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
                 let v = self.eval_args(args)?;
                 self.stats_builtin(name, v, nout)?
             }
@@ -10849,6 +10855,10 @@ impl Session {
             "umap" => {
                 let v = self.eval_args(args)?;
                 self.umap_call(&v, nout)?
+            }
+            "tsne" => {
+                let v = self.eval_args(args)?;
+                self.tsne_call(&v, nout)?
             }
             "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
                 let v = self.eval_args(args)?;
@@ -16825,6 +16835,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "ttest2",
     "kstest",
     "adtest",
+    "chi2gof",
     "pca",
     "gampdf",
     "gamcdf",
@@ -16857,6 +16868,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "ranksum",
     "kruskalwallis",
     "umap",
+    "tsne",
     "ode45",
     "ode15s",
     "ode23",
@@ -23189,6 +23201,133 @@ end",
         assert!(scalar(&s, "wmin") > 0.0);
         assert_eq!(s.get("lsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
         assert!(scalar(&s, "lmin") > 0.0);
+    }
+
+    #[test]
+    fn statistics_tlocation_scale() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run(
+            "rng(11); u = rand(1, 5000); xt = 2 + 3*tinv(u, 7); td = fitdist(xt, 'tLocationScale'); \
+             tmu = td.mu; tsig = td.sigma; tnu = td.nu; tname = td.DistributionName; \
+             tpdf = pdf(td, 3); tcdf = cdf(td, 3); ticdf = icdf(td, 0.9); \
+             tm = mean(td); tv = var(td); tmed = median(td); rng(3); tr = random(td, 2, 3); tsz = size(tr);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "tmu") - 1.9415).abs() < 0.3, "tLocationScale mu = {}", scalar(&s, "tmu"));
+        assert!((scalar(&s, "tsig") - 3.0676).abs() < 0.4, "tLocationScale sigma = {}", scalar(&s, "tsig"));
+        assert!((scalar(&s, "tnu") - 8.2802).abs() < 3.0, "tLocationScale nu = {}", scalar(&s, "tnu"));
+        assert_eq!(s.get("tname"), Some(&Value::Str("tLocationScale".into())));
+        let z = (3.0 - scalar(&s, "tmu")) / scalar(&s, "tsig");
+        let nu = scalar(&s, "tnu");
+        let expected_pdf = matcore::stats::t_pdf(z, nu) / scalar(&s, "tsig");
+        assert!((scalar(&s, "tpdf") - expected_pdf).abs() < 1e-9);
+        assert!((scalar(&s, "tcdf") - matcore::stats::t_cdf(z, nu)).abs() < 1e-9);
+        let expected_inv = scalar(&s, "tmu") + scalar(&s, "tsig") * matcore::stats::t_inv(0.9, nu);
+        assert!((scalar(&s, "ticdf") - expected_inv).abs() < 1e-7);
+        assert!((scalar(&s, "tm") - scalar(&s, "tmu")).abs() < 1e-6);
+        assert!((scalar(&s, "tv") - scalar(&s, "tsig") * scalar(&s, "tsig") * nu / (nu - 2.0)).abs() < 1e-6);
+        assert!((scalar(&s, "tmed") - scalar(&s, "tmu")).abs() < 1e-6);
+        assert_eq!(s.get("tsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+
+        s.run("try, fitdist([1 2], 'tLocationScale'); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("three observations"), "tLocationScale error = {m}");
+        } else {
+            panic!("short tLocationScale fit did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_chi2gof() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Exactly ten observations per bin: zero statistic, nine degrees of freedom.
+        s.run(
+            "x = linspace(0.01, 0.99, 100); [h, p, st] = chi2gof(x, 'CDF', @(z) unifcdf(z,0,1), 'Edges', 0:0.1:1, 'NParams', 0); \
+             stat = st.chi2stat; df = st.df; nb = numel(st.O); e1 = st.E(1);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "h"), 0.0);
+        assert!((scalar(&s, "p") - 1.0).abs() < 1e-9);
+        assert!(scalar(&s, "stat").abs() < 1e-9);
+        assert_eq!(scalar(&s, "df"), 9.0);
+        assert_eq!(scalar(&s, "nb"), 10.0);
+        assert!((scalar(&s, "e1") - 10.0).abs() < 1e-9);
+
+        // Default normal null with estimated parameters.
+        s.run("y = norminv(linspace(0.005, 0.995, 200), 0, 1); [h2, p2, s2] = chi2gof(y); df2 = s2.df; stat2 = s2.chi2stat;").unwrap();
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert!(scalar(&s, "p2") > 0.05);
+        assert_eq!(scalar(&s, "df2"), 7.0);
+        assert!(scalar(&s, "stat2") < 1.0, "normal chi2stat = {}", scalar(&s, "stat2"));
+
+        s.run("try, chi2gof(y, 'bogus', 1); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unknown option"), "chi2gof error = {m}");
+        } else {
+            panic!("unknown chi2gof option did not error");
+        }
+        s.run("try, chi2gof([1 2 3], 'Alpha', 2); catch e, amsg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("Alpha"), "chi2gof Alpha error = {m}");
+        } else {
+            panic!("invalid chi2gof Alpha did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_tsne_embedding() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "rng(1); X = [randn(20,2)*0.3; randn(20,2)*0.3+5]; \
+             [Y, L] = tsne(X, 'Perplexity', 10, 'NumIterations', 300); \
+             a = mean(Y(1:20,:)); b = mean(Y(21:40,:)); sep = sqrt(sum((a-b).^2)); \
+             bad = sum(sum(isnan(Y))); rng(1); X = [randn(20,2)*0.3; randn(20,2)*0.3+5]; Y2 = tsne(X, 'Perplexity', 10, 'NumIterations', 300); same = isequal(Y, Y2); \
+             Z = tsne(X, 'NumDimensions', 3, 'NumIterations', 80, 'NumPCAComponents', 1); zsz = size(Z);",
+        )
+        .unwrap();
+        assert_eq!(s.get("Y").map(|v| v.dims()), Some((40, 2)));
+        assert_eq!(s.get("zsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![40.0, 3.0]));
+        assert!(scalar(&s, "sep") > 10.0, "cluster separation = {}", scalar(&s, "sep"));
+        assert_eq!(scalar(&s, "bad"), 0.0);
+        assert_eq!(s.get("same"), Some(&Value::Num(1.0)));
+        assert!(scalar(&s, "L") == scalar(&s, "L"), "loss is NaN");
+
+        s.run("try, tsne(X, 'Distance', 'cosine'); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unsupported distance"), "tsne error = {m}");
+        } else {
+            panic!("unsupported tsne distance did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_kernel_fit() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "kd = fitdist([1 2 3 4 5], 'Kernel'); kb = kd.Bandwidth; kname = kd.DistributionName; kn = kd.Kernel; \
+             kp = pdf(kd, 3); kc = cdf(kd, 3); kq = icdf(kd, 0.5); km = mean(kd); kv = var(kd); kmed = median(kd); \
+             rng(5); kr = random(kd, 2, 2); ksz = size(kr); kbad = sum(sum(isnan(kr)));",
+        )
+        .unwrap();
+        let bw = scalar(&s, "kb");
+        assert!(bw > 0.0);
+        assert_eq!(s.get("kname"), Some(&Value::Str("Kernel".into())));
+        assert_eq!(s.get("kn"), Some(&Value::Str("normal".into())));
+        let expected_pdf: f64 = (1..=5).map(|x| matcore::stats::norm_pdf((3.0 - x as f64) / bw, 0.0, 1.0)).sum::<f64>() / (5.0 * bw);
+        assert!((scalar(&s, "kp") - expected_pdf).abs() < 1e-12);
+        assert!((scalar(&s, "kc") - 0.5).abs() < 1e-7);
+        assert!((scalar(&s, "kq") - 3.0).abs() < 1e-9);
+        assert!((scalar(&s, "km") - 3.0).abs() < 1e-12);
+        assert!((scalar(&s, "kv") - (2.0 + bw * bw)).abs() < 1e-9);
+        assert!((scalar(&s, "kmed") - 3.0).abs() < 1e-9);
+        assert_eq!(s.get("ksz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
+        assert_eq!(scalar(&s, "kbad"), 0.0);
     }
 
     #[test]

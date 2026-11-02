@@ -252,6 +252,29 @@ pub fn exp_inv(p: f64, mu: f64) -> f64 {
     }
 }
 
+pub fn tls_pdf(x: f64, mu: f64, sigma: f64, nu: f64) -> f64 {
+    if mu.is_nan() || sigma.is_nan() || sigma <= 0.0 || nu.is_nan() || nu <= 0.0 {
+        return f64::NAN;
+    }
+    let z = (x - mu) / sigma;
+    let log_pdf = gammaln(0.5 * (nu + 1.0)) - gammaln(0.5 * nu) - 0.5 * (nu * PI).ln() - sigma.ln() - 0.5 * (nu + 1.0) * (1.0 + z * z / nu).ln();
+    log_pdf.exp()
+}
+
+pub fn tls_cdf(x: f64, mu: f64, sigma: f64, nu: f64) -> f64 {
+    if sigma.is_nan() || sigma <= 0.0 || nu.is_nan() || nu <= 0.0 {
+        return f64::NAN;
+    }
+    t_cdf((x - mu) / sigma, nu)
+}
+
+pub fn tls_inv(p: f64, mu: f64, sigma: f64, nu: f64) -> f64 {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) || sigma.is_nan() || sigma <= 0.0 || nu.is_nan() || nu <= 0.0 {
+        return f64::NAN;
+    }
+    mu + sigma * t_inv(p, nu)
+}
+
 pub fn weibull_pdf(x: f64, a: f64, b: f64) -> f64 {
     if a.is_nan() || a <= 0.0 || b.is_nan() || b <= 0.0 || x < 0.0 {
         return 0.0;
@@ -761,6 +784,10 @@ mod tests {
         assert!((logn_inv(0.5, 0.0, 1.0) - 1.0).abs() < 1e-12);
         assert_eq!(weibull_pdf(-1.0, 2.0, 3.0), 0.0);
         assert_eq!(logn_pdf(0.0, 0.0, 1.0), 0.0);
+        assert!((tls_pdf(1.0, 0.0, 1.0, 5.0) - 0.219_679_797_350_980_53).abs() < 1e-12);
+        assert!((tls_cdf(1.0, 0.0, 1.0, 5.0) - 0.818_391_266_175_438_8).abs() < 1e-9);
+        assert!((tls_inv(0.9, 0.0, 1.0, 5.0) - 1.475_884_048_855_821_6).abs() < 1e-9);
+        assert!((tls_pdf(3.0, 2.0, 3.0, 7.0) - 0.120_495_861_973_248_4).abs() < 1e-12);
     }
 
     #[test]
