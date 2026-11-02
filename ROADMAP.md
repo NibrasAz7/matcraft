@@ -350,6 +350,10 @@
 - Complex-zpk wave (2026-11): `zpk` accepts complex zeros/poles, `zpk(tf)`
   keeps conjugate pairs, `zpkdata`/`pole`/`zero` report complex values, and
   `tf(zpk)` reconstructs real polynomials when pairs are conjugate.
+- DDE wave (2026-11): `dde23` integrates constant-lag delay equations
+  with constant-vector or functional history, Hermite interpolation of
+  delayed states, adaptive Bogacki-Shampine stepping and solution-struct
+  or `[t,y]` outputs.
 - MIMO-margin wave (2026-11): `nyquist` returns `p x m x N` real/imag
   arrays for state-space systems, and `margin` evaluates every loop and
   reports the worst gain and phase margins with square-plant validation.

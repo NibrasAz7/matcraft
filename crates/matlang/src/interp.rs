@@ -6913,7 +6913,7 @@ impl Session {
                 let out = self.umap_call(&v, 1)?;
                 Ok(out.into_iter().next())
             }
-            "ode45" | "ode15s" | "ode23" | "ode23s" | "odeset" | "odeget" | "deval" => {
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
                 let v = self.eval_args(args)?;
                 let out = self.ode_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -10850,7 +10850,7 @@ impl Session {
                 let v = self.eval_args(args)?;
                 self.umap_call(&v, nout)?
             }
-            "ode45" | "ode15s" | "ode23" | "ode23s" | "odeset" | "odeget" | "deval" => {
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
                 let v = self.eval_args(args)?;
                 self.ode_builtin(name, v, nout)?
             }
@@ -16853,6 +16853,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "ode15s",
     "ode23",
     "ode23s",
+    "dde23",
     "deval",
     "odeset",
     "odeget",
@@ -23484,6 +23485,32 @@ end",
         assert!(es < 1e-6, "ode23s stiff residual = {es}");
         assert!(s.get("t3").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
         assert!(s.get("ts").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
+    }
+
+    #[test]
+    fn dde23_delay_history_and_outputs() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "f = @(t,y,Z) -Z(:,1); [t,y] = dde23(f, 1, 1, [0 2], odeset('RelTol',1e-6,'AbsTol',1e-9)); err = abs(y(end) + 0.5); \
+             sol = dde23(f, 1, @(t) 1, [0 1 2]); sy = sol.y(1,end); sx = numel(sol.x); slv = sol.solver;",
+        )
+        .unwrap();
+        assert!(scalar(&s, "err") < 1e-5, "DDE error = {}", scalar(&s, "err"));
+        assert!((scalar(&s, "sy") + 0.5).abs() < 1e-5, "functional history y(2) = {}", scalar(&s, "sy"));
+        assert!(scalar(&s, "sx") >= 3.0);
+        assert_eq!(s.get("slv"), Some(&Value::Str("dde23".into())));
+
+        // Two lags: y' = -0.5*y(t-0.5) - 0.5*y(t-1), history 1.
+        s.run("g = @(t,y,Z) -0.5*Z(:,1) - 0.5*Z(:,2); [t2,y2] = dde23(g, [0.5 1], 1, [0 1 2]);").unwrap();
+        assert!(s.get("t2").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) >= 3);
+
+        s.run("try, dde23(f, 0, 1, [0 1]); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("positive"), "lag error = {m}");
+        } else {
+            panic!("non-positive dde23 lag did not error");
+        }
     }
 
     #[test]

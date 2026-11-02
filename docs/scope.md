@@ -22,7 +22,6 @@ These are tracked as post-1.0 depth work, not as incomplete blocks.
 | Area | Status | Reason |
 | --- | --- | --- |
 | MCOS cyclic handle graphs | Depth guarded | Cyclic handle-object graphs exceed the reader depth guard and report an error; acyclic scalar/array/nested graphs are supported. |
-| ODE variants | `dde23` | Delay differential equations need history functions and a different stepping model. |
 | Statistics depth | Weibull/lognormal/kernel `fitdist`, `tLocationScale`, `chi2gof`, `tsne` | Additional MLE families and embedding algorithms; existing distributions, ANOVA and UMAP are shipped. |
 | Graphics depth | `contourf`, lighting/`surfc`/`contour3`, JPEG | Additional raster/vector rendering and codec work, not part of the shipped plotting contract. |
 | Deployment | macOS/Linux device QA, signing/notarization, public web hosting | Requires external machines, certificates and hosting credentials. |

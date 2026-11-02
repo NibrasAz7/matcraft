@@ -103,6 +103,50 @@ fn options_from_value(v: Option<&Value>) -> Result<OdeOptions, LangError> {
     Ok(o)
 }
 
+/// Accepted DDE steps plus derivatives, used for Hermite interpolation of
+/// delayed states and for requested output times.
+#[derive(Clone, Default)]
+struct DdeHistory {
+    ts: Vec<f64>,
+    ys: Vec<Vec<f64>>,
+    fs: Vec<Vec<f64>>,
+}
+
+impl DdeHistory {
+    fn interpolate(&self, s: f64) -> Vec<f64> {
+        let Some(first) = self.ys.first() else { return Vec::new() };
+        if self.ts.len() < 2 || s <= self.ts.first().copied().unwrap_or(0.0) {
+            return first.clone();
+        }
+        if s >= self.ts.last().copied().unwrap_or(0.0) {
+            return self.ys.last().cloned().unwrap_or_else(|| first.clone());
+        }
+        let i = self.ts.partition_point(|&x| x <= s).saturating_sub(1);
+        let (Some(&t0), Some(&t1)) = (self.ts.get(i), self.ts.get(i + 1)) else { return first.clone() };
+        let (Some(y0), Some(y1)) = (self.ys.get(i), self.ys.get(i + 1)) else { return first.clone() };
+        let (Some(f0), Some(f1)) = (self.fs.get(i), self.fs.get(i + 1)) else { return y0.clone() };
+        let h = t1 - t0;
+        if h <= 0.0 {
+            return y1.clone();
+        }
+        let th = ((s - t0) / h).clamp(0.0, 1.0);
+        let th2 = th * th;
+        let th3 = th2 * th;
+        let h00 = 2.0 * th3 - 3.0 * th2 + 1.0;
+        let h10 = th3 - 2.0 * th2 + th;
+        let h01 = -2.0 * th3 + 3.0 * th2;
+        let h11 = th3 - th2;
+        (0..y0.len())
+            .map(|j| {
+                h00 * y0.get(j).copied().unwrap_or(0.0)
+                    + h * h10 * f0.get(j).copied().unwrap_or(0.0)
+                    + h01 * y1.get(j).copied().unwrap_or(0.0)
+                    + h * h11 * f1.get(j).copied().unwrap_or(0.0)
+            })
+            .collect()
+    }
+}
+
 fn state_vector(v: &Value, what: &str) -> Result<Vec<f64>, LangError> {
     let m = v.to_numeric()?;
     if m.rows() > 1 && m.cols() > 1 {
@@ -316,6 +360,168 @@ impl Session {
         Ok((yn, fnew))
     }
 
+    /// Evaluate the constant or functional history at `s`. `expected` is
+    /// `None` while inferring the state length from the initial history.
+    fn dde_history_at(&mut self, history: &Value, s: f64, expected: Option<usize>) -> Result<Vec<f64>, LangError> {
+        let value = match history {
+            Value::Num(_) | Value::Mat(_) => state_vector(history, "history")?,
+            Value::Func(_) | Value::Str(_) => {
+                let out = self.call_feval_target(history, vec![Value::Num(s)], 1)?;
+                state_vector(out.first().ok_or_else(|| LangError::new("history returned no value", 0))?, "history")?
+            }
+            _ => return Err(LangError::new("history must be a constant vector or a function handle", 0)),
+        };
+        if let Some(n) = expected {
+            if value.len() != n {
+                return Err(LangError::new(format!("history must return {n} values, got {}", value.len()), 0));
+            }
+        }
+        Ok(value)
+    }
+
+    /// `ddefun(t, y, Z)` with `Z(:,j) = y(t - lags(j))`.
+    fn dde_rhs(&mut self, target: &Value, history: &Value, lags: &[f64], past: &DdeHistory, t: f64, y: &[f64]) -> Result<Vec<f64>, LangError> {
+        let n = y.len();
+        let mut z = Matrix::zeros(n, lags.len());
+        for (j, &lag) in lags.iter().enumerate() {
+            let s = t - lag;
+            let delayed =
+                if s >= past.ts.first().copied().unwrap_or(f64::INFINITY) { past.interpolate(s) } else { self.dde_history_at(history, s, Some(n))? };
+            for (i, &v) in delayed.iter().enumerate().take(n) {
+                let _ = z.set(i, j, v);
+            }
+        }
+        let out = self.call_feval_target(target, vec![Value::Num(t), Value::Mat(Matrix::col_vector(y.to_vec())), Value::Mat(z)], 1)?;
+        let m = out.first().ok_or_else(|| LangError::new("ddefun returned no value", 0))?.to_numeric()?;
+        if m.numel() != n {
+            return Err(LangError::new(format!("ddefun must return {n} values, got {}", m.numel()), 0));
+        }
+        Ok(m.data().to_vec())
+    }
+
+    fn dde23_call(&mut self, argv: &[Value], nout: usize) -> Result<Vec<Value>, LangError> {
+        let target = argv.first().ok_or_else(|| LangError::new("dde23 needs a ddefun", 0))?.clone();
+        let lags = state_vector(argv.get(1).ok_or_else(|| LangError::new("dde23 needs lags", 0))?, "lags")?;
+        if lags.is_empty() || lags.len() > 64 {
+            return Err(LangError::new("dde23: lags must contain between 1 and 64 positive values", 0));
+        }
+        if lags.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+            return Err(LangError::new("dde23: lags must be positive and finite", 0));
+        }
+        let history = argv.get(2).ok_or_else(|| LangError::new("dde23 needs a history", 0))?.clone();
+        let span_m = argv.get(3).ok_or_else(|| LangError::new("dde23 needs tspan", 0))?.to_numeric()?;
+        if span_m.numel() < 2 {
+            return Err(LangError::new("tspan needs at least two times", 0));
+        }
+        let span = span_m.data().to_vec();
+        if span.windows(2).any(|w| w.get(1).copied().unwrap_or(0.0) <= w.first().copied().unwrap_or(0.0)) {
+            return Err(LangError::new("tspan must be strictly increasing", 0));
+        }
+        let opts = options_from_value(argv.get(4))?;
+        if opts.mass.is_some() || opts.events.is_some() {
+            return Err(LangError::new("dde23: Mass and Events options are not supported", 0));
+        }
+        let t0 = span.first().copied().unwrap_or(0.0);
+        let tf = span.last().copied().unwrap_or(0.0);
+        let span_len = tf - t0;
+        let y0 = self.dde_history_at(&history, t0, None)?;
+        if y0.is_empty() {
+            return Err(LangError::new("dde23: history must not be empty", 0));
+        }
+        let n = y0.len();
+        let (rt, at) = opts.tolerances(n)?;
+        let min_lag = lags.iter().copied().fold(f64::INFINITY, f64::min);
+        // Keep every delayed stage inside the accepted history, so a step
+        // never needs a state that is still being integrated.
+        let lag_cap = (min_lag / 4.0).max(1e-12);
+        let max_step = opts.max_step.unwrap_or(span_len / 10.0).min(lag_cap).max(1e-12);
+        let mut h = opts.initial_step.unwrap_or((span_len / 100.0).min(max_step)).min(max_step).min(span_len).max(1e-12);
+        let mut t = t0;
+        let mut y = y0;
+        let f0 = self.dde_rhs(&target, &history, &lags, &DdeHistory::default(), t, &y)?;
+        let mut past = DdeHistory { ts: vec![t], ys: vec![y.clone()], fs: vec![f0] };
+        let max_steps = opts.max_iterations.min(200_000);
+        let mut steps = 0usize;
+        while t < tf {
+            if steps >= max_steps {
+                return Err(LangError::new("dde23: maximum number of steps exceeded", 0));
+            }
+            steps = steps.saturating_add(1);
+            let h_use = h.min(tf - t).min(max_step).max(1e-15);
+            let stage = |base: &[f64], sums: &[(f64, &Vec<f64>)]| -> Vec<f64> {
+                (0..n)
+                    .map(|i| {
+                        let mut v = base.get(i).copied().unwrap_or(0.0);
+                        for (a, k) in sums {
+                            v += h_use * *a * k.get(i).copied().unwrap_or(0.0);
+                        }
+                        v
+                    })
+                    .collect()
+            };
+            let k1 = past.fs.last().cloned().unwrap_or_else(|| vec![0.0; n]);
+            let k2 = self.dde_rhs(&target, &history, &lags, &past, t + h_use / 2.0, &stage(&y, &[(1.0 / 2.0, &k1)]))?;
+            let k3 = self.dde_rhs(&target, &history, &lags, &past, t + 3.0 * h_use / 4.0, &stage(&y, &[(3.0 / 4.0, &k2)]))?;
+            let ynew = stage(&y, &[(2.0 / 9.0, &k1), (1.0 / 3.0, &k2), (4.0 / 9.0, &k3)]);
+            let fnew = self.dde_rhs(&target, &history, &lags, &past, t + h_use, &ynew)?;
+            let y2 = stage(&y, &[(7.0 / 24.0, &k1), (1.0 / 4.0, &k2), (1.0 / 3.0, &k3), (1.0 / 8.0, &fnew)]);
+            let mut err = 0.0f64;
+            for i in 0..n {
+                let scale = at.get(i).copied().unwrap_or(1e-6)
+                    + rt.get(i).copied().unwrap_or(1e-3) * y.get(i).copied().unwrap_or(0.0).abs().max(ynew.get(i).copied().unwrap_or(0.0).abs());
+                let e = (ynew.get(i).copied().unwrap_or(0.0) - y2.get(i).copied().unwrap_or(0.0)).abs() / scale;
+                if e > err {
+                    err = e;
+                }
+            }
+            let small = h_use <= 1e-12 * (1.0 + t.abs());
+            if err <= 1.0 || small {
+                let mut accepted = ynew;
+                for &i in &opts.non_negative {
+                    if let Some(slot) = accepted.get_mut(i.saturating_sub(1)) {
+                        *slot = slot.max(0.0);
+                    }
+                }
+                t += h_use;
+                y = accepted;
+                past.ts.push(t);
+                past.ys.push(y.clone());
+                past.fs.push(fnew);
+                let factor = if err <= 1e-16 { 5.0 } else { (0.9 * err.powf(-1.0 / 3.0)).clamp(0.2, 5.0) };
+                h = (h_use * factor).min(max_step).max(1e-15);
+                if small && t < tf {
+                    return Err(LangError::new("dde23: step size became too small", 0));
+                }
+            } else {
+                h = (h_use * (0.9 * err.powf(-1.0 / 3.0)).clamp(0.2, 0.9)).max(1e-15);
+            }
+        }
+        if nout == 1 {
+            let mut ymat = Matrix::zeros(n, past.ts.len());
+            let mut fmat = Matrix::zeros(n, past.ts.len());
+            for (j, row) in past.ys.iter().enumerate() {
+                for (i, v) in row.iter().enumerate() {
+                    let _ = ymat.set(i, j, *v);
+                    let _ = fmat.set(i, j, past.fs.get(j).and_then(|f| f.get(i)).copied().unwrap_or(0.0));
+                }
+            }
+            let mut sol = StructArray::new();
+            sol.set_field(0, "x", Value::Mat(Matrix::col_vector(past.ts)))?;
+            sol.set_field(0, "y", Value::Mat(ymat))?;
+            sol.set_field(0, "f", Value::Mat(fmat))?;
+            sol.set_field(0, "solver", Value::Str("dde23".into()))?;
+            return Ok(vec![Value::Struct(sol)]);
+        }
+        let (to, yo) = if span.len() > 2 { ode_interpolate(&past.ts, &past.ys, &past.fs, &span)? } else { (past.ts.clone(), past.ys.clone()) };
+        let mut mat = Matrix::zeros(yo.len(), n);
+        for (r, row) in yo.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let _ = mat.set(r, c, *v);
+            }
+        }
+        Ok(truncate_ode(vec![Value::Mat(Matrix::col_vector(to)), Value::Mat(mat)], nout))
+    }
+
     fn ode_integrate(
         &mut self,
         target: &Value,
@@ -508,6 +714,7 @@ impl Session {
                 }
                 Ok(vec![Value::Mat(out)])
             }
+            "dde23" => self.dde23_call(&argv, nout),
             "ode45" | "ode15s" | "ode23" | "ode23s" => {
                 let target = argv.first().ok_or_else(|| LangError::new(format!("{name} needs an odefun"), 0))?.clone();
                 let span_m = argv.get(1).ok_or_else(|| LangError::new(format!("{name} needs tspan"), 0))?.to_numeric()?;
