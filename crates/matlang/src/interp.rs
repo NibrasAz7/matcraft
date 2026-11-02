@@ -6470,7 +6470,8 @@ impl Session {
                 };
                 Ok(Some(Value::Num(trapz(&x, &y))))
             }
-            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "fmincon" | "patternsearch" => {
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "intlinprog" | "fmincon"
+            | "patternsearch" => {
                 let v = self.eval_args(args)?;
                 let out = self.optimize_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
@@ -10365,7 +10366,8 @@ impl Session {
             "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
             "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
-            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "fmincon" | "patternsearch" => {
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "intlinprog" | "fmincon"
+            | "patternsearch" => {
                 let v = self.eval_args(args)?;
                 self.optimize_builtin(name, v, nout)?
             }
@@ -16113,6 +16115,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "lsqcurvefit",
     "linprog",
     "quadprog",
+    "intlinprog",
     "fmincon",
     "patternsearch",
     "tf",
@@ -21624,6 +21627,50 @@ end",
         assert!((xr[1] - 1.0).abs() < 1e-5);
         assert!((scalar(&s, "fr") + 4.0).abs() < 1e-6);
         assert_eq!(scalar(&s, "flagr"), 1.0);
+    }
+
+    #[test]
+    fn optimization_intlinprog_and_solver_options() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().as_scalar().unwrap()
+        };
+        let vec = |s: &Session, name: &str| -> Vec<f64> {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().data().to_vec()
+        };
+
+        // Binary knapsack: at most one item, both worth one.
+        s.run(
+            "[xi, fi, flagi, outi] = intlinprog([-1;-1], [1 2], [2 2], 3, [], [], [0;0], [1;1], optimoptions('intlinprog','Solver','internal','MipGap',0)); oi = outi.iterations;",
+        )
+        .unwrap();
+        let xi = vec(&s, "xi");
+        assert_eq!(xi.len(), 2);
+        assert!((xi[0] + xi[1] - 1.0).abs() < 1e-6, "xi = {xi:?}");
+        assert!((scalar(&s, "fi") + 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagi"), 1.0);
+        assert!(scalar(&s, "oi") >= 1.0);
+
+        // Continuous variables default to a zero lower bound, so this is
+        // infeasible rather than unbounded.
+        s.run("[xn, fn, flagn] = intlinprog([1;1], [1 2], [1 1], -1, [], [], [], []);").unwrap();
+        assert_eq!(scalar(&s, "flagn"), -2.0);
+
+        // Invalid solver names are rejected when a solver runs.
+        s.run("try, linprog([1;1], [],[], [],[], [0;0], [], optimoptions('linprog','Solver','bogus')); catch se, smsg = se.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("smsg") {
+            assert!(m.contains("unknown Solver"), "solver message = {m}");
+        } else {
+            panic!("unknown Solver did not error");
+        }
+
+        // Internal selection still drives the built-in QP path.
+        s.run("[xs, fs] = linprog([-1;-1], [1 2; 4 2], [4;12], [], [], [0;0], [], optimoptions('linprog','Solver','internal'));").unwrap();
+        let xs = vec(&s, "xs");
+        assert!((xs[0] - 8.0 / 3.0).abs() < 1e-5);
+        assert!((scalar(&s, "fs") + 10.0 / 3.0).abs() < 1e-6);
     }
 
     #[test]

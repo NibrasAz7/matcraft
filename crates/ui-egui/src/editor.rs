@@ -562,6 +562,7 @@ const SIGNATURES: &[(&str, &str, &str)] = &[
     ("lsqcurvefit", "lsqcurvefit(Fun, X0, XData, YData, LB, UB, Options)", "Fit a nonlinear curve to data."),
     ("linprog", "linprog(F, A, B, Aeq, Beq, LB, UB, Options)", "Solve a linear program."),
     ("quadprog", "quadprog(H, F, A, B, Aeq, Beq, LB, UB, X0, Options)", "Solve a convex quadratic program."),
+    ("intlinprog", "intlinprog(F, IntCon, A, B, Aeq, Beq, LB, UB, Options)", "Solve a mixed-integer linear program."),
     ("ga", "ga(FitnessFcn, Nvars, A, B, Aeq, Beq, LB, UB, Options)", "Genetic algorithm for bounded optimisation."),
     ("patternsearch", "patternsearch(Fun, X0, A, B, Aeq, Beq, LB, UB, Options)", "Derivative-free pattern-search minimisation."),
     ("optimset", "optimset(Name, Value, ...)", "Create or update an optimisation options struct."),

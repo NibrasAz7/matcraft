@@ -18,6 +18,8 @@
 
 use super::*;
 
+mod ext;
+
 /// Relative step for central differences: eps^(1/3) balances truncation
 /// and round-off for a first derivative.
 const FD_BASE: f64 = 6.055_454_452_942_879e-6;
@@ -32,6 +34,23 @@ struct Opts {
     tol_constr: f64,
     fd_step: Option<f64>,
     display: bool,
+    /// External solver selection (`'internal'` by default).
+    solver: SolverChoice,
+    /// Wall-clock cap in seconds for an external/MSIP run.
+    time_limit: Option<f64>,
+    /// Relative MIP gap for `intlinprog`.
+    mip_gap: f64,
+}
+
+/// Which backend solves a linear/quadratic/integer program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SolverChoice {
+    /// Built-in interior-point / branch-and-bound.
+    Internal,
+    /// Prefer an installed external solver, fall back to the internal one.
+    Auto,
+    /// A specific external solver (`glpk`, `highs`, `gurobi`, `cplex`).
+    Named(String),
 }
 
 impl Opts {
@@ -46,6 +65,9 @@ impl Opts {
             tol_constr: 1e-6,
             fd_step: None,
             display: false,
+            solver: SolverChoice::Internal,
+            time_limit: None,
+            mip_gap: 1e-4,
         }
     }
 
@@ -93,6 +115,29 @@ impl Opts {
         }
         if let Some(Value::Str(d)) = field_matches(s, &["display"]) {
             o.display = !matches!(d.to_ascii_lowercase().as_str(), "off" | "none");
+        }
+        if let Some(Value::Str(d)) = field_matches(s, &["solver"]) {
+            o.solver = match d.to_ascii_lowercase().as_str() {
+                "internal" | "dual-simplex" | "interior-point" | "interior-point-legacy" | "trust-region-reflective" => SolverChoice::Internal,
+                "auto" => SolverChoice::Auto,
+                "glpk" | "highs" | "gurobi" | "cplex" => SolverChoice::Named(d.to_ascii_lowercase()),
+                other => {
+                    return Err(LangError::new(
+                        format!("optimoptions: unknown Solver '{other}' (use internal, auto, glpk, highs, gurobi or cplex)"),
+                        0,
+                    ))
+                }
+            };
+        }
+        if let Some(x) = field_matches(s, &["timelimit", "maxtime"]).and_then(|x| x.to_matrix().ok()).and_then(|m| m.as_scalar()) {
+            if x.is_finite() && x > 0.0 {
+                o.time_limit = Some(x);
+            }
+        }
+        if let Some(x) = field_matches(s, &["mipgap", "miprelgap", "relativemipgap"]).and_then(|x| x.to_matrix().ok()).and_then(|m| m.as_scalar()) {
+            if x.is_finite() && x >= 0.0 {
+                o.mip_gap = x;
+            }
         }
         Ok(o)
     }
@@ -301,6 +346,7 @@ impl Session {
             "lsqcurvefit" => self.lsqcurvefit_call(&argv, nout),
             "linprog" => self.linprog_call(&argv, nout),
             "quadprog" => self.quadprog_call(&argv, nout),
+            "intlinprog" => self.intlinprog_call(&argv, nout),
             "fmincon" => self.fmincon_call(&argv, nout),
             "patternsearch" => self.patternsearch_call(&argv, nout),
             _ => Err(LangError::new(format!("{name}: unknown optimization function"), 0)),
@@ -1017,7 +1063,8 @@ impl Session {
             let (x0_val, opt_val) = parse_x0_options(argv, 7, 8);
             QpSpec { h: Matrix::zeros(n, n), f, a, b, aeq, beq, lb, ub, x0: x0_vec(x0_val, n)?, opts: Opts::from_value(opt_val, n)? }
         };
-        let res = solve_qp(spec)?;
+        let res =
+            if spec.opts.solver == SolverChoice::Internal { solve_qp(spec)? } else { ext::solve(&spec, &[], ext::ProblemKind::Linear, "linprog")? };
         self.qp_outputs(res, nout)
     }
 
@@ -1042,8 +1089,68 @@ impl Session {
             let (x0_val, opt_val) = parse_x0_options(argv, 8, 9);
             QpSpec { h, f, a, b, aeq, beq, lb, ub, x0: x0_vec(x0_val, n)?, opts: Opts::from_value(opt_val, n)? }
         };
-        let res = solve_qp(spec)?;
+        let res = if spec.opts.solver == SolverChoice::Internal {
+            solve_qp(spec)?
+        } else {
+            ext::solve(&spec, &[], ext::ProblemKind::Quadratic, "quadprog")?
+        };
         self.qp_outputs(res, nout)
+    }
+
+    /// `intlinprog` — mixed-integer linear program. The built-in solver is
+    /// a bounded depth-first branch-and-bound over the interior-point LP
+    /// relaxation; `Solver` options select GLPK/HiGHS/Gurobi/CPLEX instead.
+    fn intlinprog_call(&mut self, argv: &[Value], nout: usize) -> Result<Vec<Value>, LangError> {
+        let spec = if let Some(Value::Struct(p)) = argv.first() {
+            let intcon = vector_arg(field_matches(p, &["intcon"]).as_ref(), "intcon")?;
+            let mut s = linprog_problem(p)?;
+            s.opts = Opts::from_value(field_matches(p, &["options"]).as_ref(), s.f.len())?;
+            (s, intcon)
+        } else {
+            let f = vector_arg(argv.first(), "f")?;
+            let n = f.len();
+            let intcon = vector_arg(argv.get(1), "intcon")?;
+            let a = matrix_arg(argv.get(2), n, "A")?;
+            let b = vec_or_empty(argv.get(3))?;
+            check_len(&b, a.rows(), "b")?;
+            let aeq = matrix_arg(argv.get(4), n, "Aeq")?;
+            let beq = vec_or_empty(argv.get(5))?;
+            check_len(&beq, aeq.rows(), "beq")?;
+            let lb = bound_vec(argv.get(6), n, 0.0)?;
+            let ub = bound_vec(argv.get(7), n, f64::INFINITY)?;
+            let opt = if matches!(argv.get(8), Some(Value::Struct(_))) { argv.get(8) } else { argv.get(9) };
+            let x0 = if matches!(argv.get(8), Some(Value::Struct(_))) { None } else { argv.get(8) };
+            let q = QpSpec { h: Matrix::zeros(n, n), f, a, b, aeq, beq, lb, ub, x0: x0_vec(x0, n)?, opts: Opts::from_value(opt, n)? };
+            (q, intcon)
+        };
+        let (spec, intcon) = spec;
+        let n = spec.f.len();
+        let mut ints: Vec<usize> = Vec::new();
+        for v in intcon {
+            if !v.is_finite() || v.fract() != 0.0 || v < 1.0 || v > n as f64 {
+                return Err(LangError::new(format!("intlinprog: intcon entries must be integer indices in 1..{n}"), 0));
+            }
+            let i = v as usize - 1;
+            if !ints.contains(&i) {
+                ints.push(i);
+            }
+        }
+        if ints.is_empty() {
+            return Err(LangError::new("intlinprog: intcon must name at least one integer variable", 0));
+        }
+        ints.sort_unstable();
+        let res = if spec.opts.solver == SolverChoice::Internal {
+            ext::branch_and_bound(&spec, &ints)?
+        } else {
+            ext::solve(&spec, &ints, ext::ProblemKind::Milp, "intlinprog")?
+        };
+        let out = vec![
+            mat_or_num(Matrix::col_vector(res.x)),
+            Value::Num(res.fval),
+            Value::Num(res.exitflag),
+            qp_output(res.iters, &res.message, res.constrviolation)?,
+        ];
+        Ok(pad_outputs(out, nout))
     }
 
     /// `fmincon` — sequential quadratic programming. Each iteration solves
@@ -1525,6 +1632,7 @@ impl Session {
     }
 }
 
+#[derive(Clone)]
 struct QpSpec {
     h: Matrix,
     f: Vec<f64>,

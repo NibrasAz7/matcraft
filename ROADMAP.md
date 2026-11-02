@@ -280,6 +280,11 @@
   enumeration members as constructor-backed class instances. Windows COM
   automation is available through a safe PowerShell bridge (`actxserver`,
   property/method dispatch, `get`/`set`, `delete`).
+- Solver wave (2026-11): `intlinprog` with a built-in branch-and-bound
+  fallback, and `Solver` options that drive external GLPK/HiGHS/Gurobi/
+  CPLEX command-line executables for LP, QP and MILP through a CPLEX-LP
+  model writer and per-solver solution readers. HiGHS 1.15.1 validates
+  all three problem classes; other readers are fixture-tested.
 - Final compatibility sweep (2026-11): table grouping/joining/cleanup,
   categorical/datetime basics, `fitlm`/`boxplot`/`optimalleaforder`,
   web/UI and parallel-compatibility stubs, ODE mass matrices/events/`deval`,

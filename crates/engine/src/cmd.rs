@@ -54,7 +54,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls fir1"),
     (
         "solvers",
-        "fzero fminbnd fminsearch fminunc fsolve lsqnonlin lsqcurvefit linprog quadprog fmincon patternsearch ga integral quad optimset optimoptions optimget",
+        "fzero fminbnd fminsearch fminunc fsolve lsqnonlin lsqcurvefit linprog quadprog intlinprog fmincon patternsearch ga integral quad optimset optimoptions optimget",
     ),
     (
         "control",
