@@ -476,6 +476,36 @@ impl Session {
                 };
                 Ok(vec![Value::Mat(Matrix::col_vector((1..=n).map(|i| i as f64).collect()))])
             }
+            "zscore" => {
+                let x = argv.first().ok_or_else(|| LangError::new("zscore needs data", 0))?.to_numeric()?;
+                if x.numel() == 0 {
+                    return Ok(vec![Value::Mat(x)]);
+                }
+                let flag = argv.get(1).and_then(|v| v.scalar().ok()).unwrap_or(0.0);
+                let mut out = Matrix::zeros(x.rows(), x.cols());
+                if x.rows() == 1 {
+                    let n = x.numel() as f64;
+                    let mean = x.data().iter().sum::<f64>() / n;
+                    let denom = if flag == 1.0 { n } else { (n - 1.0).max(1.0) };
+                    let var = x.data().iter().map(|v| (v - mean).powi(2)).sum::<f64>() / denom;
+                    let sd = var.sqrt().max(1e-15);
+                    for (i, v) in x.data().iter().enumerate() {
+                        out.set_linear(i, (v - mean) / sd);
+                    }
+                } else {
+                    let n = x.rows() as f64;
+                    let denom = if flag == 1.0 { n } else { (n - 1.0).max(1.0) };
+                    for c in 0..x.cols() {
+                        let mean = (0..x.rows()).map(|r| x.get(r, c).unwrap_or(0.0)).sum::<f64>() / n;
+                        let var = (0..x.rows()).map(|r| (x.get(r, c).unwrap_or(0.0) - mean).powi(2)).sum::<f64>() / denom;
+                        let sd = var.sqrt().max(1e-15);
+                        for r in 0..x.rows() {
+                            let _ = out.set(r, c, (x.get(r, c).unwrap_or(0.0) - mean) / sd);
+                        }
+                    }
+                }
+                Ok(vec![Value::Mat(out)])
+            }
             "isbetween" => {
                 let x = argv.first().ok_or_else(|| LangError::new("isbetween needs data", 0))?.to_matrix()?;
                 let lo = argv.get(1).ok_or_else(|| LangError::new("isbetween needs a lower bound", 0))?.to_matrix()?;

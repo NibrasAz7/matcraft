@@ -397,6 +397,34 @@ pub(super) fn cluster_from_linkage(z: &Matrix, cutoff: f64, maxclust: Option<usi
     Ok(roots.into_iter().map(|x| x as f64).collect())
 }
 
+/// Leaf order produced by an in-order traversal of a linkage tree.
+pub(super) fn linkage_leaf_order(z: &Matrix) -> Result<Vec<usize>, LangError> {
+    let (n, merges) = parse_linkage(z)?;
+    if merges.is_empty() {
+        return Ok((0..n).collect());
+    }
+    let mut children = vec![(0usize, 0usize); 2 * n + 1];
+    for (i, (a, b, _)) in merges.iter().enumerate() {
+        if let Some(slot) = children.get_mut(n + i + 1) {
+            *slot = (*a, *b);
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut stack = vec![n + merges.len()];
+    while let Some(node) = stack.pop() {
+        if node <= n {
+            out.push(node.saturating_sub(1));
+        } else if let Some((a, b)) = children.get(node).copied() {
+            stack.push(b);
+            stack.push(a);
+        }
+    }
+    if out.len() != n {
+        return Err(LangError::new("linkage: malformed tree", 0));
+    }
+    Ok(out)
+}
+
 fn cophenetic_distances(z: &Matrix, n: usize) -> Result<Vec<f64>, LangError> {
     let (_, merges) = parse_linkage(z)?;
     let mut parent: Vec<Option<usize>> = vec![None; 2 * n + 2];
@@ -522,6 +550,240 @@ fn cluster_scores(true_labels: &[String], pred_labels: &[String]) -> (f64, f64, 
     let hp = h(&b);
     let nmi = if ht > 0.0 && hp > 0.0 { mi / (ht * hp).sqrt() } else { 0.0 };
     (ari, nmi, purity)
+}
+
+fn label_contingency(true_labels: &[String], pred_labels: &[String]) -> (usize, Vec<usize>, Vec<usize>, Vec<Vec<usize>>) {
+    let n = true_labels.len().min(pred_labels.len());
+    let mut tmap: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut pmap: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut tv = Vec::with_capacity(n);
+    let mut pv = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = true_labels.get(i).map(String::as_str).unwrap_or("");
+        let p = pred_labels.get(i).map(String::as_str).unwrap_or("");
+        let next_t = tmap.len();
+        let ti = *tmap.entry(t).or_insert(next_t);
+        let next_p = pmap.len();
+        let pi = *pmap.entry(p).or_insert(next_p);
+        tv.push(ti);
+        pv.push(pi);
+    }
+    let mut c = vec![vec![0usize; pmap.len()]; tmap.len()];
+    let mut a = vec![0usize; tmap.len()];
+    let mut b = vec![0usize; pmap.len()];
+    for i in 0..n {
+        let ti = tv.get(i).copied().unwrap_or(0);
+        let pi = pv.get(i).copied().unwrap_or(0);
+        if let Some(row) = c.get_mut(ti) {
+            if let Some(slot) = row.get_mut(pi) {
+                *slot += 1;
+            }
+        }
+        if let Some(slot) = a.get_mut(ti) {
+            *slot += 1;
+        }
+        if let Some(slot) = b.get_mut(pi) {
+            *slot += 1;
+        }
+    }
+    (n, a, b, c)
+}
+
+fn rand_index(true_labels: &[String], pred_labels: &[String]) -> (f64, f64) {
+    let (n, a, b, c) = label_contingency(true_labels, pred_labels);
+    if n < 2 {
+        return (1.0, 1.0);
+    }
+    let comb2 = |x: usize| (x as f64) * (x as f64 - 1.0) / 2.0;
+    let sum_ij: f64 = c.iter().flatten().map(|v| comb2(*v)).sum();
+    let sum_a: f64 = a.iter().map(|v| comb2(*v)).sum();
+    let sum_b: f64 = b.iter().map(|v| comb2(*v)).sum();
+    let total = comb2(n);
+    let agreements = total - sum_a - sum_b + 2.0 * sum_ij;
+    let ri = if total > 0.0 { agreements / total } else { 1.0 };
+    let expected = if total > 0.0 { sum_a * sum_b / total } else { 0.0 };
+    let max = 0.5 * (sum_a + sum_b);
+    let ari = if (max - expected).abs() > 1e-15 { (sum_ij - expected) / (max - expected) } else { 1.0 };
+    (ri, ari)
+}
+
+fn mutual_information(true_labels: &[String], pred_labels: &[String]) -> (f64, f64) {
+    let (n, a, b, c) = label_contingency(true_labels, pred_labels);
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mut mi = 0.0;
+    for (i, row) in c.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            if v == 0 {
+                continue;
+            }
+            let pij = v as f64 / n as f64;
+            let pi = a.get(i).copied().unwrap_or(0) as f64 / n as f64;
+            let pj = b.get(j).copied().unwrap_or(0) as f64 / n as f64;
+            if pi > 0.0 && pj > 0.0 {
+                mi += pij * (pij / (pi * pj)).ln();
+            }
+        }
+    }
+    let h = |v: &[usize]| -> f64 {
+        v.iter()
+            .filter(|x| **x > 0)
+            .map(|x| {
+                let p = *x as f64 / n as f64;
+                -p * p.ln()
+            })
+            .sum()
+    };
+    let ht = h(&a);
+    let hp = h(&b);
+    let nmi = if ht > 0.0 && hp > 0.0 { mi / (ht * hp).sqrt() } else { 0.0 };
+    (mi, nmi)
+}
+
+fn silhouette_scores(x: &Matrix, labels: &[String]) -> Result<Vec<f64>, LangError> {
+    if labels.len() != x.rows() {
+        return Err(LangError::new("silhouette: labels must match the number of rows", 0));
+    }
+    let opts = DistOpts { metric: "euclidean".into(), p: 2.0, scale: None, cov: None };
+    let n = x.rows();
+    let rows: Vec<Vec<f64>> = (0..n).map(|r| (0..x.cols()).map(|c| x.get(r, c).unwrap_or(0.0)).collect()).collect();
+    let mut d = vec![vec![0.0f64; n]; n];
+    for i in 0..n {
+        for j in i + 1..n {
+            let v = distance(rows.get(i).map(Vec::as_slice).unwrap_or(&[]), rows.get(j).map(Vec::as_slice).unwrap_or(&[]), &opts)?;
+            d[i][j] = v;
+            d[j][i] = v;
+        }
+    }
+    let mut s = vec![0.0f64; n];
+    for i in 0..n {
+        let li = labels.get(i).cloned().unwrap_or_default();
+        let mut groups: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let key = labels.get(j).cloned().unwrap_or_default();
+            let entry = groups.entry(key).or_insert((0.0, 0));
+            entry.0 += d[i][j];
+            entry.1 += 1;
+        }
+        let a = groups.get(&li).map(|(sum, count)| if *count > 0 { sum / *count as f64 } else { 0.0 }).unwrap_or(0.0);
+        let b = groups
+            .iter()
+            .filter(|(k, _)| **k != li)
+            .map(|(_, (sum, count))| if *count > 0 { sum / *count as f64 } else { f64::INFINITY })
+            .fold(f64::INFINITY, f64::min);
+        s[i] = if groups.get(&li).map(|(_, c)| *c).unwrap_or(0) == 0 || !b.is_finite() { 0.0 } else { (b - a) / a.max(b).max(1e-12) };
+    }
+    Ok(s)
+}
+
+fn group_rows(labels: &[String]) -> BTreeMap<String, Vec<usize>> {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, label) in labels.iter().enumerate() {
+        groups.entry(label.clone()).or_default().push(i);
+    }
+    groups
+}
+
+fn centroid(x: &Matrix, rows: &[usize]) -> Vec<f64> {
+    let mut c = vec![0.0f64; x.cols()];
+    if rows.is_empty() {
+        return c;
+    }
+    for &r in rows {
+        for (j, slot) in c.iter_mut().enumerate() {
+            *slot += x.get(r, j).unwrap_or(0.0);
+        }
+    }
+    for slot in &mut c {
+        *slot /= rows.len() as f64;
+    }
+    c
+}
+
+fn dist_to_centroid(x: &Matrix, row: usize, c: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for (j, v) in c.iter().enumerate() {
+        let d = x.get(row, j).unwrap_or(0.0) - v;
+        s += d * d;
+    }
+    s.sqrt()
+}
+
+fn davies_bouldin(x: &Matrix, labels: &[String]) -> Result<f64, LangError> {
+    let groups = group_rows(labels);
+    if groups.len() < 2 {
+        return Err(LangError::new("evalclusters: at least two clusters are required", 0));
+    }
+    let centroids: Vec<Vec<f64>> = groups.values().map(|rows| centroid(x, rows)).collect();
+    let scatter: Vec<f64> = groups
+        .values()
+        .zip(centroids.iter())
+        .map(|(rows, c)| rows.iter().map(|&r| dist_to_centroid(x, r, c)).sum::<f64>() / rows.len().max(1) as f64)
+        .collect();
+    let mut total = 0.0;
+    for i in 0..centroids.len() {
+        let mut worst: f64 = 0.0;
+        for j in 0..centroids.len() {
+            if i == j {
+                continue;
+            }
+            let mut d = 0.0;
+            for (a, b) in centroids[i].iter().zip(centroids[j].iter()) {
+                d += (a - b) * (a - b);
+            }
+            let d = d.sqrt().max(1e-12);
+            worst = worst.max((scatter[i] + scatter[j]) / d);
+        }
+        total += worst;
+    }
+    Ok(total / centroids.len() as f64)
+}
+
+fn calinski_harabasz(x: &Matrix, labels: &[String]) -> Result<f64, LangError> {
+    let groups = group_rows(labels);
+    let n = x.rows();
+    let k = groups.len();
+    if k < 2 || n <= k {
+        return Err(LangError::new("evalclusters: need at least two clusters and more rows than clusters", 0));
+    }
+    let mut mean = vec![0.0f64; x.cols()];
+    for r in 0..n {
+        for (j, slot) in mean.iter_mut().enumerate() {
+            *slot += x.get(r, j).unwrap_or(0.0);
+        }
+    }
+    for slot in &mut mean {
+        *slot /= n as f64;
+    }
+    let mut between = 0.0;
+    let mut within = 0.0;
+    for rows in groups.values() {
+        let c = centroid(x, rows);
+        let mut d = 0.0;
+        for (a, b) in c.iter().zip(mean.iter()) {
+            d += (a - b) * (a - b);
+        }
+        between += rows.len() as f64 * d;
+        within += rows
+            .iter()
+            .map(|&r| {
+                let mut s = 0.0;
+                for (j, v) in c.iter().enumerate() {
+                    let d = x.get(r, j).unwrap_or(0.0) - v;
+                    s += d * d;
+                }
+                s
+            })
+            .sum::<f64>();
+    }
+    if within <= 1e-15 {
+        return Ok(f64::INFINITY);
+    }
+    Ok((between / (k - 1) as f64) / (within / (n - k) as f64))
 }
 
 impl Session {
@@ -726,47 +988,68 @@ impl Session {
             "silhouette" => {
                 let x = argv.first().ok_or_else(|| LangError::new("silhouette needs data", 0))?.to_numeric()?;
                 let labels = label_map(argv.get(1).ok_or_else(|| LangError::new("silhouette needs labels", 0))?)?;
-                if labels.len() != x.rows() {
-                    return Err(LangError::new("silhouette: labels must match the number of rows", 0));
-                }
-                let opts = DistOpts { metric: "euclidean".into(), p: 2.0, scale: None, cov: None };
-                let n = x.rows();
-                let rows: Vec<Vec<f64>> = (0..n).map(|r| (0..x.cols()).map(|c| x.get(r, c).unwrap_or(0.0)).collect()).collect();
-                let mut d = vec![vec![0.0f64; n]; n];
-                for i in 0..n {
-                    for j in i + 1..n {
-                        let v = distance(rows.get(i).map(Vec::as_slice).unwrap_or(&[]), rows.get(j).map(Vec::as_slice).unwrap_or(&[]), &opts)?;
-                        d[i][j] = v;
-                        d[j][i] = v;
-                    }
-                }
-                let mut s = vec![0.0f64; n];
-                for i in 0..n {
-                    let li = labels.get(i).cloned().unwrap_or_default();
-                    let mut groups: BTreeMap<String, (f64, usize)> = BTreeMap::new();
-                    for j in 0..n {
-                        if i == j {
-                            continue;
-                        }
-                        let key = labels.get(j).cloned().unwrap_or_default();
-                        let entry = groups.entry(key).or_insert((0.0, 0));
-                        entry.0 += d[i][j];
-                        entry.1 += 1;
-                    }
-                    let a = groups.get(&li).map(|(sum, count)| if *count > 0 { sum / *count as f64 } else { 0.0 }).unwrap_or(0.0);
-                    let b = groups
-                        .iter()
-                        .filter(|(k, _)| **k != li)
-                        .map(|(_, (sum, count))| if *count > 0 { sum / *count as f64 } else { f64::INFINITY })
-                        .fold(f64::INFINITY, f64::min);
-                    s[i] = if groups.get(&li).map(|(_, c)| *c).unwrap_or(0) == 0 || !b.is_finite() { 0.0 } else { (b - a) / a.max(b).max(1e-12) };
-                }
-                let mean = s.iter().sum::<f64>() / n.max(1) as f64;
+                let s = silhouette_scores(&x, &labels)?;
+                let mean = s.iter().sum::<f64>() / x.rows().max(1) as f64;
                 if nout >= 2 {
                     Ok(vec![Value::Mat(Matrix::col_vector(s)), Value::Num(mean)])
                 } else {
                     Ok(vec![Value::Mat(Matrix::col_vector(s))])
                 }
+            }
+            "randindex" => {
+                let t = label_map(argv.first().ok_or_else(|| LangError::new("randindex needs true labels", 0))?)?;
+                let p = label_map(argv.get(1).ok_or_else(|| LangError::new("randindex needs predicted labels", 0))?)?;
+                if t.len() != p.len() {
+                    return Err(LangError::new("randindex: label vectors must have the same length", 0));
+                }
+                let (ri, ari) = rand_index(&t, &p);
+                Ok(vec![Value::Num(ri), Value::Num(ari)])
+            }
+            "mutualinfo" => {
+                let t = label_map(argv.first().ok_or_else(|| LangError::new("mutualinfo needs true labels", 0))?)?;
+                let p = label_map(argv.get(1).ok_or_else(|| LangError::new("mutualinfo needs predicted labels", 0))?)?;
+                if t.len() != p.len() {
+                    return Err(LangError::new("mutualinfo: label vectors must have the same length", 0));
+                }
+                let (mi, nmi) = mutual_information(&t, &p);
+                Ok(vec![Value::Num(mi), Value::Num(nmi)])
+            }
+            "evalclusters" => {
+                let x = argv.first().ok_or_else(|| LangError::new("evalclusters needs data", 0))?.to_numeric()?;
+                let labels_arg = argv.get(1).ok_or_else(|| LangError::new("evalclusters needs labels or K", 0))?;
+                let is_scalar = matches!(labels_arg, Value::Num(_)) || labels_arg.to_numeric().map(|m| m.numel() == 1).unwrap_or(false);
+                let labels = if is_scalar {
+                    let k = labels_arg.scalar()?.round().max(2.0) as usize;
+                    let km = self.kmeans_call(&[Value::Mat(x.clone()), Value::Num(k as f64)])?;
+                    let idx = km.first().ok_or_else(|| LangError::new("evalclusters: kmeans failed", 0))?.to_numeric()?;
+                    label_map(&Value::Mat(idx))?
+                } else {
+                    label_map(labels_arg)?
+                };
+                if labels.len() != x.rows() {
+                    return Err(LangError::new("evalclusters: labels must match the number of rows", 0));
+                }
+                let criterion = match argv.get(2) {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    _ => "silhouette".into(),
+                };
+                let (value, name) = match criterion.as_str() {
+                    "silhouette" | "sil" => {
+                        let s = silhouette_scores(&x, &labels)?;
+                        (s.iter().sum::<f64>() / s.len().max(1) as f64, "silhouette")
+                    }
+                    "daviesbouldin" | "davies-bouldin" | "db" => (davies_bouldin(&x, &labels)?, "DaviesBouldin"),
+                    "calinskiharabasz" | "calinski-harabasz" | "ch" => (calinski_harabasz(&x, &labels)?, "CalinskiHarabasz"),
+                    other => return Err(LangError::new(format!("evalclusters: unknown criterion '{other}'"), 0)),
+                };
+                let k = labels.iter().collect::<BTreeSet<_>>().len();
+                let mut out = StructArray::new();
+                out.set_field(0, "CriterionName", Value::Str(name.into()))?;
+                out.set_field(0, "CriterionValues", Value::Mat(Matrix::row_vector(vec![value])))?;
+                out.set_field(0, "OptimalK", Value::Num(k as f64))?;
+                out.set_field(0, "InspectedK", Value::Num(k as f64))?;
+                out.set_field(0, "ClusterLabels", Value::Cell(CellArray::col(labels.into_iter().map(Value::Str).collect())))?;
+                Ok(vec![Value::Struct(out)])
             }
             _ => Err(LangError::new(format!("{name}: not a metrics builtin"), 0)),
         }

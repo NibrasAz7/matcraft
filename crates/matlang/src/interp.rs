@@ -32,6 +32,7 @@ mod netcdf;
 mod ode;
 mod optim;
 mod stats;
+mod streams;
 mod tsne;
 mod umap;
 mod xlsx;
@@ -7197,19 +7198,19 @@ impl Session {
                 Ok(out.into_iter().next())
             }
             "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
-            | "cophenet" | "silhouette" => {
+            | "cophenet" | "silhouette" | "randindex" | "mutualinfo" | "evalclusters" => {
                 let v = self.eval_args(args)?;
                 let out = self.metrics_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
             }
             "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
-            | "bfsearch" | "dfsearch" | "adjacency" | "isgraph" => {
+            | "bfsearch" | "dfsearch" | "adjacency" | "incidence" | "isgraph" => {
                 let v = self.eval_args(args)?;
                 let out = self.graph_builtin(name, v, 1)?;
                 Ok(out.into_iter().next())
             }
             "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
-            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" | "zscore" => {
                 let v = self.eval_args(args)?;
                 let out = self.mathx_builtin(name, v)?;
                 Ok(out.into_iter().next())
@@ -8288,6 +8289,92 @@ impl Session {
             dashed,
         );
         self.figure_mut().title = Some("volcano".into());
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn clustergram_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let x = argv.first().ok_or_else(|| LangError::new("clustergram needs data", 0))?.to_numeric()?;
+        if x.rows() < 2 || x.cols() < 2 {
+            return Err(LangError::new("clustergram needs at least a 2-by-2 matrix", 0));
+        }
+        let dr = self.metrics_builtin("pdist", vec![Value::Mat(x.clone())], 1)?;
+        let dr = dr.first().ok_or_else(|| LangError::new("clustergram: pdist failed", 0))?.to_numeric()?;
+        let zr = self.mathx_builtin("linkage", vec![Value::Mat(dr), Value::Str("average".into())])?;
+        let zr = zr.first().ok_or_else(|| LangError::new("clustergram: row linkage failed", 0))?.to_numeric()?;
+        let dc = self.metrics_builtin("pdist", vec![Value::Mat(x.transpose())], 1)?;
+        let dc = dc.first().ok_or_else(|| LangError::new("clustergram: pdist failed", 0))?.to_numeric()?;
+        let zc = self.mathx_builtin("linkage", vec![Value::Mat(dc), Value::Str("average".into())])?;
+        let zc = zc.first().ok_or_else(|| LangError::new("clustergram: column linkage failed", 0))?.to_numeric()?;
+        let row_order = metrics::linkage_leaf_order(&zr)?;
+        let col_order = metrics::linkage_leaf_order(&zc)?;
+        let mut rows = Matrix::zeros(x.rows(), x.cols());
+        for (ri, &r) in row_order.iter().enumerate() {
+            for c in 0..x.cols() {
+                let _ = rows.set(ri, c, x.get(r, c).unwrap_or(0.0));
+            }
+        }
+        let mut ordered = Matrix::zeros(x.rows(), x.cols());
+        for (ci, &c) in col_order.iter().enumerate() {
+            for r in 0..x.rows() {
+                let _ = ordered.set(r, ci, rows.get(r, c).unwrap_or(0.0));
+            }
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        {
+            let fig = self.figure_mut();
+            fig.sub = None;
+            fig.yrev = true;
+            fig.colorbar = true;
+            fig.title = Some("clustergram".into());
+            let xs: Vec<f64> = (1..=ordered.cols()).map(|i| i as f64).collect();
+            let ys: Vec<f64> = (1..=ordered.rows()).map(|i| i as f64).collect();
+            fig.push_grid(
+                matplot::SeriesKind::Image,
+                xs,
+                ys,
+                ordered.data().to_vec(),
+                ordered.rows(),
+                ordered.cols(),
+                Vec::new(),
+                matplot::LineSpec::new(),
+            );
+        }
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn streamline_value(&mut self, argv: &[Value], slice: bool) -> Result<Option<Value>, LangError> {
+        let z = Matrix::zeros(0, 0);
+        let (x, y, u, v, sx, sy) = if slice && argv.len() >= 4 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?, z.clone(), z.clone())
+        } else if argv.len() >= 6 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?, argv[4].to_numeric()?, argv[5].to_numeric()?)
+        } else if argv.len() >= 4 {
+            (z.clone(), z.clone(), argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?)
+        } else if slice && argv.len() >= 2 {
+            (z.clone(), z.clone(), argv[0].to_numeric()?, argv[1].to_numeric()?, z.clone(), z.clone())
+        } else {
+            return Err(LangError::new(
+                if slice { "streamslice needs U,V or X,Y,U,V" } else { "streamline needs U,V,startX,startY or X,Y,U,V,startX,startY" },
+                0,
+            ));
+        };
+        let n = sx.numel().min(sy.numel());
+        let seeds: Vec<(f64, f64)> = (0..n).map(|i| (sx.get_linear(i).unwrap_or(0.0), sy.get_linear(i).unwrap_or(0.0))).collect();
+        let grid_seeds = slice && seeds.is_empty();
+        if !slice && seeds.is_empty() {
+            return Err(LangError::new("streamline needs at least one seed point", 0));
+        }
+        let lines = streams::compute(&x, &y, &u, &v, &seeds, grid_seeds);
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        for line in lines {
+            let xs: Vec<f64> = line.iter().map(|p| p.0).collect();
+            let ys: Vec<f64> = line.iter().map(|p| p.1).collect();
+            self.figure_mut().push(matplot::SeriesKind::Line, xs, ys, matplot::LineSpec::new());
+        }
         Ok(Some(Value::Num(self.cur_fig as f64)))
     }
 
@@ -9802,6 +9889,18 @@ impl Session {
                 let v = self.eval_args(args)?;
                 self.dendrogram_value(&v)
             }
+            "clustergram" => {
+                let v = self.eval_args(args)?;
+                self.clustergram_value(&v)
+            }
+            "streamline" => {
+                let v = self.eval_args(args)?;
+                self.streamline_value(&v, false)
+            }
+            "streamslice" => {
+                let v = self.eval_args(args)?;
+                self.streamline_value(&v, true)
+            }
             "venn" => {
                 let v = self.eval_args(args)?;
                 self.venn_value(&v)
@@ -11237,17 +11336,17 @@ impl Session {
                 self.bio_builtin(name, v, nout)?
             }
             "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
-            | "cophenet" | "silhouette" => {
+            | "cophenet" | "silhouette" | "randindex" | "mutualinfo" | "evalclusters" => {
                 let v = self.eval_args(args)?;
                 self.metrics_builtin(name, v, nout)?
             }
             "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
-            | "bfsearch" | "dfsearch" | "adjacency" | "isgraph" => {
+            | "bfsearch" | "dfsearch" | "adjacency" | "incidence" | "isgraph" => {
                 let v = self.eval_args(args)?;
                 self.graph_builtin(name, v, nout)?
             }
             "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
-            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" | "zscore" => {
                 let v = self.eval_args(args)?;
                 self.mathx_builtin(name, v)?
             }
@@ -17364,12 +17463,18 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "clusterdata",
     "cophenet",
     "silhouette",
+    "randindex",
+    "mutualinfo",
+    "evalclusters",
     "dendrogram",
     "venn",
     "venncounts",
     "quiver",
     "quiver3",
     "heatmap",
+    "clustergram",
+    "streamline",
+    "streamslice",
     "volcano",
     "graph",
     "digraph",
@@ -17384,6 +17489,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "bfsearch",
     "dfsearch",
     "adjacency",
+    "incidence",
     "isgraph",
     "nchoosek",
     "gammaln",
@@ -17398,6 +17504,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "gradient",
     "expm",
     "isbetween",
+    "zscore",
     "isoutlier",
     "partialcorr",
     "linkage",
@@ -24029,6 +24136,43 @@ end",
         assert_eq!(s.figs[0].series[0].kind, SeriesKind::Graph);
         let svg = matplot::to_svg(&s.figs[0]);
         assert!(svg.contains("<circle") && svg.contains("<line"));
+    }
+
+    #[test]
+    fn analysis_extensions_and_streamlines() {
+        use matplot::SeriesKind;
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "ri = randindex([1 1 2 2], [1 1 2 3]); [mi, nmi] = mutualinfo([1 1 2 2], [1 1 2 3]); \
+             z = zscore([1 2; 3 4]); ev = evalclusters([0 0; 1 0; 10 0; 11 0], [1;1;2;2], 'silhouette'); evv = ev.CriterionValues; \
+             evd = evalclusters([0 0; 1 0; 10 0; 11 0], 2, 'DaviesBouldin'); evdv = evd.CriterionValues; \
+             evc = evalclusters([0 0; 1 0; 10 0; 11 0], [1;1;2;2], 'CalinskiHarabasz'); evcv = evc.CriterionValues; \
+             G = graph([0 1 1; 1 0 0; 1 0 0]); inc = incidence(G);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "ri") - 5.0 / 6.0).abs() < 1e-12);
+        assert!(scalar(&s, "mi") > 0.0 && (scalar(&s, "nmi") - 0.8165).abs() < 1e-4);
+        let z = vec(&s, "z");
+        assert!((z[0] + std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-4 && (z[3] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-4);
+        assert!((scalar(&s, "evv") - 0.8997).abs() < 1e-3 || scalar(&s, "evv") > 0.8);
+        assert!(scalar(&s, "evdv").is_finite());
+        assert!(scalar(&s, "evcv").is_finite());
+        assert_eq!(s.get("inc").map(|v| v.dims()), Some((3, 2)));
+
+        s.run("clf; clustergram([1 2 3; 4 5 6; 7 8 9; 10 11 12]);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Image);
+        assert_eq!(s.figs[0].title.as_deref(), Some("clustergram"));
+        assert!(matplot::to_svg(&s.figs[0]).contains("<rect"));
+
+        s.run("clf; [X,Y] = meshgrid(1:3,1:3); U = ones(3); V = zeros(3); streamline(X,Y,U,V,1,1);").unwrap();
+        assert!(!s.figs[0].series.is_empty());
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; [X,Y] = meshgrid(1:3,1:3); streamslice(X,Y,ones(3),ones(3));").unwrap();
+        assert!(!s.figs[0].series.is_empty());
     }
 
     #[test]

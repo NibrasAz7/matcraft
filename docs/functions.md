@@ -34,10 +34,10 @@ files or depend on the host platform use a descriptive output.
 - [dsp](#dsp) — 23 functions
 - [solvers](#solvers) — 18 functions
 - [control](#control) — 27 functions
-- [graph objects](#graph-objects) — 14 functions
-- [distances and clustering](#distances-and-clustering) — 14 functions
+- [graph objects](#graph-objects) — 15 functions
+- [distances and clustering](#distances-and-clustering) — 17 functions
 - [chemistry and sequences](#chemistry-and-sequences) — 16 functions
-- [statistics](#statistics) — 78 functions
+- [statistics](#statistics) — 79 functions
 - [ode](#ode) — 8 functions
 - [corpus classes](#corpus-classes) — 42 functions
 - [anova](#anova) — 4 functions
@@ -56,7 +56,7 @@ files or depend on the host platform use a descriptive output.
 - [image io](#image-io) — 4 functions
 - [workspace/env](#workspace-env) — 38 functions
 - [files/path](#files-path) — 21 functions
-- [plotting](#plotting) — 95 functions
+- [plotting](#plotting) — 98 functions
 
 ## construction
 
@@ -507,6 +507,7 @@ files or depend on the host platform use a descriptive output.
 | **`bfsearch`** <code>bfsearch(G,s)</code> | Breadth-first search order. | <code>G = graph([0 1 1;1 0 0;1 0 0]); r = bfsearch(G,1);</code> | <code>[1 2 3]</code> |
 | **`dfsearch`** <code>dfsearch(G,s)</code> | Depth-first search order. | <code>G = graph([0 1 1;1 0 0;1 0 0]); r = dfsearch(G,1);</code> | <code>[1 2 3]</code> |
 | **`adjacency`** <code>adjacency(G)</code> | Graph adjacency matrix. | <code>G = graph([0 1;1 0]); r = adjacency(G);</code> | <code>[0 1;1 0]</code> |
+| **`incidence`** <code>incidence(G)</code> | Node-edge incidence matrix. | <code>G = graph([0 1 1;1 0 0;1 0 0]); r = incidence(G);</code> | <code>[1 1;1 0;0 1]</code> |
 | **`isgraph`** <code>isgraph(x)</code> | True for graph objects. | <code>r = isgraph(graph([0 1;1 0]));</code> | <code>[1]</code> |
 
 ## distances and clustering
@@ -527,6 +528,9 @@ files or depend on the host platform use a descriptive output.
 | **`clusterdata`** <code>clusterdata(X,k&#124;cutoff)</code> | Distance, linkage and cut in one call. | <code>r = clusterdata([0 0;1 0;10 0;11 0],2);</code> | <code>[1;1;2;2]</code> |
 | **`cophenet`** <code>cophenet(Z[,Y])</code> | Cophenetic distances or cophenetic correlation. | <code>Z = linkage([1 2 3],'single'); r = cophenet(Z,[1 3 2]);</code> | <code>[0.866]</code> |
 | **`silhouette`** <code>silhouette(X,labels)</code> | Silhouette scores and mean. | <code>[s,m] = silhouette([0 0;1 0;10 0;11 0],[1;1;2;2]); r = m;</code> | <code>[0.8997]</code> |
+| **`randindex`** <code>randindex(true,pred)</code> | Rand index; the second output is the adjusted Rand index. | <code>[ri,ari] = randindex([1 1 2 2],[1 1 2 3]); r = [ri ari];</code> | <code>[0.8333 0.5714]</code> |
+| **`mutualinfo`** <code>mutualinfo(true,pred)</code> | Mutual information (nats); the second output is normalised MI. | <code>[mi,nmi] = mutualinfo([1 1 2 2],[1 1 2 3]); r = [mi nmi];</code> | <code>[0.6931 0.8165]</code> |
+| **`evalclusters`** <code>evalclusters(X, labels&#124;K, criterion)</code> | Evaluate a clustering using silhouette, Davies-Bouldin or Calinski-Harabasz. | <code>ev = evalclusters([0 0;1 0;10 0;11 0],[1;1;2;2],'silhouette'); r = ev.CriterionValues;</code> | <code>[0.8997]</code> |
 | **`linkage`** <code>linkage(Y,method)</code> | Agglomerative linkage tree. | <code>r = linkage([1 2 3],'single');</code> | <code>[1 2 1;4 3 2]</code> |
 | **`optimalleaforder`** <code>optimalleaforder(Z,Y)</code> | Optimal leaf ordering for a tree. | <code>Z = linkage([1 2 3],'single'); r = optimalleaforder(Z,[1 3 2]);</code> | <code>[1;2;3;4]</code> |
 
@@ -636,6 +640,7 @@ files or depend on the host platform use a descriptive output.
 | **`partialcorr`** <code>partialcorr(X)</code> | Partial correlation matrix. | <code>r = partialcorr([1 2 4;2 5 3;3 1 6;4 7 2;5 4 8]);</code> | <code>[-1 0.8625 0.8718;0.8625 -1 -0.8856;0.8718 -0.8856 -1]</code> |
 | **`isoutlier`** <code>isoutlier(x)</code> | Flag outliers. | <code>r = isoutlier([1 2 3 100]);</code> | <code>[0 0 0 1]</code> |
 | **`isbetween`** <code>isbetween(x,lo,hi)</code> | True for values inside a closed interval. | <code>r = isbetween([1 5 10],2,8);</code> | <code>[0 1 0]</code> |
+| **`zscore`** <code>zscore(X[,flag])</code> | Column-wise standardisation (flag=1 uses the population standard deviation). | <code>r = zscore([1 2;3 4]);</code> | <code>[-0.7071 -0.7071;0.7071 0.7071]</code> |
 | **`fitlm`** <code>fitlm(X,y)</code> | Fit a linear model. | <code>m = fitlm((1:10)',2*(1:10)'+1); r = m.Rsquared.Ordinary;</code> | <code>[1]</code> |
 
 ## ode
@@ -1138,10 +1143,13 @@ files or depend on the host platform use a descriptive output.
 | **`lines`** <code>lines([n])</code> | Lines colormap. | <code>r = size(lines(4));</code> | <code>[4 3]</code> |
 | **`volcano`** <code>volcano(log2fc,p)</code> | Volcano plot. | <code>clf; r = volcano([-3 -1 1 3],[0.001 0.2 0.01 0.0001]);</code> | <code>[1]</code> |
 | **`dendrogram`** <code>dendrogram(Z)</code> | Hierarchical-clustering dendrogram. | <code>clf; Z = linkage([1 2 3],'single'); r = dendrogram(Z);</code> | <code>[1]</code> |
+| **`clustergram`** <code>clustergram(X)</code> | Clustered heatmap ordered by average-linkage trees. | <code>clf; clustergram([1 2 3;4 5 6;7 8 9;10 11 12]); r = gcf;</code> | <code>[1]</code> |
 | **`venn`** <code>venn(A,B[,C,D])</code> | Venn diagram for 2-4 sets. | <code>clf; r = venn({'a','b'},{'b','c'});</code> | <code>[1]</code> |
 | **`venncounts`** <code>venncounts(A,B,...)</code> | Region counts for 2-10 sets. | <code>r = venncounts({'a','b'},{'b','c'});</code> | <code>[0 0 0;1 0 1;0 1 1;1 1 1]</code> |
 | **`quiver`** <code>quiver(X,Y,U,V)</code> | 2-D vector field. | <code>clf; r = quiver(1:2,1:2,[1 1],[0 0]);</code> | <code>[1]</code> |
 | **`quiver3`** <code>quiver3(X,Y,Z,U,V,W)</code> | 3-D vector field. | <code>clf; r = quiver3(1:2,1:2,1:2,[1 1],[0 0],[1 1]);</code> | <code>[1]</code> |
+| **`streamline`** <code>streamline(X,Y,U,V,SX,SY)</code> | Integrate streamlines through a 2-D vector field. | <code>clf; [X,Y] = meshgrid(1:3,1:3); streamline(X,Y,ones(3),zeros(3),1,1); r = gcf;</code> | <code>[1]</code> |
+| **`streamslice`** <code>streamslice(X,Y,U,V)</code> | Streamlines on a slice of a 2-D vector field. | <code>clf; [X,Y] = meshgrid(1:3,1:3); streamslice(X,Y,ones(3),ones(3)); r = gcf;</code> | <code>[1]</code> |
 | **`heatmap`** <code>heatmap(C)</code> | Heatmap with colorbar. | <code>clf; heatmap(magic(3)); r = gcf;</code> | <code>[1]</code> |
 | **`validatecolor`** <code>validatecolor(c)</code> | Validate or normalize a color specification. | <code>r = validatecolor([1 0 0]);</code> | <code>[1 0 0]</code> |
 | **`caxis`** <code>caxis([lo hi])</code> | Set the color limits. | <code>clf; imagesc(magic(3)); caxis([0 10]); r = caxis;</code> | <code>[0 10]</code> |

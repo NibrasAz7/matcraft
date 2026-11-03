@@ -290,7 +290,8 @@ impl Session {
                 let names = node_names(argv.get(names_at), a.rows())?;
                 Ok(vec![make_graph(a, names, directed)?])
             }
-            "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances" | "bfsearch" | "dfsearch" | "adjacency" => {
+            "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances" | "bfsearch" | "dfsearch" | "adjacency"
+            | "incidence" => {
                 let (a, names, directed) = graph_parts(argv.first().ok_or_else(|| LangError::new(format!("{name} needs a graph"), 0))?)?;
                 let n = a.rows();
                 match name {
@@ -308,6 +309,29 @@ impl Session {
                     }
                     "degree" => Ok(vec![Value::Mat(Matrix::col_vector(degree(&a, directed)))]),
                     "adjacency" => Ok(vec![Value::Mat(a)]),
+                    "incidence" => {
+                        let mut edges = Vec::new();
+                        for i in 0..n {
+                            for j in 0..n {
+                                if a.get(i, j).unwrap_or(0.0) != 0.0 && (directed || j >= i) {
+                                    edges.push((i, j));
+                                }
+                            }
+                        }
+                        let mut out = Matrix::zeros(n, edges.len());
+                        for (e, (i, j)) in edges.iter().enumerate() {
+                            if directed {
+                                let _ = out.set(*i, e, -1.0);
+                                let _ = out.set(*j, e, 1.0);
+                            } else {
+                                let _ = out.set(*i, e, 1.0);
+                                if i != j {
+                                    let _ = out.set(*j, e, 1.0);
+                                }
+                            }
+                        }
+                        Ok(vec![Value::Mat(out)])
+                    }
                     "conncomp" => {
                         let labels = weak_components(&a);
                         let k = labels.iter().copied().max().unwrap_or(0);

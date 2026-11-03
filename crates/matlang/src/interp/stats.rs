@@ -520,7 +520,7 @@ impl Session {
         }
     }
 
-    fn kmeans_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
+    pub(super) fn kmeans_call(&mut self, argv: &[Value]) -> Result<Vec<Value>, LangError> {
         let x = matrix_arg(argv.first(), "X")?;
         let n = x.rows();
         let d = x.cols();

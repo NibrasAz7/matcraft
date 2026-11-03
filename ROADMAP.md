@@ -6,11 +6,11 @@
 
 | Dimension | Now | Target |
 | --- | --- | --- |
-| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, 837 builtins | full M-code |
+| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, 845 builtins | full M-code |
 | Execution | tree-walk interpreter | bytecode VM → Cranelift JIT |
 | Linear algebra | pure-Rust LU/QR/Cholesky/eig/SVD/pinv/cond/rank/rref/null/orth | faer-rs backend + complex eigensolver |
 | Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
-| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
+| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs/clustergrams/streamlines, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
 | Toolboxes | DSP, optimization, control, statistics, distances/clustering, graph algorithms, chemistry/reaction/GPR and sequence I/O, xlsx/table + HDF5/NetCDF I/O, image processing | interactive figures and the remaining toolbox breadth |
 
 ## Phases
@@ -464,3 +464,7 @@
   weighted Dijkstra, BFS/DFS, components, adjacency), dendrogram/venn/
   quiver/graph/volcano/heatmap rendering, elemental formula and reaction
   parsing, GPR Boolean rules, and FASTA/GenBank I/O.
+- Analysis-extensions wave (2026-11): `randindex`, `mutualinfo`,
+  `evalclusters` (silhouette/Davies-Bouldin/Calinski-Harabasz), `zscore`,
+  graph `incidence` matrices, `clustergram` clustered heatmaps, and
+  `streamline`/`streamslice` vector-field integration.

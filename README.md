@@ -19,7 +19,7 @@ x =
 ## Status
 
 **Alpha** — Studio + engine + language/numerics + DSP + broad plotting are
-in. 837 builtins, `classdef` OOP (value + handle classes), N-D arrays,
+in. 845 builtins, `classdef` OOP (value + handle classes), N-D arrays,
 complex and sparse matrices, struct/cell arrays, `.mat` v5 I/O, 2D and 3D
 figures with SVG/PNG/PDF export, a MATLAB-style desktop Studio (ribbon
 toolstrip, docked panes, command window, workspace, editor, figure tabs,
@@ -59,7 +59,7 @@ sibling — `sim.run`/`model.*` commands already bridge it). See
   unwrap` + `hamming hann blackman bartlett rectwin triang kaiser
   gausswin` windows.
 - Figures: `plot scatter stem bar area stairs errorbar histogram pie
-  imagesc contour contourf plot3 surf mesh quiver quiver3 dendrogram venn
+  imagesc contour contourf plot3 surf mesh quiver quiver3 streamline clustergram dendrogram venn
   graph volcano heatmap` with `'r--o'` specs, `semilog*`/`loglog`,
   `meshgrid`, `view`/`zlim`/`zlabel`, `colormap`/`colorbar`/`caxis`, `grid`
   `box` `axis`, `saveas`/`exportgraphics`/`print` to **SVG/PNG/PDF**.
