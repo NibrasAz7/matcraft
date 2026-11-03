@@ -772,3 +772,60 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(metric: &str) -> DistOpts {
+        DistOpts { metric: metric.into(), p: 2.0, scale: None, cov: None }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    #[test]
+    fn documented_distance_metrics() {
+        let a = [0.0, 0.0];
+        let b = [3.0, 4.0];
+        assert!(close(distance(&a, &b, &opts("euclidean")).unwrap(), 5.0));
+        assert!(close(distance(&a, &b, &opts("squaredeuclidean")).unwrap(), 25.0));
+        assert!(close(distance(&a, &b, &opts("cityblock")).unwrap(), 7.0));
+        assert!(close(distance(&a, &b, &opts("chebychev")).unwrap(), 4.0));
+        let mut minkowski = opts("minkowski");
+        minkowski.p = 1.0;
+        assert!(close(distance(&a, &b, &minkowski).unwrap(), 7.0));
+        minkowski.p = 2.0;
+        assert!(close(distance(&a, &b, &minkowski).unwrap(), 5.0));
+        assert!(close(distance(&[1.0, 0.0], &[0.0, 1.0], &opts("cosine")).unwrap(), 1.0));
+        assert!(close(distance(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0], &opts("correlation")).unwrap(), 0.0));
+        assert!(close(distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], &opts("spearman")).unwrap(), 0.0));
+        assert!(close(distance(&[1.0, 0.0, 1.0], &[1.0, 1.0, 0.0], &opts("hamming")).unwrap(), 2.0 / 3.0));
+        assert!(close(distance(&[1.0, 0.0, 1.0, 1.0], &[1.0, 1.0, 0.0, 1.0], &opts("jaccard")).unwrap(), 0.5));
+        assert!(close(distance(&[1.0, 0.0, 1.0, 1.0], &[1.0, 1.0, 0.0, 1.0], &opts("dice")).unwrap(), 1.0 / 3.0));
+        assert!(close(distance(&[1.0, 0.0, 1.0], &[1.0, 1.0, 0.0], &opts("matching")).unwrap(), 2.0 / 3.0));
+        assert!(close(distance(&[1.0, 0.0], &[0.0, 1.0], &opts("canberra")).unwrap(), 2.0));
+        assert!(close(distance(&[1.0, 0.0], &[0.0, 1.0], &opts("braycurtis")).unwrap(), 1.0));
+        let mut scaled = opts("seuclidean");
+        scaled.scale = Some(vec![1.0, 1.0]);
+        assert!(close(distance(&a, &b, &scaled).unwrap(), 5.0));
+        let mut mahalanobis = opts("mahalanobis");
+        mahalanobis.cov = Some(Matrix::eye(2, 2));
+        assert!(close(distance(&a, &b, &mahalanobis).unwrap(), 5.0));
+        assert!(distance(&a, &b, &opts("not-a-metric")).is_err());
+    }
+
+    #[test]
+    fn cluster_cuts_cophenetic_and_scores() {
+        let z = Matrix::from_col_major(2, 3, vec![1.0, 4.0, 2.0, 3.0, 1.0, 2.0]).unwrap();
+        assert_eq!(cluster_from_linkage(&z, 1.5, None).unwrap(), vec![1.0, 1.0, 2.0]);
+        assert_eq!(cluster_from_linkage(&z, f64::INFINITY, Some(2)).unwrap(), vec![1.0, 1.0, 2.0]);
+        let cophenetic = cophenetic_distances(&z, 3).unwrap();
+        assert_eq!(cophenetic, vec![1.0, 2.0, 2.0]);
+        let (ari, nmi, purity) = cluster_scores(&["1".into(), "1".into(), "2".into(), "2".into()], &["1".into(), "1".into(), "2".into(), "3".into()]);
+        assert!((ari - 0.5714).abs() < 1e-4);
+        assert!((nmi - 0.8165).abs() < 1e-4);
+        assert!((purity - 0.75).abs() < 1e-12);
+    }
+}
