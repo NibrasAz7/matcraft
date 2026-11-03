@@ -129,6 +129,17 @@ mod group_tests {
         builtin.sort_unstable();
         assert_eq!(grouped, builtin);
     }
+
+    /// The published dictionary must contain exactly one row per builtin.
+    #[test]
+    fn function_dictionary_covers_builtins() {
+        let docs = include_str!("../../../docs/functions.md");
+        for name in matlang::BUILTIN_NAMES {
+            let needle = format!("**`{name}`**");
+            let count = docs.matches(&needle).count();
+            assert_eq!(count, 1, "docs/functions.md must document `{name}` exactly once");
+        }
+    }
 }
 
 /// Crash-safe write: atomic replace via `craft-atomic` on native targets.

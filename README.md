@@ -32,7 +32,7 @@ files (98%) parse cleanly** — the only two parse failures in the corpus
 are prose files saved with a `.m` extension, and all sources decode
 (latin-1 fallback). Scripts fail mostly on repo-local helper functions
 and external toolboxes — see [`docs/wild-corpus.md`](docs/wild-corpus.md)
-and [`docs/gaps.md`](docs/gaps.md); the growing function dictionary is
+and [`docs/gaps.md`](docs/gaps.md); the complete function dictionary is
 [`docs/functions.md`](docs/functions.md). Landed since the first sweep: `@`
 anonymous functions/handles, `classdef` OOP, N-D indexing, `global`/
 `persistent`, `import`, PNG image I/O, file I/O, regex, latin-1 sources.

@@ -271,6 +271,9 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 
 ## Builtin library
 
+Every builtin in this table has a full entry (signature, description,
+runnable example, expected output) in [`functions.md`](functions.md).
+
 | Group | Functions |
 | --- | --- |
 | Construction | `zeros ones eye magic peaks rand randn randi randperm linspace logspace reshape squeeze transpose repmat repelem diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90` (shape builtins are cell-aware; `magic(2)` returns the conventional placeholder `[1 3; 4 2]` since no order-2 magic square exists). `zeros`/`ones`/`rand`/`randn`/`Inf`/`NaN` take extra dims (`zeros(2,3,4)` or `zeros([2 3 4])`), `reshape` takes an N-D dims vector or extra args, `squeeze` drops singleton dims, and `cat(d,a,b)` concatenates along any dim (`cat(3,…)` stacks pages; `horzcat`/`vertcat` work on N-D operands too). `peaks(n)`/`[X,Y,Z] = peaks(n)` is the standard demo surface; `repelem(v,n)` repeats each element (scalar `n`, per-element `n`, or `[r c]` block tiling on matrices) |
