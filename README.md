@@ -19,7 +19,7 @@ x =
 ## Status
 
 **Alpha** — Studio + engine + language/numerics + DSP + broad plotting are
-in. ~440 builtins, `classdef` OOP (value + handle classes), N-D arrays,
+in. 837 builtins, `classdef` OOP (value + handle classes), N-D arrays,
 complex and sparse matrices, struct/cell arrays, `.mat` v5 I/O, 2D and 3D
 figures with SVG/PNG/PDF export, a MATLAB-style desktop Studio (ribbon
 toolstrip, docked panes, command window, workspace, editor, figure tabs,
@@ -32,7 +32,8 @@ files (98%) parse cleanly** — the only two parse failures in the corpus
 are prose files saved with a `.m` extension, and all sources decode
 (latin-1 fallback). Scripts fail mostly on repo-local helper functions
 and external toolboxes — see [`docs/wild-corpus.md`](docs/wild-corpus.md)
-and [`docs/gaps.md`](docs/gaps.md). Landed since the first sweep: `@`
+and [`docs/gaps.md`](docs/gaps.md); the growing function dictionary is
+[`docs/functions.md`](docs/functions.md). Landed since the first sweep: `@`
 anonymous functions/handles, `classdef` OOP, N-D indexing, `global`/
 `persistent`, `import`, PNG image I/O, file I/O, regex, latin-1 sources.
 Not yet: most toolbox functions, object arrays/`subsref`, deferred
@@ -58,7 +59,8 @@ sibling — `sim.run`/`model.*` commands already bridge it). See
   unwrap` + `hamming hann blackman bartlett rectwin triang kaiser
   gausswin` windows.
 - Figures: `plot scatter stem bar area stairs errorbar histogram pie
-  imagesc contour plot3 surf mesh` with `'r--o'` specs, `semilog*`/`loglog`,
+  imagesc contour contourf plot3 surf mesh quiver quiver3 dendrogram venn
+  graph volcano heatmap` with `'r--o'` specs, `semilog*`/`loglog`,
   `meshgrid`, `view`/`zlim`/`zlabel`, `colormap`/`colorbar`/`caxis`, `grid`
   `box` `axis`, `saveas`/`exportgraphics`/`print` to **SVG/PNG/PDF**.
 - `.mat` v5 `load`/`save`: numeric, complex, sparse, char.
@@ -92,7 +94,7 @@ cargo run -p matcraft-cli -- repl                    # interactive
 | `crates/ui-egui` | Studio UI: command window, workspace, editor, figure dock, control dispatch |
 | `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` |
 | `apps/matcraft` | MatCraft Studio (`--control PORT` for the JSON-lines channel) |
-| `docs/` | architecture, language reference |
+| `docs/` | architecture, language reference, function dictionary |
 | `xtask` | `cargo xtask ci` — fmt, clippy, tests |
 
 ## Design

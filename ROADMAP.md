@@ -6,12 +6,12 @@
 
 | Dimension | Now | Target |
 | --- | --- | --- |
-| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, ~440 builtins | full M-code |
+| Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, 837 builtins | full M-code |
 | Execution | tree-walk interpreter | bytecode VM → Cranelift JIT |
 | Linear algebra | pure-Rust LU/QR/Cholesky/eig/SVD/pinv/cond/rank/rref/null/orth | faer-rs backend + complex eigensolver |
 | Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
-| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh), imagesc/pie/contour, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
-| Toolboxes | DSP (`fft`/`ifft`/`filter`/`xcorr`/`freqz`/windows), optimization (`fminbnd`…`fmincon`/`patternsearch`/`ga`), control (`tf`/`ss`/`zpk`, MIMO/discrete `step`/`lsim`, `bode`/`margin`/`nyquist`/`pid`), statistics (distributions/`fitdist`, `regress`, `kmeans`, `ttest`/`kstest`/`adtest`/`pca`), xlsx/table + HDF5/NetCDF I/O, image processing incl. morphology | MIMO frequency arrays, HDF5 v2/chunked, Canny/bicubic, PCoA/UMAP and multiple-testing corrections |
+| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
+| Toolboxes | DSP, optimization, control, statistics, distances/clustering, graph algorithms, chemistry/reaction/GPR and sequence I/O, xlsx/table + HDF5/NetCDF I/O, image processing | interactive figures and the remaining toolbox breadth |
 
 ## Phases
 
@@ -456,3 +456,11 @@
   value/handle classes and `@dir` dispatch (`50e8e90`). Corpus re-run:
   parse-fail 93 → 2 (both non-code doc files), 632/645 function files
   parse (98%), 39/143 scripts run clean.
+- Bioinformatics and clustering wave (2026-11): documented distance metrics
+  (`pdist`/`pdist2`, Jaccard, set precision/recall/F1, confusion matrices),
+  hierarchical clustering (`cluster`/`clusterdata`/`cophenet`/`silhouette`,
+  Ward/centroid/median linkage), cluster validation against true labels
+  (ARI/NMI/purity), graph objects and algorithms (`graph`/`digraph`,
+  weighted Dijkstra, BFS/DFS, components, adjacency), dendrogram/venn/
+  quiver/graph/volcano/heatmap rendering, elemental formula and reaction
+  parsing, GPR Boolean rules, and FASTA/GenBank I/O.
