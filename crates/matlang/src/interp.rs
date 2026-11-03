@@ -16,15 +16,18 @@ use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::LangError;
 
 mod anova;
+mod bio;
 mod com;
 mod control;
 mod corpus;
 mod ga;
 mod gpu;
+mod graphs;
 mod hdf5;
 mod image;
 mod maps;
 mod mathx;
+mod metrics;
 mod netcdf;
 mod ode;
 mod optim;
@@ -7187,8 +7190,26 @@ impl Session {
                     }
                 }
             }
-            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "pdist" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient"
-            | "expm" | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
+            "formulaatoms" | "formulaweight" | "formulacheck" | "inferformula" | "parsereaction" | "formatreaction" | "canonicalreaction"
+            | "rxnequal" | "rxnbalance" | "gprparse" | "gpreval" | "gprgenes" | "gprmerge" | "fastaread" | "fastawrite" | "genbankread" => {
+                let v = self.eval_args(args)?;
+                let out = self.bio_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
+            | "cophenet" | "silhouette" => {
+                let v = self.eval_args(args)?;
+                let out = self.metrics_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
+            | "bfsearch" | "dfsearch" | "adjacency" | "isgraph" => {
+                let v = self.eval_args(args)?;
+                let out = self.graph_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
                 let v = self.eval_args(args)?;
                 let out = self.mathx_builtin(name, v)?;
                 Ok(out.into_iter().next())
@@ -8172,6 +8193,260 @@ impl Session {
         &mut self.figs[self.cur_fig - 1]
     }
 
+    fn venncounts_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let mut sets = Vec::new();
+        for v in argv {
+            sets.push(metrics::set_of(v)?);
+        }
+        if !(2..=10).contains(&sets.len()) {
+            return Err(LangError::new("venncounts supports 2 to 10 sets", 0));
+        }
+        let n = sets.len();
+        let mut universe = std::collections::BTreeSet::new();
+        for s in &sets {
+            universe.extend(s.iter().cloned());
+        }
+        let mut counts = vec![0.0f64; 1usize << n];
+        for item in universe {
+            let mut mask = 0usize;
+            for (k, s) in sets.iter().enumerate() {
+                if s.contains(&item) {
+                    mask |= 1 << k;
+                }
+            }
+            if let Some(slot) = counts.get_mut(mask) {
+                *slot += 1.0;
+            }
+        }
+        let mut out = Matrix::zeros(1usize << n, n + 1);
+        for mask in 0..(1usize << n) {
+            for k in 0..n {
+                let _ = out.set(mask, k, if mask & (1 << k) != 0 { 1.0 } else { 0.0 });
+            }
+            let _ = out.set(mask, n, counts.get(mask).copied().unwrap_or(0.0));
+        }
+        Ok(Some(Value::Mat(out)))
+    }
+
+    fn volcano_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let fc = argv.first().ok_or_else(|| LangError::new("volcano needs log2 fold changes", 0))?.to_numeric()?;
+        let pv = argv.get(1).ok_or_else(|| LangError::new("volcano needs p-values", 0))?.to_numeric()?;
+        if fc.numel() != pv.numel() {
+            return Err(LangError::new("volcano: fold changes and p-values must have the same length", 0));
+        }
+        let mut alpha = 0.05f64;
+        let mut fold = 1.0f64;
+        let mut i = 2usize;
+        while i + 1 < argv.len() {
+            if let Value::Str(key) = &argv[i] {
+                let value = argv.get(i + 1).ok_or_else(|| LangError::new("volcano: missing option value", 0))?;
+                match key.to_ascii_lowercase().as_str() {
+                    "alpha" => alpha = value.scalar()?,
+                    "foldchange" | "fold" => fold = value.scalar()?,
+                    other => return Err(LangError::new(format!("volcano: unknown option '{other}'"), 0)),
+                }
+            }
+            i += 2;
+        }
+        let n = fc.numel();
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut colors = Vec::with_capacity(n);
+        let up = matplot::Rgb(0xD9, 0x53, 0x19);
+        let down = matplot::Rgb(0x00, 0x72, 0xBD);
+        let flat = matplot::Rgb(0x99, 0x99, 0x99);
+        for k in 0..n {
+            let f = fc.get_linear(k).unwrap_or(0.0);
+            let p = pv.get_linear(k).unwrap_or(1.0).clamp(1e-300, 1.0);
+            x.push(f);
+            y.push(-p.log10());
+            colors.push(if p < alpha && f >= fold {
+                up
+            } else if p < alpha && f <= -fold {
+                down
+            } else {
+                flat
+            });
+        }
+        let ymax = y.iter().copied().fold(1.0f64, f64::max);
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        self.figure_mut().push(matplot::SeriesKind::Scatter, x, y, matplot::LineSpec::new());
+        if let Some(series) = self.figure_mut().series.last_mut() {
+            series.colors = colors;
+        }
+        let mut dashed = matplot::LineSpec::new();
+        dashed.dash = matplot::DashStyle::Dashed;
+        dashed.color = Some(matplot::Rgb(0x66, 0x66, 0x66));
+        self.figure_mut().push(matplot::SeriesKind::Line, vec![-fold, -fold], vec![0.0, ymax], dashed.clone());
+        self.figure_mut().push(matplot::SeriesKind::Line, vec![fold, fold], vec![0.0, ymax], dashed.clone());
+        self.figure_mut().push(
+            matplot::SeriesKind::Line,
+            vec![-fold.abs().max(1.0), fold.abs().max(1.0)],
+            vec![-alpha.log10(), -alpha.log10()],
+            dashed,
+        );
+        self.figure_mut().title = Some("volcano".into());
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn dendrogram_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let z = argv.first().ok_or_else(|| LangError::new("dendrogram needs a linkage matrix", 0))?.to_numeric()?;
+        if z.cols() != 3 {
+            return Err(LangError::new("dendrogram: linkage matrix must have three columns", 0));
+        }
+        let n = z.rows() + 1;
+        let mut labels: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        let mut color_threshold = None;
+        let mut i = 1usize;
+        while i < argv.len() {
+            let key = match &argv[i] {
+                Value::Str(s) => s.to_ascii_lowercase(),
+                _ => return Err(LangError::new("dendrogram options must be name/value pairs", 0)),
+            };
+            let value = argv.get(i + 1).ok_or_else(|| LangError::new(format!("dendrogram: missing value for '{key}'"), 0))?;
+            match key.as_str() {
+                "labels" => labels = bio::as_string_list(value, "Labels")?,
+                "colorthreshold" => color_threshold = Some(value.scalar()?),
+                other => return Err(LangError::new(format!("dendrogram: unknown option '{other}'"), 0)),
+            }
+            i += 2;
+        }
+        if labels.len() != n {
+            return Err(LangError::new("dendrogram: Labels must match the number of leaves", 0));
+        }
+        let max_h = (0..z.rows()).map(|r| z.get(r, 2).unwrap_or(0.0)).fold(0.0f64, f64::max);
+        let threshold = color_threshold.unwrap_or(max_h * 0.7);
+        let clusters = metrics::cluster_from_linkage(&z, threshold, None)?;
+        let palette = [
+            matplot::Rgb(0x00, 0x72, 0xBD),
+            matplot::Rgb(0xD9, 0x53, 0x19),
+            matplot::Rgb(0xED, 0xB1, 0x20),
+            matplot::Rgb(0x7E, 0x2F, 0x8E),
+            matplot::Rgb(0x77, 0xAC, 0x30),
+            matplot::Rgb(0x4D, 0xBE, 0xEE),
+            matplot::Rgb(0xA2, 0x14, 0x2F),
+        ];
+        let mut colors = Vec::with_capacity(z.rows());
+        for r in 0..z.rows() {
+            let leaf = z.get(r, 0).unwrap_or(1.0).round().max(1.0) as usize;
+            let cluster = clusters.get(leaf.saturating_sub(1)).copied().unwrap_or(1.0).max(1.0) as usize;
+            colors.push(palette[(cluster - 1) % palette.len()]);
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        self.figure_mut().push_dendrogram(z.data().to_vec(), z.rows(), labels, colors);
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn venn_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let mut sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        let mut labels: Option<Vec<String>> = None;
+        let mut i = 0usize;
+        while i < argv.len() {
+            match &argv[i] {
+                Value::Str(key) if key.eq_ignore_ascii_case("labels") => {
+                    labels = Some(bio::as_string_list(argv.get(i + 1).ok_or_else(|| LangError::new("venn: Labels needs a value", 0))?, "Labels")?);
+                    i += 2;
+                }
+                v => {
+                    sets.push(metrics::set_of(v)?);
+                    i += 1;
+                }
+            }
+        }
+        if !(2..=4).contains(&sets.len()) {
+            return Err(LangError::new("venn supports 2, 3 or 4 sets; use setmetrics for larger comparisons", 0));
+        }
+        let n = sets.len();
+        let mut labels = labels.unwrap_or_else(|| (0..n).map(|k| format!("S{}", k + 1)).collect());
+        if labels.len() != n {
+            return Err(LangError::new("venn: Labels must match the number of sets", 0));
+        }
+        if labels.iter().any(String::is_empty) {
+            labels = (0..n).map(|k| format!("S{}", k + 1)).collect();
+        }
+        let mut counts = vec![0.0f64; 1usize << n];
+        let mut universe = std::collections::BTreeSet::new();
+        for s in &sets {
+            universe.extend(s.iter().cloned());
+        }
+        for item in universe {
+            let mut mask = 0usize;
+            for (k, s) in sets.iter().enumerate() {
+                if s.contains(&item) {
+                    mask |= 1 << k;
+                }
+            }
+            if mask != 0 {
+                if let Some(slot) = counts.get_mut(mask) {
+                    *slot += 1.0;
+                }
+            }
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        self.figure_mut().push_venn(labels, counts, Vec::new());
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn quiver_value(&mut self, argv: &[Value], three_d: bool) -> Result<Option<Value>, LangError> {
+        let (x, y, z, u, vv, w) = if three_d {
+            if argv.len() < 6 {
+                return Err(LangError::new("quiver3 needs X,Y,Z,U,V,W", 0));
+            }
+            (
+                argv[0].to_numeric()?,
+                argv[1].to_numeric()?,
+                argv[2].to_numeric()?,
+                argv[3].to_numeric()?,
+                argv[4].to_numeric()?,
+                Some(argv[5].to_numeric()?),
+            )
+        } else if argv.len() >= 4 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, Matrix::zeros(0, 0), argv[2].to_numeric()?, argv[3].to_numeric()?, None)
+        } else if argv.len() >= 2 {
+            let u = argv[0].to_numeric()?;
+            let vv = argv[1].to_numeric()?;
+            let n = u.numel().min(vv.numel());
+            // With matrix components, lay the arrows out on the same grid as
+            // `meshgrid` (x across columns, y down rows); vectors are a 1-D row.
+            let (x, y) = if u.rows() > 1 && u.cols() > 1 && u.dims() == vv.dims() {
+                let rows = u.rows();
+                let xs: Vec<f64> = (0..n).map(|k| (k / rows + 1) as f64).collect();
+                let ys: Vec<f64> = (0..n).map(|k| (k % rows + 1) as f64).collect();
+                (Matrix::row_vector(xs), Matrix::row_vector(ys))
+            } else {
+                (Matrix::row_vector((1..=n).map(|k| k as f64).collect()), Matrix::row_vector(vec![0.0; n]))
+            };
+            (x, y, Matrix::zeros(0, 0), u, vv, None)
+        } else {
+            return Err(LangError::new("quiver needs U,V or X,Y,U,V", 0));
+        };
+        let n = x.numel().min(y.numel()).min(u.numel()).min(vv.numel());
+        if n == 0 || (three_d && z.numel() < n) || w.as_ref().is_some_and(|m| m.numel() < n) {
+            return Err(LangError::new("quiver: coordinate and vector lengths must match", 0));
+        }
+        let vectors: Vec<(f64, f64, f64)> = (0..n)
+            .map(|i| (u.get_linear(i).unwrap_or(0.0), vv.get_linear(i).unwrap_or(0.0), w.as_ref().and_then(|m| m.get_linear(i)).unwrap_or(0.0)))
+            .collect();
+        if !self.figure_mut().hold {
+            self.figure_mut().series.clear();
+        }
+        self.figure_mut().push_quiver(
+            if three_d { matplot::SeriesKind::Quiver3 } else { matplot::SeriesKind::Quiver },
+            x.data().to_vec(),
+            y.data().to_vec(),
+            z.data().to_vec(),
+            vectors,
+            matplot::LineSpec::new(),
+        );
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
     /// Evaluate args then apply a figure-related command.
     fn fig_command(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         use matplot::SeriesKind;
@@ -8861,9 +9136,9 @@ impl Session {
                 }
                 Ok(None)
             }
-            "surf" | "mesh" | "surfc" => {
+            "surf" | "surfl" | "mesh" | "surfc" => {
                 // surf/surfc/mesh(Z) | (X,Y,Z) — vectors or meshgrid matrices.
-                let kind = if matches!(name, "surf" | "surfc") { SeriesKind::Surf } else { SeriesKind::Mesh };
+                let kind = if matches!(name, "surf" | "surfl" | "surfc") { SeriesKind::Surf } else { SeriesKind::Mesh };
                 let v = self.eval_args(args)?;
                 let zm = match v.len() {
                     1 => v[0].to_matrix()?,
@@ -8919,6 +9194,9 @@ impl Session {
                     self.figure_mut().push_grid(SeriesKind::Contour3Base, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
                 } else {
                     self.figure_mut().push_grid(kind, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
+                }
+                if name == "surfl" {
+                    self.figure_mut().lighting = true;
                 }
                 Ok(None)
             }
@@ -9520,6 +9798,36 @@ impl Session {
                 }
                 Ok(Some(Value::Mat(out)))
             }
+            "dendrogram" => {
+                let v = self.eval_args(args)?;
+                self.dendrogram_value(&v)
+            }
+            "venn" => {
+                let v = self.eval_args(args)?;
+                self.venn_value(&v)
+            }
+            "quiver" => {
+                let v = self.eval_args(args)?;
+                self.quiver_value(&v, false)
+            }
+            "quiver3" => {
+                let v = self.eval_args(args)?;
+                self.quiver_value(&v, true)
+            }
+            "heatmap" => {
+                let out = self.fig_command("imagesc", args)?;
+                self.figure_mut().colorbar = true;
+                self.figure_mut().title = Some("heatmap".into());
+                Ok(out)
+            }
+            "volcano" => {
+                let v = self.eval_args(args)?;
+                self.volcano_value(&v)
+            }
+            "venncounts" => {
+                let v = self.eval_args(args)?;
+                self.venncounts_value(&v)
+            }
             _ => Err(LangError::new(format!("unknown function or variable '{name}'"), 0)),
         }
     }
@@ -9529,6 +9837,11 @@ impl Session {
     /// expands to one series per column.
     fn add_series(&mut self, kind: matplot::SeriesKind, args: &[Expr]) -> Result<Option<Value>, LangError> {
         let v = self.eval_args(args)?;
+        if let Some(Value::Object(o)) = v.first() {
+            if o.class_name == "graph" || o.class_name == "digraph" {
+                return self.plot_graph_object(o);
+            }
+        }
         if !self.figure_mut().hold {
             self.figure_mut().series.clear();
         }
@@ -10918,8 +11231,23 @@ impl Session {
                 let v = self.eval_args(args)?;
                 self.ode_builtin(name, v, nout)?
             }
-            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "pdist" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient"
-            | "expm" | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
+            "formulaatoms" | "formulaweight" | "formulacheck" | "inferformula" | "parsereaction" | "formatreaction" | "canonicalreaction"
+            | "rxnequal" | "rxnbalance" | "gprparse" | "gpreval" | "gprgenes" | "gprmerge" | "fastaread" | "fastawrite" | "genbankread" => {
+                let v = self.eval_args(args)?;
+                self.bio_builtin(name, v, nout)?
+            }
+            "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
+            | "cophenet" | "silhouette" => {
+                let v = self.eval_args(args)?;
+                self.metrics_builtin(name, v, nout)?
+            }
+            "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
+            | "bfsearch" | "dfsearch" | "adjacency" | "isgraph" => {
+                let v = self.eval_args(args)?;
+                self.graph_builtin(name, v, nout)?
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" => {
                 let v = self.eval_args(args)?;
                 self.mathx_builtin(name, v)?
             }
@@ -17010,6 +17338,53 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "datetime",
     "duration",
     "seconds",
+    "formulaatoms",
+    "formulaweight",
+    "formulacheck",
+    "inferformula",
+    "parsereaction",
+    "formatreaction",
+    "canonicalreaction",
+    "rxnequal",
+    "rxnbalance",
+    "gprparse",
+    "gpreval",
+    "gprgenes",
+    "gprmerge",
+    "fastaread",
+    "fastawrite",
+    "genbankread",
+    "pdist2",
+    "jaccard",
+    "jaccarddistance",
+    "setmetrics",
+    "confusionmat",
+    "clustermetrics",
+    "cluster",
+    "clusterdata",
+    "cophenet",
+    "silhouette",
+    "dendrogram",
+    "venn",
+    "venncounts",
+    "quiver",
+    "quiver3",
+    "heatmap",
+    "volcano",
+    "graph",
+    "digraph",
+    "gplot",
+    "numnodes",
+    "numedges",
+    "degree",
+    "conncomp",
+    "neighbors",
+    "shortestpath",
+    "distances",
+    "bfsearch",
+    "dfsearch",
+    "adjacency",
+    "isgraph",
     "nchoosek",
     "gammaln",
     "hygecdf",
@@ -17199,7 +17574,6 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "barh",
     "annotation",
     "gobjects",
-    "isprop",
     "isgraphics",
     "allchild",
     "ancestor",
@@ -17253,6 +17627,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "plot3",
     "surf",
     "surfc",
+    "surfl",
     "mesh",
     "saveas",
     "exportgraphics",
@@ -23507,6 +23882,153 @@ end",
         assert!((scalar(&s, "kmed") - 3.0).abs() < 1e-9);
         assert_eq!(s.get("ksz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
         assert_eq!(scalar(&s, "kbad"), 0.0);
+    }
+
+    #[test]
+    fn bio_formula_reaction_gpr_sequences() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "f = formulaatoms('C6H12O6'); fc = f.C; w = formulaweight('C6H12O6'); ok = formulacheck('C55H80CoN15O11'); \
+             r = parsereaction('2 H2O + ATP <=> ADP + Pi'); txt = formatreaction(r); rev = rxnequal(r, 'ADP + Pi <=> 2 H2O + ATP', 'Reverse', 1); \
+             bal = rxnbalance('2 H2 + O2 -> 2 H2O', {'H2','O2','H2O'}); balv = bal.Balanced; bad = rxnbalance('H2O -> H2 + O2', {'H2O','H2','O2'}); badv = bad.Balanced; \
+             g = gprparse('g1 & (g2 | g3)'); on = gpreval(g, {'g1','g3'}); off = gpreval(g, {'g1'}); gl = gprgenes(g); gm = gprmerge(g, 'g4'); \
+             inf = inferformula([-1 -1 1 1 1], {'C10H16N5O13P3','H2O','C10H16N5O10P2','','H+'}, 4);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "fc"), 6.0);
+        assert!((scalar(&s, "w") - 180.15588).abs() < 1e-4);
+        assert_eq!(scalar(&s, "ok"), 1.0);
+        assert_eq!(s.get("txt"), Some(&Value::Str("2 H2O + ATP <=> ADP + Pi".into())));
+        assert_eq!(scalar(&s, "rev"), 1.0);
+        assert_eq!(scalar(&s, "balv"), 1.0);
+        assert_eq!(scalar(&s, "badv"), 0.0);
+        assert_eq!(scalar(&s, "on"), 1.0);
+        assert_eq!(scalar(&s, "off"), 0.0);
+        assert_eq!(
+            s.get("gl").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(3)
+        );
+        assert!(matches!(s.get("gm"), Some(Value::Str(_))));
+        let inf = s.get("inf").and_then(|v| match v {
+            Value::Struct(st) => st.field_at(0, "Formula").cloned(),
+            _ => None,
+        });
+        assert_eq!(inf, Some(Value::Str("HO4P".into())));
+
+        let dir = m_dir("bioio");
+        let fa = dir.join("sample.fasta");
+        let gb = dir.join("sample.gbk");
+        std::fs::write(&fa, ">seq1 locus_tag=gene1\nMKV\n>seq2\nGG\n").unwrap();
+        std::fs::write(
+            &gb,
+            "LOCUS       TEST001     100 bp    DNA\nDEFINITION  test protein.\nFEATURES             Location/Qualifiers\n     CDS             1..9\n                     /locus_tag=\"gene1\"\n                     /protein_id=\"P1\"\n                     /product=\"enzyme\"\n                     /translation=\"MKV\"\n     CDS             10..15\n                     /locus_tag=\"gene2\"\n                     /protein_id=\"P2\"\n                     /product=\"second enzyme\"\n                     /translation=\"GG\"\nORIGIN\n        1 atggccgttgga\n//\n",
+        )
+        .unwrap();
+        let fp = fa.to_string_lossy().replace('\\', "/");
+        let gp = gb.to_string_lossy().replace('\\', "/");
+        s.run(&format!(
+            "[fh, fs] = fastaread('{fp}'); rec = fastaread('{fp}'); h1 = rec(1).Header; q1 = rec(1).Sequence; fastawrite('{fp}.out', fh, fs); \
+             gb = genbankread('{gp}'); g1 = gb(1); gl = g1.LocusTag; gid = g1.ProteinID; gtr = g1.Translation; gsq = g1.Sequence; g2 = gb(2); gl2 = g2.LocusTag; gid2 = g2.ProteinID; gtr2 = g2.Translation;"
+        ))
+        .unwrap();
+        assert_eq!(s.get("h1"), Some(&Value::Str("seq1 locus_tag=gene1".into())));
+        assert_eq!(s.get("q1"), Some(&Value::Str("MKV".into())));
+        assert_eq!(s.get("gl"), Some(&Value::Str("gene1".into())));
+        assert_eq!(s.get("gid"), Some(&Value::Str("P1".into())));
+        assert_eq!(s.get("gtr"), Some(&Value::Str("MKV".into())));
+        assert_eq!(s.get("gl2"), Some(&Value::Str("gene2".into())));
+        assert_eq!(s.get("gid2"), Some(&Value::Str("P2".into())));
+        assert_eq!(s.get("gtr2"), Some(&Value::Str("GG".into())));
+        assert_eq!(s.get("gsq"), Some(&Value::Str("atggccgttgga".into())));
+        let out = std::fs::read_to_string(dir.join("sample.fasta.out")).unwrap();
+        assert!(out.contains(">seq1") && out.contains("MKV"));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn clustering_graphs_and_visual_metrics() {
+        use matplot::SeriesKind;
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "X = [0 0; 1 0; 0 2; 3 3]; Y = [0 1; 2 2]; D2 = pdist2(X, Y); dj = pdist([1 0;0 1;1 1], 'jaccard'); \
+             Z = linkage(pdist(X), 'average'); cl = cluster(Z, 'maxclust', 2); \
+             cp = cophenet(Z, pdist(X)); sil = silhouette(X, cl); silm = mean(silhouette([0 0;1 0;10 0;11 0], [1;1;2;2])); cm = confusionmat([1 1 2 2], [1 2 2 2]); \
+             score = clustermetrics([1 1 2 2], [1 1 2 2]); ari = score.ARI; nmi = score.NMI; jj = jaccard([1 0 1 1], [1 1 0 1]); sm = setmetrics([1 2 3], [2 3 4]); prec = sm.Precision;",
+        )
+        .unwrap();
+        assert_eq!(s.get("D2").map(|v| v.dims()), Some((4, 2)));
+        assert!((s.get("D2").and_then(|v| v.to_matrix().ok()).map(|m| m.get(0, 1).unwrap_or(0.0)).unwrap_or(0.0) - 8f64.sqrt()).abs() < 1e-12);
+        assert_eq!(vec(&s, "dj"), vec![1.0, 0.5, 0.5]);
+        assert_eq!(vec(&s, "cl").len(), 4);
+        assert!(vec(&s, "cl").iter().all(|v| *v <= 2.0));
+        assert!(scalar(&s, "cp").is_finite());
+        assert_eq!(vec(&s, "sil").len(), 4);
+        assert!((scalar(&s, "silm") - 0.8997).abs() < 1e-3);
+        assert_eq!(s.get("cm").map(|v| v.dims()), Some((2, 2)));
+        assert!((scalar(&s, "ari") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "nmi") - 1.0).abs() < 1e-12);
+        assert_eq!(scalar(&s, "jj"), 0.5);
+        assert!((scalar(&s, "prec") - 2.0 / 3.0).abs() < 1e-12);
+
+        s.run("clf; dendrogram(Z, 'Labels', {'a','b','c','d'}, 'ColorThreshold', 2);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Dendrogram);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; venn({'a','b','c'}, {'b','c','d'}, {'c','e'}); vc = venncounts({'a','b','c'}, {'b','c','d'}, {'c','e'});").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Venn);
+        assert_eq!(s.get("vc").map(|v| v.dims()), Some((8, 4)));
+        assert!(matplot::to_svg(&s.figs[0]).contains("<circle"));
+
+        s.run("clf; quiver(1:3, 1:3, ones(1,3), zeros(1,3));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Quiver);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; quiver3(1:2,1:2,1:2,ones(1,2),zeros(1,2),ones(1,2));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Quiver3);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; volcano([-3 -1 0 1 3], [0.001 0.2 0.5 0.01 0.0001]);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Scatter);
+        assert_eq!(s.figs[0].series[0].colors.len(), 5);
+        assert_eq!(s.figs[0].title.as_deref(), Some("volcano"));
+        assert!(matplot::to_svg(&s.figs[0]).contains("stroke-dasharray"));
+
+        s.run("clf; heatmap(magic(5));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Image);
+        assert!(s.figs[0].colorbar);
+        assert_eq!(s.figs[0].title.as_deref(), Some("heatmap"));
+        assert_eq!(s.figs.len(), 1);
+
+        s.run("clf; [mx, my] = meshgrid(-1:1); surfl(mx.^2 + my.^2);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Surf);
+        assert!(s.figs[0].lighting);
+
+        s.run("G = graph([0 1 1 0;1 0 1 0;1 1 0 1;0 0 1 0]); nn = numnodes(G); ne = numedges(G); dg = degree(G); cc = conncomp(G); [p, dist] = shortestpath(G, 1, 4); pstr = strjoin(p, ','); nb = neighbors(G, 1); clf; plot(G); G2 = graph([0 2 0;0 0 3;0 0 0], {'a','b','c'}); G3 = digraph([0 2 0;0 0 3;0 0 0]); dg3 = degree(G3); G4 = graph([1 0;0 1], 'omitselfloops'); ne4 = numedges(G4);").unwrap();
+        assert_eq!(scalar(&s, "nn"), 4.0);
+        assert_eq!(scalar(&s, "ne"), 4.0);
+        assert_eq!(vec(&s, "dg"), vec![2.0, 2.0, 3.0, 1.0]);
+        assert_eq!(vec(&s, "cc"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s.get("pstr"), Some(&Value::Str("1,3,4".into())));
+        assert_eq!(vec(&s, "dg3"), vec![1.0, 2.0, 1.0]);
+        assert_eq!(scalar(&s, "ne4"), 0.0);
+        assert_eq!(scalar(&s, "dist"), 2.0);
+        assert_eq!(
+            s.get("nb").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(2)
+        );
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Graph);
+        let svg = matplot::to_svg(&s.figs[0]);
+        assert!(svg.contains("<circle") && svg.contains("<line"));
     }
 
     #[test]

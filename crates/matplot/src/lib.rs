@@ -28,13 +28,20 @@ pub struct Series {
     /// `ImageRgb` pixel payload — row-major RGBA8, `zshape` = (rows, cols).
     /// `None` for every other kind.
     pub rgba: Option<Vec<u8>>,
+    /// Per-point/per-link colours (scatter, dendrogram, graph, volcano).
+    pub colors: Vec<Rgb>,
+    /// `quiver`/`quiver3` vectors paired with `x`/`y`/`z` bases.
+    pub vectors: Vec<(f64, f64, f64)>,
     pub spec: LineSpec,
 }
 
 impl Series {
     /// True for kinds drawn by the 3-D projected path.
     fn is_3d(&self) -> bool {
-        matches!(self.kind, SeriesKind::Line3 | SeriesKind::Mesh | SeriesKind::Surf | SeriesKind::Contour3 | SeriesKind::Contour3Base)
+        matches!(
+            self.kind,
+            SeriesKind::Line3 | SeriesKind::Mesh | SeriesKind::Surf | SeriesKind::Contour3 | SeriesKind::Contour3Base | SeriesKind::Quiver3
+        )
     }
 }
 
@@ -70,6 +77,16 @@ pub enum SeriesKind {
     Contour3,
     /// `surfc` - iso-lines projected on the base plane.
     Contour3Base,
+    /// `dendrogram` — hierarchical-clustering tree from a linkage matrix.
+    Dendrogram,
+    /// `quiver` — 2-D vector field arrows.
+    Quiver,
+    /// `quiver3` — 3-D vector field arrows.
+    Quiver3,
+    /// `venn` — 2–4 set overlap diagram.
+    Venn,
+    /// `graph` — node/edge network.
+    Graph,
     /// `text` — a string anchored at a data point: `x[0]`/`y[0]` carry
     /// the anchor, `labels[0]` the text, `spec.color` the colour.
     Text,
@@ -677,7 +694,20 @@ impl Figure {
         {
             spec.dash = DashStyle::None;
         }
-        self.series.push(Series { kind, x, y, z: Vec::new(), zshape: (0, 0), levels: Vec::new(), labels: Vec::new(), err, rgba: None, spec });
+        self.series.push(Series {
+            kind,
+            x,
+            y,
+            z: Vec::new(),
+            zshape: (0, 0),
+            levels: Vec::new(),
+            labels: Vec::new(),
+            err,
+            rgba: None,
+            colors: Vec::new(),
+            vectors: Vec::new(),
+            spec,
+        });
     }
 
     /// `plot3` — a 3-D point-list series.
@@ -695,6 +725,8 @@ impl Figure {
             labels: Vec::new(),
             err: None,
             rgba: None,
+            colors: Vec::new(),
+            vectors: Vec::new(),
             spec,
         });
     }
@@ -717,7 +749,110 @@ impl Figure {
         if spec.color.is_none() {
             spec.color = Some(self.next_color());
         }
-        self.series.push(Series { kind, x, y, z, zshape: (rows, cols), levels, labels: Vec::new(), err: None, rgba: None, spec });
+        self.series.push(Series {
+            kind,
+            x,
+            y,
+            z,
+            zshape: (rows, cols),
+            levels,
+            labels: Vec::new(),
+            err: None,
+            rgba: None,
+            colors: Vec::new(),
+            vectors: Vec::new(),
+            spec,
+        });
+    }
+
+    /// `dendrogram` — a linkage tree. `z` is the column-major n-1×3
+    /// linkage matrix; `labels` are leaf labels and `colors` optionally
+    /// colour each merge.
+    pub fn push_dendrogram(&mut self, z: Vec<f64>, rows: usize, labels: Vec<String>, colors: Vec<Rgb>) {
+        let mut spec = LineSpec::new();
+        spec.color = Some(self.next_color());
+        let n = rows.saturating_add(1);
+        let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = vec![0.0];
+        for r in 0..rows {
+            y.push(z.get(r.saturating_mul(3).saturating_add(2)).copied().unwrap_or(0.0));
+        }
+        self.series.push(Series {
+            kind: SeriesKind::Dendrogram,
+            x,
+            y,
+            z,
+            zshape: (rows, 3),
+            levels: Vec::new(),
+            labels,
+            err: None,
+            rgba: None,
+            colors,
+            vectors: Vec::new(),
+            spec,
+        });
+    }
+
+    /// `quiver`/`quiver3` — base points and vectors.
+    pub fn push_quiver(&mut self, kind: SeriesKind, x: Vec<f64>, y: Vec<f64>, z: Vec<f64>, vectors: Vec<(f64, f64, f64)>, mut spec: LineSpec) {
+        if spec.color.is_none() {
+            spec.color = Some(self.next_color());
+        }
+        self.series.push(Series {
+            kind,
+            x,
+            y,
+            z,
+            zshape: (0, 0),
+            levels: Vec::new(),
+            labels: Vec::new(),
+            err: None,
+            rgba: None,
+            colors: Vec::new(),
+            vectors,
+            spec,
+        });
+    }
+
+    /// `venn` — 2–4 sets. `z` holds intersection counts indexed by bitmask.
+    pub fn push_venn(&mut self, labels: Vec<String>, counts: Vec<f64>, colors: Vec<Rgb>) {
+        let mut spec = LineSpec::new();
+        spec.color = Some(CYCLE[0]);
+        self.series.push(Series {
+            kind: SeriesKind::Venn,
+            x: vec![-1.2, 1.2],
+            y: vec![-1.2, 1.2],
+            z: counts,
+            zshape: (labels.len(), 0),
+            levels: Vec::new(),
+            labels,
+            err: None,
+            rgba: None,
+            colors,
+            vectors: Vec::new(),
+            spec,
+        });
+    }
+
+    /// `graph`/`digraph` — node positions plus a column-major adjacency matrix.
+    pub fn push_graph(&mut self, x: Vec<f64>, y: Vec<f64>, adjacency: Vec<f64>, labels: Vec<String>, directed: bool, colors: Vec<Rgb>) {
+        let n = x.len();
+        let mut spec = LineSpec::new();
+        spec.color = Some(Rgb(0x77, 0x77, 0x77));
+        self.series.push(Series {
+            kind: SeriesKind::Graph,
+            x,
+            y,
+            z: adjacency,
+            zshape: (n, n),
+            levels: vec![if directed { 1.0 } else { 0.0 }],
+            labels,
+            err: None,
+            rgba: None,
+            colors,
+            vectors: Vec::new(),
+            spec,
+        });
     }
 
     /// `pie` — slice values and labels.
@@ -734,6 +869,8 @@ impl Figure {
             labels,
             err: None,
             rgba: None,
+            colors: Vec::new(),
+            vectors: Vec::new(),
             spec,
         });
     }
@@ -755,6 +892,8 @@ impl Figure {
             labels: vec![label],
             err: None,
             rgba: None,
+            colors: Vec::new(),
+            vectors: Vec::new(),
             spec,
         });
     }
@@ -773,6 +912,8 @@ impl Figure {
             labels: Vec::new(),
             err: None,
             rgba: Some(rgba),
+            colors: Vec::new(),
+            vectors: Vec::new(),
             spec: LineSpec::new(),
         });
     }
@@ -1323,6 +1464,184 @@ preserveAspectRatio=\"none\" href=\"data:image/png;base64,{}\"/>\n",
                     }
                 }
             }
+            SeriesKind::Dendrogram => {
+                let rows = s.zshape.0;
+                if rows == 0 {
+                    continue;
+                }
+                let n = rows + 1;
+                let mut left = vec![0.0f64; 2 * n + 2];
+                let mut right = vec![0.0f64; 2 * n + 2];
+                let mut height = vec![0.0f64; 2 * n + 2];
+                for i in 1..=n {
+                    left[i] = i as f64;
+                    right[i] = i as f64;
+                }
+                for r in 0..rows {
+                    let a = s.z.get(r * 3).copied().unwrap_or(0.0).round() as usize;
+                    let b = s.z.get(r * 3 + 1).copied().unwrap_or(0.0).round() as usize;
+                    let h = s.z.get(r * 3 + 2).copied().unwrap_or(0.0);
+                    let new = n + r + 1;
+                    let xa = (left.get(a).copied().unwrap_or(0.0) + right.get(a).copied().unwrap_or(0.0)) / 2.0;
+                    let xb = (left.get(b).copied().unwrap_or(0.0) + right.get(b).copied().unwrap_or(0.0)) / 2.0;
+                    let ya = height.get(a).copied().unwrap_or(0.0);
+                    let yb = height.get(b).copied().unwrap_or(0.0);
+                    let color = s.colors.get(r).copied().or(s.spec.color).unwrap_or(CYCLE[0]).hex();
+                    let (p1, p2) = (sx(xa), sy(ya));
+                    let (p3, p4) = (sx(xa), sy(h));
+                    let (p5, p6) = (sx(xb), sy(yb));
+                    let (p7, p8) = (sx(xb), sy(h));
+                    if [p1, p2, p3, p4, p5, p6, p7, p8].iter().all(|v| v.is_finite()) {
+                        o.push_str(&format!("<path d=\"M{:.2},{:.2}L{:.2},{:.2}M{:.2},{:.2}L{:.2},{:.2}M{:.2},{:.2}L{:.2},{:.2}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.4\"/>\n", p1,p2,p3,p4,p5,p6,p7,p8,p3,p4,p7,p8));
+                    }
+                    let new_left = left[a].min(left[b]);
+                    if let Some(slot) = left.get_mut(new) {
+                        *slot = new_left;
+                    }
+                    let new_right = right[a].max(right[b]);
+                    if let Some(slot) = right.get_mut(new) {
+                        *slot = new_right;
+                    }
+                    if let Some(slot) = height.get_mut(new) {
+                        *slot = h;
+                    }
+                }
+                for (i, label) in s.labels.iter().enumerate().take(n) {
+                    let p = sx((i + 1) as f64);
+                    let q = sy(0.0);
+                    if p.is_finite() && q.is_finite() {
+                        o.push_str(&format!(
+                            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"9\" fill=\"#1a1a1a\" text-anchor=\"middle\">{}</text>\n",
+                            p,
+                            q + 11.0,
+                            esc(label)
+                        ));
+                    }
+                }
+            }
+            SeriesKind::Quiver => {
+                let color = s.spec.color.unwrap_or(CYCLE[0]).hex();
+                for i in 0..s.x.len().min(s.y.len()).min(s.vectors.len()) {
+                    let (x0, y0) = (sx(s.x[i]), sy(s.y[i]));
+                    let (u, v, _) = s.vectors[i];
+                    let (x1, y1) = (sx(s.x[i] + u), sy(s.y[i] + v));
+                    if ![x0, y0, x1, y1].iter().all(|z| z.is_finite()) {
+                        continue;
+                    }
+                    let (dx, dy) = (x1 - x0, y1 - y0);
+                    let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let (ux, uy) = (dx / len, dy / len);
+                    let (px, py) = (-uy, ux);
+                    let (ax, ay) = (x1 - 7.0 * ux, y1 - 7.0 * uy);
+                    o.push_str(&format!("<path d=\"M{:.2},{:.2}L{:.2},{:.2}M{:.2},{:.2}L{:.2},{:.2}M{:.2},{:.2}L{:.2},{:.2}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.2\"/>\n", x0,y0,x1,y1,ax+3.0*px,ay+3.0*py,x1,y1,ax-3.0*px,ay-3.0*py,x1,y1));
+                }
+            }
+            SeriesKind::Venn => {
+                let n = s.zshape.0;
+                if !(2..=4).contains(&n) {
+                    continue;
+                }
+                let centers: Vec<(f64, f64)> = match n {
+                    2 => vec![(-0.55, 0.0), (0.55, 0.0)],
+                    3 => vec![(0.0, 0.55), (-0.48, -0.32), (0.48, -0.32)],
+                    _ => vec![(-0.45, -0.45), (0.45, -0.45), (-0.45, 0.45), (0.45, 0.45)],
+                };
+                let radius = if n == 4 { 0.62 } else { 0.72 };
+                for (i, (cx, cy)) in centers.iter().enumerate() {
+                    let color = s.colors.get(i).copied().unwrap_or(CYCLE[i % CYCLE.len()]).hex();
+                    o.push_str(&format!(
+                        "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"0.20\" stroke=\"{}\" stroke-width=\"1.5\"/>\n",
+                        sx(*cx),
+                        sy(*cy),
+                        radius * 70.0,
+                        color,
+                        color
+                    ));
+                }
+                for (i, label) in s.labels.iter().enumerate().take(n) {
+                    let (cx, cy) = centers[i];
+                    o.push_str(&format!(
+                        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"10\" fill=\"#1a1a1a\" text-anchor=\"middle\">{}</text>\n",
+                        sx(cx),
+                        sy(cy),
+                        esc(label)
+                    ));
+                }
+                for mask in 1..(1usize << n) {
+                    let inc: Vec<(f64, f64)> = (0..n).filter(|k| mask & (1 << k) != 0).map(|k| centers[k]).collect();
+                    if inc.is_empty() {
+                        continue;
+                    }
+                    let (mut px, mut py) = (0.0, 0.0);
+                    for (x, y) in &inc {
+                        px += x;
+                        py += y;
+                    }
+                    px /= inc.len() as f64;
+                    py /= inc.len() as f64;
+                    let count = s.z.get(mask).copied().unwrap_or(0.0);
+                    if count > 0.0 {
+                        o.push_str(&format!(
+                            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"9\" fill=\"#1a1a1a\" text-anchor=\"middle\">{}</text>\n",
+                            sx(px),
+                            sy(py),
+                            count
+                        ));
+                    }
+                }
+            }
+            SeriesKind::Graph => {
+                let n = s.zshape.0;
+                let directed = s.levels.first().copied().unwrap_or(0.0) != 0.0;
+                let edge_color = s.spec.color.unwrap_or(Rgb(0x77, 0x77, 0x77)).hex();
+                for i in 0..n {
+                    for j in 0..n {
+                        let w = s.z.get(j * n + i).copied().unwrap_or(0.0);
+                        if w == 0.0 || i == j || (!directed && j < i) {
+                            continue;
+                        }
+                        let (x0, y0) = (sx(s.x.get(i).copied().unwrap_or(0.0)), sy(s.y.get(i).copied().unwrap_or(0.0)));
+                        let (x1, y1) = (sx(s.x.get(j).copied().unwrap_or(0.0)), sy(s.y.get(j).copied().unwrap_or(0.0)));
+                        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+                            continue;
+                        }
+                        o.push_str(&format!(
+                            "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{edge_color}\" stroke-width=\"1.2\"/>\n",
+                            x0, y0, x1, y1
+                        ));
+                        if directed {
+                            let dx = x1 - x0;
+                            let dy = y1 - y0;
+                            let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                            let (ux, uy) = (dx / len, dy / len);
+                            let (ax, ay) = (x1 - 8.0 * ux, y1 - 8.0 * uy);
+                            o.push_str(&format!(
+                                "<path d=\"M{ax:.2},{ay:.2}L{:.2},{:.2}L{:.2},{:.2}Z\" fill=\"{edge_color}\"/>\n",
+                                ax - 4.0 * ux - 3.0 * uy,
+                                ay - 4.0 * uy + 3.0 * ux,
+                                ax - 4.0 * ux + 3.0 * uy,
+                                ay - 4.0 * uy - 3.0 * ux
+                            ));
+                        }
+                    }
+                }
+                for i in 0..n {
+                    let p = (sx(s.x.get(i).copied().unwrap_or(0.0)), sy(s.y.get(i).copied().unwrap_or(0.0)));
+                    if !p.0.is_finite() || !p.1.is_finite() {
+                        continue;
+                    }
+                    let color = s.colors.get(i).copied().unwrap_or(CYCLE[0]).hex();
+                    o.push_str(&format!("<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"7\" fill=\"{}\" stroke=\"#333333\"/>\n", p.0, p.1, color));
+                    if let Some(label) = s.labels.get(i) {
+                        o.push_str(&format!(
+                            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"9\" fill=\"#1a1a1a\" text-anchor=\"middle\">{}</text>\n",
+                            p.0,
+                            p.1 - 9.0,
+                            esc(label)
+                        ));
+                    }
+                }
+            }
             SeriesKind::ContourF => {
                 let (cl, ch) = caxis(fig);
                 let span = (ch - cl).abs().max(f64::EPSILON);
@@ -1411,7 +1730,8 @@ preserveAspectRatio=\"none\" href=\"data:image/png;base64,{}\"/>\n",
         if let Some(mk) = marker {
             for i in 0..n {
                 if let Some((x, y)) = pt(i) {
-                    draw_marker(o, mk, x, y, &col);
+                    let point_color = s.colors.get(i).map(|c| c.hex()).unwrap_or_else(|| col.clone());
+                    draw_marker(o, mk, x, y, &point_color);
                 }
             }
         }
@@ -1818,6 +2138,20 @@ fn draw_axes3d(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64,
                                 draw_marker(o, mk, p.0, p.1, &col);
                             }
                         }
+                    }
+                }
+            }
+            SeriesKind::Quiver3 => {
+                let color = s.spec.color.unwrap_or(CYCLE[0]).hex();
+                for i in 0..s.x.len().min(s.y.len()).min(s.z.len()).min(s.vectors.len()) {
+                    let (u, v, w) = s.vectors[i];
+                    let p0 = px(prj(s.x[i], s.y[i], s.z[i]));
+                    let p1 = px(prj(s.x[i] + u, s.y[i] + v, s.z[i] + w));
+                    if [p0.0, p0.1, p1.0, p1.1].iter().all(|v| v.is_finite()) {
+                        o.push_str(&format!(
+                            "<path d=\"M{:.2},{:.2}L{:.2},{:.2}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.3\"/>\n",
+                            p0.0, p0.1, p1.0, p1.1
+                        ));
                     }
                 }
             }

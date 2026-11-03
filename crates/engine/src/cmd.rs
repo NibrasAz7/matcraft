@@ -61,8 +61,20 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid pidtune margin nyquist isstable damp bandwidth",
     ),
     (
+        "graph objects",
+        "graph digraph gplot numnodes numedges degree conncomp neighbors shortestpath distances bfsearch dfsearch adjacency isgraph",
+    ),
+    (
+        "distances and clustering",
+        "pdist pdist2 squareform jaccard jaccarddistance setmetrics confusionmat clustermetrics cluster clusterdata cophenet silhouette linkage optimalleaforder",
+    ),
+    (
+        "chemistry and sequences",
+        "formulaatoms formulaweight formulacheck inferformula parsereaction formatreaction canonicalreaction rxnequal rxnbalance gprparse gpreval gprgenes gprmerge fastaread fastawrite genbankread",
+    ),
+    (
         "statistics",
-        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv wblpdf wblcdf wblinv lognpdf logncdf logninv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd wblrnd lognrnd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest chi2gof pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap tsne corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween fitlm optimalleaforder",
+        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv wblpdf wblcdf wblinv lognpdf logncdf logninv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd wblrnd lognrnd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest chi2gof pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap tsne corr tabulate gammaln hygecdf nchoosek partialcorr isoutlier isbetween fitlm",
     ),
     ("ode", "ode45 ode15s ode23 ode23s dde23 odeset odeget deval"),
     (
@@ -94,7 +106,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
         "files/path",
         "save load type addpath rmpath savepath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir",
     ),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar contourf contour3 semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lighting light lines validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf surfc mesh vline xline saveas exportgraphics print"),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar contourf contour3 semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lighting light lines volcano dendrogram venn venncounts quiver quiver3 heatmap validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf surfl surfc mesh vline xline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.

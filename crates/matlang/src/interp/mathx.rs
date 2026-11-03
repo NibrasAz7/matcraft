@@ -628,10 +628,22 @@ impl Session {
                         if !active[k] || k == i || k == j {
                             continue;
                         }
+                        let dij = dist[i][j];
                         let d = match method.as_str() {
                             "complete" => dist[i][k].max(dist[j][k]),
                             "average" | "upgma" => (dist[i][k] * ci + dist[j][k] * cj) / (ci + cj),
-                            "weighted" => (dist[i][k] + dist[j][k]) / 2.0,
+                            "weighted" | "wpgma" => (dist[i][k] + dist[j][k]) / 2.0,
+                            "ward" | "ward.d2" => {
+                                let nk = clusters[k].len() as f64;
+                                (((ci + nk) * dist[i][k] * dist[i][k] + (cj + nk) * dist[j][k] * dist[j][k] - nk * dij * dij) / (ci + cj + nk))
+                                    .max(0.0)
+                                    .sqrt()
+                            }
+                            "centroid" | "upgmc" => (((ci * dist[i][k] * dist[i][k] + cj * dist[j][k] * dist[j][k]) / (ci + cj))
+                                - ci * cj * dij * dij / ((ci + cj) * (ci + cj)))
+                                .max(0.0)
+                                .sqrt(),
+                            "median" | "wpgmc" => (0.5 * dist[i][k] * dist[i][k] + 0.5 * dist[j][k] * dist[j][k] - 0.25 * dij * dij).max(0.0).sqrt(),
                             _ => dist[i][k].min(dist[j][k]),
                         };
                         dist[i][k] = d;
