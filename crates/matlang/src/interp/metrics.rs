@@ -626,13 +626,20 @@ impl Session {
                 Ok(vec![Value::Struct(s)])
             }
             "confusionmat" => {
-                let t = label_map(argv.first().ok_or_else(|| LangError::new("confusionmat needs true labels", 0))?)?;
-                let p = label_map(argv.get(1).ok_or_else(|| LangError::new("confusionmat needs predicted labels", 0))?)?;
+                let tv = argv.first().ok_or_else(|| LangError::new("confusionmat needs true labels", 0))?;
+                let pv = argv.get(1).ok_or_else(|| LangError::new("confusionmat needs predicted labels", 0))?;
+                let numeric = matches!(tv, Value::Num(_) | Value::Mat(_)) && matches!(pv, Value::Num(_) | Value::Mat(_));
+                let t = label_map(tv)?;
+                let p = label_map(pv)?;
                 if t.len() != p.len() {
                     return Err(LangError::new("confusionmat: label vectors must have the same length", 0));
                 }
                 let mut labels: Vec<String> = t.iter().chain(p.iter()).cloned().collect();
-                labels.sort();
+                if numeric {
+                    labels.sort_by(|a, b| a.parse::<f64>().unwrap_or(0.0).total_cmp(&b.parse::<f64>().unwrap_or(0.0)));
+                } else {
+                    labels.sort();
+                }
                 labels.dedup();
                 let mut c = Matrix::zeros(labels.len(), labels.len());
                 for (a, b) in t.iter().zip(p.iter()) {

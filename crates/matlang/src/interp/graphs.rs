@@ -369,7 +369,7 @@ impl Session {
                                 return Err(LangError::new("distances: source out of range", 0));
                             }
                             let (d, _) = dijkstra(&a, s - 1, directed);
-                            Ok(vec![Value::Mat(Matrix::col_vector(d))])
+                            Ok(vec![Value::Mat(Matrix::row_vector(d))])
                         }
                     }
                     "bfsearch" | "dfsearch" => {
@@ -405,7 +405,7 @@ impl Session {
                             dfs(s - 1, &a, directed, &mut seen, &mut order);
                         }
                         let _ = nout;
-                        Ok(vec![Value::Mat(Matrix::col_vector(order))])
+                        Ok(vec![Value::Mat(Matrix::row_vector(order))])
                     }
                     _ => Err(LangError::new(format!("{name}: unsupported graph operation"), 0)),
                 }

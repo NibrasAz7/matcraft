@@ -49,7 +49,7 @@ filled in as the dictionary grows.
 | `neighbors(G,u)` | Names/IDs of the nodes adjacent to `u`. | `neighbors(G, 1)` | `{'2','3'}` |
 | `shortestpath(G,s,t)` | Dijkstra shortest path; first output is a cellstr of node names, second is the distance. | `[p,d] = shortestpath(G, 2, 3)` | `p = {'2','1','3'}`, `d = 2` |
 | `distances(G)` | All-pairs shortest-path distance matrix (or one source row when a source is given). | `distances(G)` | `[0 1 1; 1 0 2; 1 2 0]` |
-| `bfsearch(G,s)` / `dfsearch(G,s)` | Breadth-first / depth-first node order from `s`. | `bfsearch(G, 1)` | `[1; 2; 3]` |
+| `bfsearch(G,s)` / `dfsearch(G,s)` | Breadth-first / depth-first node order from `s`. | `bfsearch(G, 1)` | `[1 2 3]` |
 | `adjacency(G)` | Returns the underlying adjacency matrix. | `adjacency(G)` | the original matrix |
 | `isgraph(G)` | True for `graph` and `digraph` objects. | `isgraph(G)` | `1` |
 
