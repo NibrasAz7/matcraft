@@ -8,11 +8,15 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ast;
+mod hdf5;
 mod imgpng;
 pub mod interp;
 pub mod lexer;
 pub mod matfile;
+mod mcos;
+mod netcdf;
 pub mod parser;
+mod xlsx;
 
 pub use interp::{describe, fmt_num, fmt_value, read_m_source, Breakpoint, CellArray, PauseInfo, Session, Value, BUILTIN_NAMES, DEBUG_PAUSE_ID};
 // Re-export the numeric core types callers need to inspect `Value::Cplx`

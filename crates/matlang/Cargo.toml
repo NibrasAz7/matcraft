@@ -12,7 +12,16 @@ workspace = true
 matcore = { path = "../matcore" }
 matplot = { path = "../matplot" }
 flate2 = "1.1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 regex = "1"
+serde_json = "1"
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-atomic = { path = "../../../craft-libs/crates/atomic" }
+ureq = "3"
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }

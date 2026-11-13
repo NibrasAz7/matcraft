@@ -15,6 +15,28 @@ use matcore::{CMatrix, CNum, MatError, Matrix};
 use crate::ast::{BinOp, Expr, MultiTarget, PathStep, Stmt, UnOp};
 use crate::LangError;
 
+mod anova;
+mod bio;
+mod com;
+mod control;
+mod corpus;
+mod ga;
+mod gpu;
+mod graphs;
+mod hdf5;
+mod image;
+mod maps;
+mod mathx;
+mod metrics;
+mod netcdf;
+mod ode;
+mod optim;
+mod stats;
+mod streams;
+mod tsne;
+mod umap;
+mod xlsx;
+
 /// Hard caps so hostile or buggy scripts terminate.
 const MAX_LOOP_ITERS: usize = 1_000_000;
 const MAX_RANGE_LEN: usize = 1_000_000;
@@ -103,15 +125,96 @@ struct FuncDef {
     outputs: Vec<String>,
     body: Vec<Stmt>,
     /// Path of the `.m` file the function was defined in ("" for eval'd
-    /// code) — backs `mfilename`.
+    /// code) - backs `mfilename`.
     file: String,
-    /// `methods (Static)` — the call passes no implicit object argument.
+    /// `methods (Static)` - the call passes no implicit object argument.
     is_static: bool,
+    /// Class that owns a method definition (`None` for plain functions);
+    /// drives `private`/`protected` access checks.
+    owner: Option<String>,
+}
+
+/// Member visibility from a classdef attribute list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Access {
+    #[default]
+    Public,
+    Protected,
+    Private,
+}
+
+impl Access {
+    fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "private" => Access::Private,
+            "protected" => Access::Protected,
+            _ => Access::Public,
+        }
+    }
+    fn allows(self, owner: &str, caller: Option<&str>, is_subclass: bool) -> bool {
+        match self {
+            Access::Public => true,
+            Access::Private => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)),
+            Access::Protected => caller.is_some_and(|c| c.eq_ignore_ascii_case(owner)) || is_subclass,
+        }
+    }
+}
+
+fn access_name(a: Access) -> &'static str {
+    match a {
+        Access::Public => "public",
+        Access::Protected => "protected",
+        Access::Private => "private",
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PropAttr {
+    get_access: Access,
+    set_access: Access,
+    constant: bool,
+    dependent: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MethodAttr {
+    access: Access,
+    abstract_: bool,
+}
+
+/// One live `addlistener` registration on a handle object.
+#[derive(Debug, Clone)]
+struct EventListener {
+    id: u64,
+    event: String,
+    callback: Value,
+    enabled: bool,
+}
+
+/// Hidden property field carrying dynamic-property metadata. The leading
+/// control character makes the name unspellable in M-code and easy to filter
+/// from introspection/display while still serializing with the object.
+const DYNPROPS_FIELD: &str = "\u{1}dynamic_props";
+
+#[derive(Debug, Clone)]
+struct DynPropMeta {
+    name: String,
+    get: Access,
+    set: Access,
+    constant: bool,
+    dependent: bool,
+    hidden: bool,
+}
+
+fn is_internal_prop(name: &str) -> bool {
+    name.starts_with('\u{1}')
 }
 
 /// A `classdef` (or an `@dir` class shell) known to the session.
 #[derive(Debug, Clone, Default)]
 struct ClassDef {
+    /// Class name as declared.
+    name: String,
     /// `< super` names verbatim; resolution walks the first one (and
     /// compares on its last `.`-separated component).
     supers: Vec<String>,
@@ -124,8 +227,45 @@ struct ClassDef {
     sigs: HashMap<String, bool>,
     /// `enumeration` members: (name, value expression).
     enums: Vec<(String, Option<Expr>)>,
+    /// `events` names, in declaration order (inherited ones are resolved
+    /// through `supers` on lookup).
+    events: Vec<String>,
+    /// Property attributes by declared name (`Access`, `Constant`, …).
+    prop_attrs: HashMap<String, PropAttr>,
+    /// Method attributes by declared name (`Access`, `Abstract`, …).
+    method_attrs: HashMap<String, MethodAttr>,
+    /// Class-level attributes (`Sealed`, `Abstract`, …).
+    class_attrs: Vec<(String, String)>,
     /// `.m` file the classdef came from ("" for session-eval'd defs).
     file: String,
+}
+
+impl ClassDef {
+    fn attr_flag(&self, name: &str) -> bool {
+        attr_flag(&self.class_attrs, name)
+    }
+}
+
+fn attr_flag(attrs: &[(String, String)], name: &str) -> bool {
+    attrs.iter().any(|(k, v)| k.eq_ignore_ascii_case(name) && !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "no"))
+}
+
+fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+fn prop_attr_from(attrs: &[(String, String)]) -> PropAttr {
+    let access = attr_value(attrs, "Access");
+    PropAttr {
+        get_access: Access::parse(attr_value(attrs, "GetAccess").or(access).unwrap_or("public")),
+        set_access: Access::parse(attr_value(attrs, "SetAccess").or(access).unwrap_or("public")),
+        constant: attr_flag(attrs, "Constant"),
+        dependent: attr_flag(attrs, "Dependent"),
+    }
+}
+
+fn method_attr_from(attrs: &[(String, String)]) -> MethodAttr {
+    MethodAttr { access: Access::parse(attr_value(attrs, "Access").unwrap_or("public")), abstract_: attr_flag(attrs, "Abstract") }
 }
 
 /// One file behind an `fopen` fid. Shared `Read`/`Write`/`Seek` access on
@@ -183,11 +323,31 @@ pub struct MObject {
     /// Class name as written in `classdef`/`class(s,'name')`.
     pub class_name: String,
     props: ObjStore,
+    /// Live event listeners; only handle classes carry a store.
+    listeners: Option<std::rc::Rc<std::cell::RefCell<Vec<EventListener>>>>,
+    /// Windows COM automation session, when this object came from
+    /// `actxserver`.
+    com: Option<std::rc::Rc<std::cell::RefCell<com::ComSession>>>,
+    /// Non-empty when this object is an object-array proxy. Each entry is
+    /// a scalar object of the same class.
+    array: Option<Box<ObjectArray>>,
+}
+
+/// Heap payload for an object array, keeping `MObject` small.
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectArray {
+    elements: Vec<MObject>,
+    dims: Vec<usize>,
 }
 
 impl PartialEq for MObject {
     fn eq(&self, other: &Self) -> bool {
-        self.class_name == other.class_name && self.props_map() == other.props_map()
+        self.class_name == other.class_name
+            && match (&self.array, &other.array) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => self.props_map() == other.props_map(),
+                _ => false,
+            }
     }
 }
 
@@ -196,7 +356,104 @@ impl MObject {
         MObject {
             class_name,
             props: if handle { ObjStore::Shared(std::rc::Rc::new(std::cell::RefCell::new(props))) } else { ObjStore::Owned(props) },
+            listeners: if handle { Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))) } else { None },
+            com: None,
+            array: None,
         }
+    }
+
+    /// COM automation object: properties carry `ProgID`; the PowerShell
+    /// session lives behind a shared handle so copies talk to the same COM
+    /// object.
+    pub(crate) fn com_object(progid: &str, session: com::ComSession) -> Self {
+        let mut props = StructArray::new();
+        let _ = props.set_field(0, "ProgID", Value::Str(progid.to_string()));
+        MObject {
+            class_name: "COM".into(),
+            props: ObjStore::Owned(props),
+            listeners: None,
+            com: Some(std::rc::Rc::new(std::cell::RefCell::new(session))),
+            array: None,
+        }
+    }
+
+    fn com_session(&self) -> Option<std::rc::Rc<std::cell::RefCell<com::ComSession>>> {
+        self.com.clone()
+    }
+
+    pub(crate) fn array(class_name: String, elements: Vec<MObject>, dims: (usize, usize)) -> Self {
+        MObject {
+            class_name,
+            props: ObjStore::Owned(StructArray::new()),
+            listeners: None,
+            com: None,
+            array: Some(Box::new(ObjectArray { elements, dims: vec![dims.0, dims.1] })),
+        }
+    }
+
+    /// Rebuild a scalar object loaded from a MAT-file.
+    /// An empty handle-backed object used while resolving cyclic MCOS
+    /// graphs: the store is shared, so references created before the fields
+    /// are filled see the completed object.
+    pub(crate) fn handle_shell(class_name: String) -> Self {
+        MObject::new(class_name, StructArray::new(), true)
+    }
+
+    /// Replace the shared/owned property store of a shell object.
+    pub(crate) fn replace_props(&mut self, props: StructArray) {
+        match &mut self.props {
+            ObjStore::Owned(s) => *s = props,
+            ObjStore::Shared(s) => *s.borrow_mut() = props,
+        }
+    }
+
+    pub(crate) fn from_saved(class_name: String, props: StructArray) -> Self {
+        MObject::new(class_name, props, false)
+    }
+
+    pub(crate) fn is_array(&self) -> bool {
+        self.array.is_some()
+    }
+
+    pub(crate) fn array_dims(&self) -> Vec<usize> {
+        self.array.as_ref().map(|a| a.dims.clone()).unwrap_or_else(|| vec![1, 1])
+    }
+
+    pub(crate) fn array_elements(&self) -> Vec<MObject> {
+        self.array.as_ref().map(|a| a.elements.clone()).unwrap_or_else(|| vec![self.clone()])
+    }
+
+    /// Stable identity for handle objects (shared property store). Value
+    /// objects return 0; MCOS writing uses this to preserve cycles.
+    pub(crate) fn identity(&self) -> usize {
+        match &self.props {
+            ObjStore::Shared(s) => std::rc::Rc::as_ptr(s) as usize,
+            ObjStore::Owned(_) => 0,
+        }
+    }
+
+    /// Restore handle semantics after loading: object files store only
+    /// properties + class name, so the session reattaches the shared store
+    /// and listener table when the class is a handle class.
+    pub(crate) fn into_handle(self) -> Self {
+        if self.com.is_some() {
+            return self;
+        }
+        if let Some(arr) = self.array {
+            let elements = arr.elements.into_iter().map(|e| e.into_handle()).collect();
+            return MObject {
+                class_name: self.class_name,
+                props: ObjStore::Owned(StructArray::new()),
+                listeners: None,
+                com: None,
+                array: Some(Box::new(ObjectArray { elements, dims: arr.dims })),
+            };
+        }
+        if self.listeners.is_some() {
+            return self;
+        }
+        let props = self.props_map();
+        MObject::new(self.class_name, props, true)
     }
 
     /// Value-class constructor helper (`class(s,'name')` objects own
@@ -207,6 +464,9 @@ impl MObject {
 
     /// `obj.prop` — property value by name.
     fn prop(&self, name: &str) -> Option<Value> {
+        if self.array.is_some() {
+            return None;
+        }
         match &self.props {
             ObjStore::Owned(s) => s.field_at(0, name).cloned(),
             ObjStore::Shared(s) => s.borrow().field_at(0, name).cloned(),
@@ -214,6 +474,9 @@ impl MObject {
     }
 
     fn has_prop(&self, name: &str) -> bool {
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.has_prop(name);
+        }
         match &self.props {
             ObjStore::Owned(s) => s.has_field(name),
             ObjStore::Shared(s) => s.borrow().has_field(name),
@@ -222,6 +485,131 @@ impl MObject {
 
     /// `obj.prop = v` — writes through the shared store on handle
     /// classes, into the owned copy on value classes.
+    /// Remove a property (table variable deletion).
+    fn remove_prop(&mut self, name: &str) -> bool {
+        match &mut self.props {
+            ObjStore::Owned(s) => s.remove_field(name),
+            ObjStore::Shared(s) => s.borrow_mut().remove_field(name),
+        }
+    }
+
+    fn is_handle(&self) -> bool {
+        self.listeners.is_some()
+    }
+
+    /// Dynamic-property metadata stored in the hidden field.
+    fn dyn_props(&self) -> Vec<DynPropMeta> {
+        let Some(Value::Struct(s)) = self.prop(DYNPROPS_FIELD) else { return Vec::new() };
+        let mut out = Vec::with_capacity(s.numel());
+        for i in 0..s.numel() {
+            let name = match s.field_at(i, "Name") {
+                Some(Value::Str(v)) => v.clone(),
+                _ => continue,
+            };
+            let attr = |field: &str| match s.field_at(i, field) {
+                Some(Value::Str(v)) => Access::parse(v),
+                _ => Access::Public,
+            };
+            let flag = |field: &str| match s.field_at(i, field) {
+                Some(Value::Num(v)) => *v != 0.0,
+                _ => false,
+            };
+            out.push(DynPropMeta {
+                name,
+                get: attr("GetAccess"),
+                set: attr("SetAccess"),
+                constant: flag("Constant"),
+                dependent: flag("Dependent"),
+                hidden: flag("Hidden"),
+            });
+        }
+        out
+    }
+
+    fn store_dyn_props(&mut self, props: &[DynPropMeta]) {
+        if props.is_empty() {
+            self.remove_prop(DYNPROPS_FIELD);
+            return;
+        }
+        let mut s = StructArray::with_dims(1, props.len());
+        s.add_field("Name");
+        s.add_field("GetAccess");
+        s.add_field("SetAccess");
+        s.add_field("Constant");
+        s.add_field("Dependent");
+        s.add_field("Hidden");
+        for (i, p) in props.iter().enumerate() {
+            let _ = s.set_field(i, "Name", Value::Str(p.name.clone()));
+            let _ = s.set_field(i, "GetAccess", Value::Str(access_name(p.get).into()));
+            let _ = s.set_field(i, "SetAccess", Value::Str(access_name(p.set).into()));
+            let _ = s.set_field(i, "Constant", Value::Num(p.constant as u8 as f64));
+            let _ = s.set_field(i, "Dependent", Value::Num(p.dependent as u8 as f64));
+            let _ = s.set_field(i, "Hidden", Value::Num(p.hidden as u8 as f64));
+        }
+        self.set_prop(DYNPROPS_FIELD, Value::Struct(s));
+    }
+
+    fn dyn_prop(&self, name: &str) -> Option<DynPropMeta> {
+        self.dyn_props().into_iter().find(|p| p.name == name)
+    }
+
+    fn add_dyn_prop(&mut self, name: &str) {
+        if !self.has_prop(name) {
+            self.set_prop(name, Value::Mat(Matrix::zeros(0, 0)));
+        }
+        let mut props = self.dyn_props();
+        if !props.iter().any(|p| p.name == name) {
+            props.push(DynPropMeta {
+                name: name.to_string(),
+                get: Access::Public,
+                set: Access::Public,
+                constant: false,
+                dependent: false,
+                hidden: false,
+            });
+        }
+        self.store_dyn_props(&props);
+    }
+
+    fn remove_dyn_prop(&mut self, name: &str) -> bool {
+        let mut props = self.dyn_props();
+        let before = props.len();
+        props.retain(|p| p.name != name);
+        if props.len() == before {
+            return false;
+        }
+        self.store_dyn_props(&props);
+        self.remove_prop(name);
+        true
+    }
+
+    fn update_dyn_prop_attr(&mut self, name: &str, attr: &str, value: &Value) -> bool {
+        let mut props = self.dyn_props();
+        let Some(p) = props.iter_mut().find(|p| p.name == name) else { return false };
+        match attr {
+            "GetAccess" | "SetAccess" => {
+                let Value::Str(s) = value else { return false };
+                let access = Access::parse(s);
+                if attr == "GetAccess" {
+                    p.get = access;
+                } else {
+                    p.set = access;
+                }
+            }
+            "Constant" | "Dependent" | "Hidden" => {
+                let value = value.scalar().unwrap_or(0.0) != 0.0;
+                match attr {
+                    "Constant" => p.constant = value,
+                    "Dependent" => p.dependent = value,
+                    _ => p.hidden = value,
+                }
+            }
+            _ => return false,
+        }
+        self.store_dyn_props(&props);
+        true
+    }
+
     fn set_prop(&mut self, name: &str, v: Value) {
         match &mut self.props {
             ObjStore::Owned(s) => {
@@ -235,11 +623,17 @@ impl MObject {
 
     /// Property field names (engine/JSON introspection).
     pub fn prop_names(&self) -> Vec<String> {
-        self.props_map().field_names()
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.prop_names();
+        }
+        self.props_map().field_names().into_iter().filter(|n| !is_internal_prop(n)).collect()
     }
 
     /// Snapshot of the property struct (display, `fieldnames`, `get`).
-    fn props_map(&self) -> StructArray {
+    pub(crate) fn props_map(&self) -> StructArray {
+        if let Some(first) = self.array.as_ref().and_then(|a| a.elements.first()) {
+            return first.props_map();
+        }
         match &self.props {
             ObjStore::Owned(s) => s.clone(),
             ObjStore::Shared(s) => s.borrow().clone(),
@@ -767,6 +1161,11 @@ impl Value {
             Value::Str(_) => Err(LangError::new("string used where a number was expected", 0)),
             Value::Cell(_) => Err(LangError::new("cell array used where a number was expected", 0)),
             Value::Struct(_) => Err(LangError::new("struct used where a number was expected", 0)),
+            Value::Object(o) if o.class_name == "gpuArray" => match o.prop("Data") {
+                Some(Value::Mat(m)) => Ok(m),
+                Some(v) => v.to_matrix(),
+                None => Err(LangError::new("gpuArray has no data", 0)),
+            },
             Value::Object(o) => Err(LangError::new(format!("'{}' object used where a number was expected", o.class_name), 0)),
             Value::Func(_) => Err(LangError::new("function handle used where a number was expected", 0)),
         }
@@ -830,7 +1229,14 @@ impl Value {
             }
             Value::Cell(c) => c.shape(),
             Value::Struct(s) => (s.rows(), s.cols()),
-            Value::Object(_) => (1, 1),
+            Value::Object(o) if o.class_name == "gpuArray" => match o.prop("Data") {
+                Some(Value::Mat(m)) => m.shape(),
+                _ => (1, 1),
+            },
+            Value::Object(o) => {
+                let d = o.array_dims();
+                (d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1))
+            }
             Value::Sparse(s) => s.shape(),
             Value::Func(_) => (1, 1),
         }
@@ -848,6 +1254,55 @@ impl Value {
 }
 
 /// A live workspace: variables, RNG state, pending printed output.
+/// Where `savepath` stores the persistent search path. `MATCRAFT_PATH_FILE`
+/// overrides the platform default (useful for tests and portable installs).
+fn path_store_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("MATCRAFT_PATH_FILE") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(app) = std::env::var("APPDATA") {
+            return std::path::PathBuf::from(app).join("MatCraft").join("path.txt");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(".config").join("matcraft").join("path.txt");
+        }
+    }
+    std::path::PathBuf::from(".matcraft_path")
+}
+
+fn load_paths_from(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(file) {
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                let p = std::path::PathBuf::from(line);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn initial_paths() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::env::current_dir().map(|d| vec![d]).unwrap_or_default();
+    for p in load_paths_from(&path_store_file()) {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
 /// `Clone` so the engine's panic guard can snapshot/restore a session.
 #[derive(Clone)]
 pub struct Session {
@@ -912,16 +1367,34 @@ pub struct Session {
     /// Key into `persistents` for the function now executing (`None` at
     /// base/script scope).
     cur_func_key: Option<String>,
+    /// Class whose method is executing (`private`/`protected` checks).
+    cur_class: Option<String>,
+    /// True while a user `subsref`/`subsasgn` body is running, so its own
+    /// property access bypasses the custom dot dispatch.
+    subs_dot_guard: bool,
+    /// Next `addlistener` id.
+    next_listener_id: u64,
     /// `import pkg.*`/`import pkg.Name` specs recorded this session.
     imports: Vec<String>,
     /// Root-object defaults written via `set(0,'Default...',v)` — read back
     /// through `get(0,'Default...')`.
     defaults: HashMap<String, Value>,
+    /// `diary` target file and whether logging is active.
+    diary_file: Option<std::path::PathBuf>,
+    diary_active: bool,
+    /// Set when `diary` is called in the current run so a final `off` still
+    /// flushes output produced earlier in that run.
+    diary_touched: bool,
+    /// Per-figure application data (`setappdata`/`getappdata`).
+    appdata: HashMap<(usize, String), Value>,
+    /// `tiledlayout` grid and next tile index.
+    tile_layout: Option<(usize, usize)>,
+    tile_next: usize,
 }
 
 impl Session {
     pub fn new() -> Self {
-        let paths = std::env::current_dir().map(|d| vec![d]).unwrap_or_default();
+        let paths = initial_paths();
         Session {
             vars: HashMap::new(),
             rng: 0x9E3779B97F4A7C15,
@@ -951,8 +1424,17 @@ impl Session {
             persistents: HashMap::new(),
             frame_persist: HashSet::new(),
             cur_func_key: None,
+            cur_class: None,
+            subs_dot_guard: false,
+            next_listener_id: 1,
             imports: Vec::new(),
             defaults: HashMap::new(),
+            diary_file: None,
+            diary_active: false,
+            diary_touched: false,
+            appdata: HashMap::new(),
+            tile_layout: None,
+            tile_next: 0,
         }
     }
 
@@ -1146,7 +1628,15 @@ impl Session {
         self.hoist_functions(&bare, "");
         let mut out = String::new();
         match self.exec_lines("", &stmts, false, &mut out) {
-            Ok(()) => Ok(out),
+            Ok(()) => {
+                if self.diary_active || self.diary_touched {
+                    if let Some(path) = &self.diary_file {
+                        diary_write_to(path, &out);
+                    }
+                }
+                self.diary_touched = false;
+                Ok(out)
+            }
             Err(e) => {
                 if e.id == DEBUG_PAUSE_ID {
                     // Echo produced before the pause survives — it rejoins
@@ -1392,7 +1882,14 @@ impl Session {
                 Stmt::Function { name, params, outputs, body } => {
                     self.funcs.insert(
                         name.clone(),
-                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static: false },
+                        FuncDef {
+                            params: params.clone(),
+                            outputs: outputs.clone(),
+                            body: body.clone(),
+                            file: file.to_string(),
+                            is_static: false,
+                            owner: None,
+                        },
                     );
                     // Nested functions (a `function` inside an
                     // `end`-terminated body) register like file-local
@@ -1412,7 +1909,14 @@ impl Session {
                     let is_static = def.sigs.get(name).copied().unwrap_or(false);
                     def.methods.insert(
                         name.clone(),
-                        FuncDef { params: params.clone(), outputs: outputs.clone(), body: body.clone(), file: file.to_string(), is_static },
+                        FuncDef {
+                            params: params.clone(),
+                            outputs: outputs.clone(),
+                            body: body.clone(),
+                            file: file.to_string(),
+                            is_static,
+                            owner: None,
+                        },
                     );
                     break;
                 }
@@ -1423,15 +1927,25 @@ impl Session {
     /// Record a `Stmt::ClassDef` into `classes` — a later re-registration
     /// (edited file, re-run script) replaces the definition wholesale.
     fn register_class(&mut self, s: &Stmt, file: &str) {
-        let Stmt::ClassDef { name, supers, props, methods, enums } = s else { return };
+        let Stmt::ClassDef { name, supers, props, methods, enums, events, attrs } = s else { return };
         let mut def = ClassDef {
+            name: name.clone(),
             supers: supers.clone(),
             props: props.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
             enums: enums.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+            events: events.iter().map(|e| e.name.clone()).collect(),
+            class_attrs: attrs.clone(),
             file: file.to_string(),
             ..ClassDef::default()
         };
+        for p in props {
+            def.prop_attrs.insert(p.name.clone(), prop_attr_from(&p.attrs));
+        }
+        for e in events {
+            def.prop_attrs.insert(e.name.clone(), prop_attr_from(&e.attrs));
+        }
         for m in methods {
+            def.method_attrs.insert(m.name.clone(), method_attr_from(&m.attrs));
             if m.body.is_empty() {
                 def.sigs.insert(m.name.clone(), m.is_static);
             } else {
@@ -1444,6 +1958,7 @@ impl Session {
                         body: m.body.clone(),
                         file: file.to_string(),
                         is_static: m.is_static,
+                        owner: Some(name.clone()),
                     },
                 );
             }
@@ -2068,15 +2583,42 @@ impl Session {
                 }
                 Ok(Some(Value::Cell(ca)))
             }
-            Expr::BraceIndex(name, args) => {
-                let ca = match self.var_get(name) {
-                    Some(Value::Cell(c)) => c.clone(),
-                    Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
-                    None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
-                };
-                self.cell_content(&ca, args)
-            }
+            Expr::BraceIndex(name, args) => match self.var_get(name).cloned() {
+                Some(Value::Cell(c)) => {
+                    let picked = self.cell_pick(&c, args)?;
+                    match picked.len() {
+                        1 => Ok(picked.into_iter().next()),
+                        n => Err(LangError::new(
+                            format!("expected one output from a curly brace or dot indexing expression, but there were {n} results"),
+                            0,
+                        )),
+                    }
+                }
+                Some(Value::Object(o)) if o.class_name == "table" => self.table_brace_index(&o, args).map(Some),
+                Some(Value::Object(o)) => {
+                    if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                        let s = self.subs_struct("{}", args)?;
+                        let saved = self.subs_dot_guard;
+                        self.subs_dot_guard = true;
+                        let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                        self.subs_dot_guard = saved;
+                        Ok(result?.into_iter().next())
+                    } else {
+                        Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
+                    }
+                }
+                Some(_) => Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
+                None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
+            },
             Expr::Field(base, field) => {
+                if let Some(full) = Self::expr_dotted_name(e) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some(v) = self.resolve_dotted_value(&full)? {
+                            return Ok(Some(v));
+                        }
+                    }
+                }
                 let v = self.eval(base)?;
                 match v {
                     Value::Struct(m) => match m.field_values(field) {
@@ -2113,12 +2655,75 @@ impl Session {
                 }
             }
             Expr::Index(base, args) => {
-                // `obj.m(args)` — method-call syntax on a class instance:
+                // `pkg.func(args)` / `pkg.Class(args)` /
+                // `pkg.Class.method(args)` — resolve package members before
+                // treating the chain as field/index access.
+                if let Some(full) = Self::expr_dotted_name(base) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some((target, method)) = self.resolve_package_call(&full)? {
+                            let argv = self.eval_args(args)?;
+                            if let Some(m) = method {
+                                let def = self
+                                    .find_method(&target, &m)?
+                                    .ok_or_else(|| LangError::new(format!("package class '{target}' has no method '{m}'"), 0))?;
+                                return Ok(self.call_def(&m, &def, argv, 1, None)?.into_iter().next());
+                            }
+                            return Ok(self.call_function_argv(&target, argv, 1)?.into_iter().next());
+                        }
+                    }
+                }
+                // `obj.m(args)` - method-call syntax on a class instance:
                 // when `m` isn't a property the parens are the call's
                 // argument list, not subscripts (MATLAB resolves by
                 // declaration).
                 if let Expr::Field(b, fname) = base.as_ref() {
-                    if let Value::Object(o) = self.eval(b)? {
+                    if fname == "Map" {
+                        if let Expr::Ident(ns) = b.as_ref() {
+                            if ns == "containers" {
+                                let argv = self.eval_args(args)?;
+                                return Ok(Some(maps::new_from_args(&argv)?));
+                            }
+                        }
+                    }
+                    let base_val = self.eval(b)?;
+                    if let Value::Object(o) = &base_val {
+                        if o.class_name == "COM" {
+                            if let Some(session) = o.com_session() {
+                                let argv = self.eval_args(args)?;
+                                let out = session.borrow_mut().invoke(fname, &argv)?;
+                                return Ok(Some(out));
+                            }
+                        }
+                        if o.class_name == "containers.Map" {
+                            match fname.as_str() {
+                                "isKey" => {
+                                    let argv = self.eval_args(args)?;
+                                    let key = argv.first().ok_or_else(|| LangError::new("isKey needs a key", 0))?;
+                                    return Ok(Some(Value::Num(if maps::is_key(o, key) { 1.0 } else { 0.0 })));
+                                }
+                                "remove" => {
+                                    let argv = self.eval_args(args)?;
+                                    let key = argv.first().ok_or_else(|| LangError::new("remove needs a key", 0))?;
+                                    let _ = maps::remove(o, key);
+                                    return Ok(None);
+                                }
+                                "keys" if args.is_empty() => return Ok(Some(maps::keys(o))),
+                                "values" if args.is_empty() => return Ok(Some(maps::values(o))),
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Figure handles are numeric here, but M-code uses the
+                    // graphics-object method form (`f.findobj('Type','text')`).
+                    if fname == "findobj" {
+                        if let Value::Num(_) = base_val {
+                            let mut argv = vec![base_val];
+                            argv.extend(self.eval_args(args)?);
+                            return Ok(self.call_named("findobj", argv, 1)?.into_iter().next());
+                        }
+                    }
+                    if let Value::Object(o) = base_val {
                         if o.has_prop(fname) {
                             let v = o.prop(fname).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                             if let Value::Func(h) = v {
@@ -2309,7 +2914,25 @@ impl Session {
 
     fn indexed_assign(&mut self, name: &str, index: &[Expr], v: Value, braces: bool) -> Result<(), LangError> {
         if braces {
-            // `c{i} = v` — content assignment; creates/grows the cell.
+            // `c{i} = v` - content assignment; creates/grows the cell.
+            if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
+                if o.class_name == "table" {
+                    let new = self.table_assign(&o, index, v)?;
+                    self.vars.insert(name.to_string(), new);
+                    return Ok(());
+                }
+                if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                    let s = self.subs_struct("{}", index)?;
+                    let saved = self.subs_dot_guard;
+                    self.subs_dot_guard = true;
+                    let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                    self.subs_dot_guard = saved;
+                    let new = result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0))?;
+                    self.vars.insert(name.to_string(), new);
+                    return Ok(());
+                }
+                return Err(LangError::new(format!("brace assignment on '{name}' needs a 'subsasgn' method"), 0));
+            }
             let ca = match self.vars.remove(name) {
                 Some(Value::Cell(c)) => c,
                 Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (clear it to reassign as a cell)"), 0)),
@@ -2317,6 +2940,42 @@ impl Session {
             };
             let ca = self.cell_brace_apply(ca, index, v)?;
             self.vars.insert(name.to_string(), Value::Cell(ca));
+            return Ok(());
+        }
+        if let Some(Value::Object(o)) = self.vars.get(name).cloned() {
+            if o.class_name == "table" {
+                let new = self.table_assign(&o, index, v)?;
+                self.vars.insert(name.to_string(), new);
+                return Ok(());
+            }
+        }
+        let map = match self.vars.get(name) {
+            Some(Value::Object(o)) if o.class_name == "containers.Map" => Some(o.clone()),
+            _ => None,
+        };
+        if let Some(o) = map {
+            if index.len() != 1 {
+                return Err(LangError::new("containers.Map assignment needs one key", 0));
+            }
+            let key = self.eval(&index[0])?;
+            if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+                let _ = maps::remove(&o, &key);
+            } else {
+                maps::set(&o, key, v);
+            }
+            return Ok(());
+        }
+        // Object-array element write, including `obj(2) = obj` growth.
+        if matches!(self.vars.get(name), Some(Value::Object(_))) || matches!(v, Value::Object(_)) {
+            let cur = match self.vars.remove(name) {
+                Some(Value::Object(o)) => Value::Object(o),
+                _ => match &v {
+                    Value::Object(o) => Value::Object(MObject::array(o.class_name.clone(), Vec::new(), (0, 0))),
+                    _ => Value::Mat(Matrix::zeros(0, 0)),
+                },
+            };
+            let new = self.paren_apply(cur, index, v)?;
+            self.vars.insert(name.to_string(), new);
             return Ok(());
         }
         if matches!(self.vars.get(name), Some(Value::Cell(_))) || matches!(v, Value::Cell(_)) {
@@ -2335,7 +2994,7 @@ impl Session {
         if let Some(Value::Str(s)) = self.vars.get(name).cloned() {
             let len = s.chars().count();
             let mut target = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, target.dims(), target.numel().max(1))?;
+            let specs = self.index_specs(index, target.dims(), target.numel())?;
             pages_in_bounds(&specs)?;
             let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
@@ -2362,7 +3021,7 @@ impl Session {
         // them; writing past the end grows the sparse dims (MATLAB rule).
         if let Some(Value::Sparse(mut s)) = self.vars.get(name).cloned() {
             let rhs = v.to_matrix()?;
-            let specs = self.index_specs(index, &[s.rows(), s.cols()], s.numel().max(1))?;
+            let specs = self.index_specs(index, &[s.rows(), s.cols()], s.numel())?;
             pages_in_bounds(&specs)?;
             if rhs.numel() == 0 {
                 // `S(idx) = []` clears the addressed entries.
@@ -2401,7 +3060,7 @@ impl Session {
                 None => CMatrix::zeros(0, 0),
             };
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, &[target.rows(), target.cols()], target.numel().max(1))?;
+            let specs = self.index_specs(index, &[target.rows(), target.cols()], target.numel())?;
             if rhs.numel() == 0 {
                 let kept = cmatrix_delete(&target, &specs)?;
                 self.vars.insert(name.to_string(), cmat_or_value(kept));
@@ -2435,7 +3094,12 @@ impl Session {
     /// Fetch the contents selected by `c{…}` as a list — the building
     /// block of comma-separated-list expansion.
     fn cell_pick(&mut self, ca: &CellArray, args: &[Expr]) -> Result<Vec<Value>, LangError> {
-        let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        // `c{:}` over an empty cell is an empty comma-separated list (this is
+        // how `varargin{:}` forwards "no arguments"), not an index error.
+        if ca.numel() == 0 && matches!(args, [Expr::Colon]) {
+            return Ok(Vec::new());
+        }
+        let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         if specs.linear {
             specs
@@ -2477,23 +3141,54 @@ impl Session {
     /// literals, multi-target assignment, and index positions.
     fn eval_multi(&mut self, e: &Expr) -> Result<Vec<Value>, LangError> {
         match e {
-            Expr::BraceIndex(name, args) => {
-                let ca = match self.var_get(name) {
-                    Some(Value::Cell(c)) => c.clone(),
-                    Some(_) => return Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
-                    None => return Err(LangError::new(format!("undefined variable '{name}'"), 0)),
-                };
-                self.cell_pick(&ca, args)
-            }
+            Expr::BraceIndex(name, args) => match self.var_get(name).cloned() {
+                Some(Value::Cell(c)) => self.cell_pick(&c, args),
+                Some(Value::Object(o)) if o.class_name == "table" => self.table_brace_index(&o, args).map(|v| vec![v]),
+                Some(Value::Object(o)) => {
+                    if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                        let s = self.subs_struct("{}", args)?;
+                        let saved = self.subs_dot_guard;
+                        self.subs_dot_guard = true;
+                        let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                        self.subs_dot_guard = saved;
+                        result
+                    } else {
+                        Err(LangError::new(format!("brace indexing on '{name}' needs a 'subsref' method"), 0))
+                    }
+                }
+                Some(_) => Err(LangError::new(format!("'{name}' is not a cell array (use parens for matrix indexing)"), 0)),
+                None => Err(LangError::new(format!("undefined variable '{name}'"), 0)),
+            },
             Expr::BraceIdx(base, args) => {
                 // The base of the chain must yield exactly one value.
                 match self.eval(base)? {
                     Value::Cell(ca) => self.cell_pick(&ca, args),
+                    Value::Object(o) if o.class_name == "table" => self.table_brace_index(&o, args).map(|v| vec![v]),
+                    Value::Object(o) => {
+                        if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                            let s = self.subs_struct("{}", args)?;
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsref", &def, vec![Value::Object(o), s], 1, None);
+                            self.subs_dot_guard = saved;
+                            result
+                        } else {
+                            Err(LangError::new("brace indexing on an object needs a 'subsref' method", 0))
+                        }
+                    }
                     _ => Err(LangError::new("brace indexing needs a cell array", 0)),
                 }
             }
             Expr::Field(base, field) => {
                 // `s.f` on a struct array yields one value per element.
+                if let Some(full) = Self::expr_dotted_name(e) {
+                    let root = full.split('.').next().unwrap_or("");
+                    if self.var_get(root).is_none() {
+                        if let Some(v) = self.resolve_dotted_value(&full)? {
+                            return Ok(vec![v]);
+                        }
+                    }
+                }
                 match self.eval(base)? {
                     Value::Struct(m) => match m.field_values(field) {
                         Some(vals) => Ok(vals),
@@ -2541,12 +3236,72 @@ impl Session {
         let Some((step, rest)) = path.split_first() else { return Ok(v) };
         match step {
             PathStep::Name(field) => {
+                if let Value::Object(o) = &cur {
+                    if o.class_name == "COM" {
+                        if let Some(session) = o.com_session() {
+                            session.borrow_mut().set(field, &v)?;
+                            return Ok(Value::Object(o.clone()));
+                        }
+                    }
+                }
+                // Custom `.`-field assignment via `subsasgn` when the class
+                // defines it (the method's own body bypasses this guard).
+                if !self.subs_dot_guard {
+                    if let Value::Object(o) = &cur {
+                        if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                            let mut s = StructArray::new();
+                            s.set_field(0, "type", Value::Str(".".into()))?;
+                            s.set_field(0, "subs", Value::Cell(CellArray::row(vec![Value::Str(field.clone())])))?;
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsasgn", &def, vec![Value::Object(o.clone()), Value::Struct(s), v], 1, None);
+                            self.subs_dot_guard = saved;
+                            return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                        }
+                    }
+                }
                 // `obj.prop = v` — write into the object's store (shared
                 // for handle classes, copy-on-write for value classes).
                 if let Value::Object(mut o) = cur {
+                    self.check_prop_access(&o, field, true)?;
                     let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                     let new = self.path_set(sub, rest, v, root)?;
-                    o.set_prop(field, new);
+                    if self.sync_dynamic_meta(&mut o, field, &new)? {
+                        return Ok(Value::Object(o));
+                    }
+                    if o.class_name == "table" && field != "Properties" {
+                        // Dot-assignment adds/updates a table variable and
+                        // keeps `Properties.VariableNames`/`NumRows` in sync.
+                        // Assigning an empty value removes an existing variable.
+                        let mut names = table_var_names(&o);
+                        let existed = names.iter().any(|n| n == field);
+                        let empty_new = match &new {
+                            Value::Mat(m) => m.numel() == 0,
+                            Value::Cell(c) => c.numel() == 0,
+                            _ => false,
+                        };
+                        let nrows = table_num_rows(&o);
+                        if existed && empty_new {
+                            o.remove_prop(field);
+                            names.retain(|n| n != field);
+                            let rows = if names.is_empty() { 0 } else { nrows };
+                            o.set_prop("Properties", table_properties(&names, rows)?);
+                        } else {
+                            o.set_prop(field, new.clone());
+                            if !existed {
+                                names.push(field.clone());
+                            }
+                            let mut p = match o.prop("Properties") {
+                                Some(Value::Struct(s)) => s,
+                                _ => StructArray::new(),
+                            };
+                            p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.into_iter().map(Value::Str).collect())))?;
+                            p.set_field(0, "NumRows", Value::Num(value_row_count(&new) as f64))?;
+                            o.set_prop("Properties", Value::Struct(p));
+                        }
+                    } else {
+                        o.set_prop(field, new);
+                    }
                     return Ok(Value::Object(o));
                 }
                 let mut sa = match cur {
@@ -2577,6 +3332,14 @@ impl Session {
                         let _ = e;
                         Value::Struct(StructArray::new())
                     }
+                    Err(e) if matches!(rest.first(), Some(PathStep::Name(_))) && matches!(cur, Value::Object(_)) => {
+                        let _ = e;
+                        let class = match &cur {
+                            Value::Object(o) => o.class_name.clone(),
+                            _ => String::new(),
+                        };
+                        self.construct_object(&class, Vec::new())?
+                    }
                     Err(e) => return Err(e),
                 };
                 let new = self.path_set(inner, rest, v, root)?;
@@ -2584,6 +3347,18 @@ impl Session {
             }
             PathStep::Brace(ix) => {
                 let ca = match cur {
+                    Value::Object(o) if o.class_name == "table" => return self.table_assign(&o, ix, v),
+                    Value::Object(o) => {
+                        if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                            let s = self.subs_struct("{}", ix)?;
+                            let saved = self.subs_dot_guard;
+                            self.subs_dot_guard = true;
+                            let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                            self.subs_dot_guard = saved;
+                            return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+                        }
+                        return Err(LangError::new("brace assignment on an object needs a 'subsasgn' method", 0));
+                    }
                     Value::Cell(c) => c,
                     Value::Mat(m) if m.numel() == 0 => CellArray::new(0, 0),
                     _ => return Err(LangError::new("brace indexing needs a cell array", 0)),
@@ -2603,9 +3378,37 @@ impl Session {
     /// cell elements via `cell_paren_apply`; otherwise it's a numeric
     /// `assign_into` write.
     fn paren_apply(&mut self, target: Value, index: &[Expr], v: Value) -> Result<Value, LangError> {
+        if let Value::Object(o) = &target {
+            if o.class_name == "table" {
+                let o = o.clone();
+                return self.table_assign(&o, index, v);
+            }
+            if o.class_name == "containers.Map" {
+                if index.len() != 1 {
+                    return Err(LangError::new("containers.Map assignment needs one key", 0));
+                }
+                let key = self.eval(&index[0])?;
+                if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+                    let _ = maps::remove(o, &key);
+                } else {
+                    maps::set(o, key, v);
+                }
+                return Ok(target);
+            }
+            let o = o.clone();
+            if let Some(def) = self.find_method(&o.class_name, "subsasgn")? {
+                let s = self.subs_struct("()", index)?;
+                let saved = self.subs_dot_guard;
+                self.subs_dot_guard = true;
+                let result = self.call_def("subsasgn", &def, vec![Value::Object(o), s, v], 1, None);
+                self.subs_dot_guard = saved;
+                return result?.into_iter().next().ok_or_else(|| LangError::new("subsasgn produced no value", 0));
+            }
+            return self.object_paren_assign(o, index, v);
+        }
         if let Value::Struct(sa) = target {
             let mut sa = sa;
-            let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            let specs = self.index_specs(index, &[sa.rows(), sa.cols()], sa.numel())?;
             pages_in_bounds(&specs)?;
             // Linear indices into the element list (1-based).
             let idx: Vec<usize> = if specs.linear {
@@ -2655,7 +3458,7 @@ impl Session {
             // Char-array write through a chain (`s.f(2) = 'x'`).
             let len = s.chars().count();
             let mut m = Matrix::row_vector(s.chars().map(|c| c as u32 as f64).collect());
-            let specs = self.index_specs(index, m.dims(), m.numel().max(1))?;
+            let specs = self.index_specs(index, m.dims(), m.numel())?;
             pages_in_bounds(&specs)?;
             let max_i = specs.rows().iter().chain(specs.cols().iter()).copied().max().unwrap_or(0);
             if max_i > len {
@@ -2678,7 +3481,7 @@ impl Session {
         if matches!(target, Value::Cplx(_)) || matches!(v, Value::Cplx(_)) {
             let mut m = target.to_cmatrix()?;
             let rhs = v.to_cmatrix()?;
-            let specs = self.index_specs(index, &[m.rows(), m.cols()], m.numel().max(1))?;
+            let specs = self.index_specs(index, &[m.rows(), m.cols()], m.numel())?;
             if rhs.numel() == 0 {
                 return Ok(cmat_or_value(cmatrix_delete(&m, &specs)?));
             }
@@ -2698,7 +3501,7 @@ impl Session {
     /// `c{i} = v` — content assignment into an owned cell array; creates and
     /// grows the cell. Shared by variable and field assignment.
     fn cell_brace_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         if specs.linear {
             let max_i = specs.rows().iter().copied().max().unwrap_or(0);
@@ -2745,7 +3548,7 @@ impl Session {
     /// The `c(i) = v` operation on an owned cell array — shared by variable
     /// assignment and `s.f(i) = …` field assignment.
     fn cell_paren_apply(&mut self, mut ca: CellArray, index: &[Expr], v: Value) -> Result<CellArray, LangError> {
-        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel().max(1))?;
+        let specs = self.index_specs(index, &[ca.rows, ca.cols], ca.numel())?;
         pages_in_bounds(&specs)?;
         match v {
             Value::Cell(rhs) => {
@@ -2806,13 +3609,324 @@ impl Session {
                 }
                 Ok(ca)
             }
+            // `string` arrays are represented as cellstr, so parenthesised
+            // assignment of a scalar string stores the element itself
+            // (`s(i) = string(x)` in corpus code).
+            Value::Str(s) => {
+                let idxs: Vec<usize> = if specs.linear {
+                    specs.rows().to_vec()
+                } else {
+                    let mut lin = Vec::with_capacity(specs.rows().len() * specs.cols().len());
+                    for &c in specs.cols() {
+                        for &r in specs.rows() {
+                            lin.push((c - 1) * ca.rows + r);
+                        }
+                    }
+                    lin
+                };
+                let (gr, gc) = if specs.linear {
+                    let max_i = idxs.iter().copied().max().unwrap_or(0);
+                    if ca.cols == 1 && ca.rows > 1 {
+                        (max_i, 1)
+                    } else if ca.rows <= 1 {
+                        (1, max_i)
+                    } else {
+                        (max_i.div_ceil(ca.cols.max(1)), ca.cols)
+                    }
+                } else {
+                    (specs.rows().iter().copied().max().unwrap_or(0), specs.cols().iter().copied().max().unwrap_or(0))
+                };
+                ca.grow_capped(gr, gc)?;
+                for &i in &idxs {
+                    ca.set_linear(i.saturating_sub(1), Value::Str(s.clone()));
+                }
+                Ok(ca)
+            }
             _ => Err(LangError::new("conversion to cell from a non-cell value — write c{i} = value instead", 0)),
         }
     }
 
+    /// Resolve a table's row and variable subscripts. Supported forms are
+    /// numeric indices, logical masks, `:`, and variable-name strings or
+    /// cellstrs for the column position.
+    fn table_selection(&mut self, o: &MObject, args: &[Expr]) -> Result<(Vec<usize>, Vec<usize>), LangError> {
+        let names = table_var_names(o);
+        let nrows = table_num_rows(o);
+        let ncols = names.len();
+        if args.is_empty() || args.len() > 2 {
+            return Err(LangError::new("table indexing needs T(rows, cols)", 0));
+        }
+        let row_specs = self.index_specs(&args[..1], &[nrows], nrows)?;
+        let rows = row_specs.rows().to_vec();
+        let cols: Vec<usize> = if args.len() == 1 || matches!(args[1], Expr::Colon) {
+            (1..=ncols).collect()
+        } else {
+            let resolved = resolve_end(&args[1], ncols);
+            let value = self.eval(&resolved)?;
+            match value {
+                Value::Str(name) => {
+                    let p = names.iter().position(|n| n == &name).ok_or_else(|| LangError::new(format!("table: unknown variable '{name}'"), 0))?;
+                    vec![p + 1]
+                }
+                Value::Cell(c) => {
+                    let mut out = Vec::with_capacity(c.numel());
+                    for item in &c.items {
+                        let Value::Str(name) = item else {
+                            return Err(LangError::new("table: variable names must be strings", 0));
+                        };
+                        let p = names.iter().position(|n| n == name).ok_or_else(|| LangError::new(format!("table: unknown variable '{name}'"), 0))?;
+                        out.push(p + 1);
+                    }
+                    out
+                }
+                other => index_list(&other, ncols)?,
+            }
+        };
+        if rows.iter().any(|&r| r == 0 || r > nrows) {
+            return Err(LangError::new("table: row index out of bounds", 0));
+        }
+        if cols.iter().any(|&c| c == 0 || c > ncols) {
+            return Err(LangError::new("table: variable index out of bounds", 0));
+        }
+        Ok((rows, cols))
+    }
+
+    /// `T(rows, cols)` for `table` objects: select rows and variables.
+    fn table_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, args)?;
+        table_subset(o, &rows, &cols)
+    }
+
+    /// `T{rows, cols}` — table contents as one numeric matrix.
+    fn table_brace_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, args)?;
+        let names = table_var_names(o);
+        let mut columns: Vec<Vec<f64>> = Vec::with_capacity(cols.len());
+        for &c in &cols {
+            let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+            let value = o.prop(&name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let sliced = slice_table_rows(&value, &rows)?;
+            let m = sliced.to_matrix().map_err(|_| LangError::new(format!("table: contents of variable '{name}' are not numeric"), 0))?;
+            if m.numel() != rows.len() {
+                return Err(LangError::new(format!("table: variable '{name}' does not match the selected rows"), 0));
+            }
+            columns.push(m.data().to_vec());
+        }
+        let mut out = Matrix::zeros(rows.len(), cols.len());
+        for (c, col) in columns.iter().enumerate() {
+            for (r, &v) in col.iter().enumerate().take(rows.len()) {
+                let _ = out.set(r, c, v);
+            }
+        }
+        Ok(mat_or_num(out))
+    }
+
+    /// `T(rows, cols) = rhs` / `T{rows, cols} = rhs`, including row and
+    /// variable deletion with an empty right-hand side.
+    fn table_assign(&mut self, o: &MObject, index: &[Expr], rhs: Value) -> Result<Value, LangError> {
+        let (rows, cols) = self.table_selection(o, index)?;
+        let names = table_var_names(o);
+        let nrows = table_num_rows(o);
+        let all_rows = rows.len() == nrows && rows.iter().enumerate().all(|(i, &r)| r == i + 1);
+        let all_cols = cols.len() == names.len();
+        let empty_rhs = match &rhs {
+            Value::Mat(m) => m.numel() == 0,
+            Value::Cell(c) => c.numel() == 0,
+            _ => false,
+        };
+        if empty_rhs {
+            if all_cols && !all_rows {
+                return table_delete_rows(o, &rows);
+            }
+            if all_rows {
+                let keep: Vec<usize> = (1..=names.len()).filter(|c| !cols.contains(c)).collect();
+                return table_delete_vars(o, &keep);
+            }
+            return Err(LangError::new("table: deletion needs whole rows or whole variables", 0));
+        }
+        let rhs_table = match &rhs {
+            Value::Object(t) if t.class_name == "table" => Some(t),
+            _ => None,
+        };
+        let mut props = o.props_map();
+        for (j, &c) in cols.iter().enumerate() {
+            let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+            let target = props.field_at(0, &name).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+            let source = if let Some(t) = rhs_table {
+                let v = t.prop(&name).ok_or_else(|| LangError::new(format!("table: right-hand table has no variable '{name}'"), 0))?;
+                if table_num_rows(t) != rows.len() && table_num_rows(t) != 1 {
+                    return Err(LangError::new("table: right-hand table has the wrong number of rows", 0));
+                }
+                v
+            } else {
+                table_rhs_column(&rhs, j, cols.len(), rows.len())?
+            };
+            let updated = assign_table_rows(&target, &rows, &source)?;
+            props.set_field(0, &name, updated)?;
+        }
+        let mut p = match props.field_at(0, "Properties").cloned() {
+            Some(Value::Struct(s)) => s,
+            _ => StructArray::new(),
+        };
+        p.set_field(0, "NumRows", Value::Num(nrows as f64))?;
+        props.set_field(0, "Properties", Value::Struct(p))?;
+        Ok(Value::Object(MObject::owned("table".into(), props)))
+    }
+
+    /// Build the `subs` struct MATLAB passes to `subsref`/`subsasgn`.
+    fn subs_struct(&mut self, kind: &str, args: &[Expr]) -> Result<Value, LangError> {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            let v = match a {
+                Expr::Colon => Value::Str(":".into()),
+                Expr::End => return Err(LangError::new("'end' is not supported in a custom subsref index", 0)),
+                _ => self.eval(a)?,
+            };
+            vals.push(v);
+        }
+        let mut s = StructArray::new();
+        s.set_field(0, "type", Value::Str(kind.into()))?;
+        s.set_field(0, "subs", Value::Cell(CellArray::row(vals)))?;
+        Ok(Value::Struct(s))
+    }
+
+    fn object_index(&mut self, o: &MObject, args: &[Expr]) -> Result<Value, LangError> {
+        if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+            let s = self.subs_struct("()", args)?;
+            let saved = self.subs_dot_guard;
+            self.subs_dot_guard = true;
+            let out = self.call_def("subsref", &def, vec![Value::Object(o.clone()), s], 1, None);
+            self.subs_dot_guard = saved;
+            return out?.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0));
+        }
+        let dims = o.array_dims();
+        let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+        let specs = self.index_specs(args, &dims, numel)?;
+        pages_in_bounds(&specs)?;
+        let elems = o.array_elements();
+        let mut idxs: Vec<usize> = Vec::new();
+        if specs.linear {
+            for &i in specs.rows() {
+                idxs.push(i.saturating_sub(1));
+            }
+        } else {
+            for &c in specs.cols() {
+                for &r in specs.rows() {
+                    idxs.push(r.saturating_sub(1).saturating_mul(dims.first().copied().unwrap_or(1)).saturating_add(c.saturating_sub(1)));
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(idxs.len());
+        for &i in &idxs {
+            let Some(el) = elems.get(i) else {
+                return Err(LangError::new(format!("index {} out of bounds for object array", i + 1), 0));
+            };
+            out.push(el.clone());
+        }
+        if out.len() == 1 {
+            return Ok(Value::Object(out.remove(0)));
+        }
+        let out_dims = if specs.linear {
+            let col = matches!(args.first(), Some(Expr::Colon)) && !o.is_array();
+            if col {
+                (out.len(), 1)
+            } else {
+                (1, out.len())
+            }
+        } else {
+            (specs.rows().len(), specs.cols().len())
+        };
+        Ok(Value::Object(MObject::array(o.class_name.clone(), out, out_dims)))
+    }
+
+    fn object_paren_assign(&mut self, cur: MObject, index: &[Expr], v: Value) -> Result<Value, LangError> {
+        let dims = cur.array_dims();
+        let numel = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+        let specs = self.index_specs(index, &dims, numel)?;
+        pages_in_bounds(&specs)?;
+        let mut elems = cur.array_elements();
+        let mut positions: Vec<usize> = Vec::new();
+        if specs.linear {
+            for &i in specs.rows() {
+                positions.push(i.saturating_sub(1));
+            }
+        } else {
+            for &c in specs.cols() {
+                for &r in specs.rows() {
+                    positions.push(r.saturating_sub(1).saturating_mul(dims.first().copied().unwrap_or(1)).saturating_add(c.saturating_sub(1)));
+                }
+            }
+        }
+        if matches!(v, Value::Mat(ref m) if m.numel() == 0) {
+            if !specs.linear {
+                return Err(LangError::new("object-array deletion needs linear indices", 0));
+            }
+            let mut keep = vec![true; elems.len()];
+            for &p in &positions {
+                if let Some(slot) = keep.get_mut(p) {
+                    *slot = false;
+                }
+            }
+            let kept: Vec<MObject> = elems.into_iter().enumerate().filter_map(|(i, e)| keep.get(i).copied().unwrap_or(true).then_some(e)).collect();
+            if kept.len() == 1 {
+                return Ok(Value::Object(kept.into_iter().next().unwrap_or(cur)));
+            }
+            return Ok(Value::Object(MObject::array(cur.class_name.clone(), kept.clone(), (1, kept.len()))));
+        }
+        let rhs = match v {
+            Value::Object(o) => o,
+            _ => return Err(LangError::new("object-array assignment needs an object", 0)),
+        };
+        let rhs_elems = rhs.array_elements();
+        let max_pos = positions.iter().copied().max().unwrap_or(0);
+        let needed = max_pos.saturating_add(1).max(numel);
+        while elems.len() < needed {
+            let fill = match self.construct_object(&cur.class_name, Vec::new()) {
+                Ok(Value::Object(o)) => o,
+                _ => rhs.clone(),
+            };
+            elems.push(fill);
+        }
+        for (k, &p) in positions.iter().enumerate() {
+            if let Some(slot) = elems.get_mut(p) {
+                *slot = rhs_elems.get(k % rhs_elems.len().max(1)).cloned().unwrap_or_else(|| rhs.clone());
+            }
+        }
+        let out_dims = if specs.linear {
+            if elems.len() > 1 && dims == vec![1, 1] {
+                (1, elems.len())
+            } else {
+                let (r, c) = (dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1));
+                if r.saturating_mul(c) >= elems.len() {
+                    (r, c)
+                } else {
+                    (1, elems.len())
+                }
+            }
+        } else {
+            let r = specs.rows().iter().copied().max().unwrap_or(dims.first().copied().unwrap_or(1)).max(dims.first().copied().unwrap_or(1));
+            let c = specs.cols().iter().copied().max().unwrap_or(dims.get(1).copied().unwrap_or(1)).max(dims.get(1).copied().unwrap_or(1));
+            (r, c)
+        };
+        if elems.len() == 1 {
+            return Ok(Value::Object(elems.remove(0)));
+        }
+        Ok(Value::Object(MObject::array(cur.class_name.clone(), elems, out_dims)))
+    }
+
     fn index_into(&mut self, target: &Value, args: &[Expr]) -> Result<Value, LangError> {
-        if let Value::Object(_) = target {
-            return Err(LangError::new("indexing into an object is not supported (object arrays are not implemented)", 0));
+        if let Value::Object(o) = target {
+            if o.class_name == "table" {
+                return self.table_index(o, args);
+            }
+            if o.class_name == "containers.Map" {
+                if args.len() != 1 {
+                    return Err(LangError::new("containers.Map indexing needs one key", 0));
+                }
+                let key = self.eval(&args[0])?;
+                return maps::get(o, &key);
+            }
+            return self.object_index(o, args);
         }
         if let Value::Cell(ca) = target {
             // `c(:)` on an empty cell yields an empty cell, not an index error.
@@ -2820,7 +3934,7 @@ impl Session {
                 return Ok(Value::Cell(CellArray::new(0, 0)));
             }
             // `c(i)` / `c(i, j)` — paren indexing keeps cells.
-            let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel().max(1))?;
+            let specs = self.index_specs(args, &[ca.rows, ca.cols], ca.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 let mut out = Vec::with_capacity(specs.rows().len());
@@ -2861,7 +3975,7 @@ impl Session {
         }
         if let Value::Sparse(s) = target {
             // `S(i,j)` reads sparse → a sparse result (or scalar Num).
-            let specs = self.index_specs(args, &[s.rows(), s.cols()], s.numel().max(1))?;
+            let specs = self.index_specs(args, &[s.rows(), s.cols()], s.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 // Single-element linear read returns a scalar double.
@@ -2911,7 +4025,7 @@ impl Session {
             return Ok(Value::Sparse(out));
         }
         if let Value::Struct(sa) = target {
-            let specs = self.index_specs(args, &[sa.rows(), sa.cols()], sa.numel().max(1))?;
+            let specs = self.index_specs(args, &[sa.rows(), sa.cols()], sa.numel())?;
             pages_in_bounds(&specs)?;
             if specs.linear {
                 let idx: Vec<usize> = specs.rows().iter().map(|i| i.saturating_sub(1)).collect();
@@ -3006,8 +4120,12 @@ impl Session {
         // whole array linearly and the last subscript spans `dims[i..]`
         // collapsed.
         let extent = |i: usize, n: usize| -> usize {
+            if numel == 0 {
+                // `end` is 0 for an empty array, so `A(end+1)=v` starts at 1.
+                return 0;
+            }
             if n == 1 {
-                return numel.max(1);
+                return numel;
             }
             if i + 1 == n {
                 return dims.get(i..).unwrap_or(&[]).iter().fold(1usize, |a, &d| a.saturating_mul(d)).max(1);
@@ -3053,9 +4171,25 @@ impl Session {
     }
 
     fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, LangError> {
+        let gpu_a = matches!(&a, Value::Object(o) if o.class_name == "gpuArray");
+        let gpu_b = matches!(&b, Value::Object(o) if o.class_name == "gpuArray");
+        if gpu_a || gpu_b {
+            let aa = gather_value(&a);
+            let bb = gather_value(&b);
+            if op == BinOp::Mul && gpu_a && gpu_b {
+                let ma = aa.to_matrix()?;
+                let mb = bb.to_matrix()?;
+                return gpu::matmul(&ma, &mb).map(|m| wrap_gpu(Value::Mat(m)));
+            }
+            let r = self.binary(op, aa, bb)?;
+            return Ok(wrap_gpu(r));
+        }
         // Operator overloading: an object operand defers to its class's
         // `plus`/`mtimes`/`eq`/… method — MATLAB's dominant-argument rule.
         if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            if self.is_lti(&a) || self.is_lti(&b) {
+                return self.lti_binary(op, a, b);
+            }
             return self.object_binary(op, a, b);
         }
         // Either side complex → the whole op runs in complex arithmetic.
@@ -3238,7 +4372,29 @@ impl Session {
     /// Builtin functions. Returns `Ok(None)` for commands that only print.
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         match name {
-            "zeros" | "ones" | "eye" | "rand" | "randn" => {
+            "builtin" => {
+                let v = self.eval_args(args)?;
+                let target = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("builtin needs a function name as its first argument", 0)),
+                };
+                let rest = v.get(1..).unwrap_or(&[]).to_vec();
+                if let Some(op) = builtin_binop(&target) {
+                    if rest.len() != 2 {
+                        return Err(LangError::new(format!("builtin('{target}', ...) needs two operands"), 0));
+                    }
+                    if rest.iter().any(|v| matches!(v, Value::Object(_))) {
+                        return Err(LangError::new(format!("builtin('{target}', ...) has no built-in object implementation"), 0));
+                    }
+                    return Ok(Some(self.binary(op, rest[0].clone(), rest[1].clone())?));
+                }
+                if !self.is_builtin(&target) {
+                    return Err(LangError::new(format!("builtin: '{target}' is not a built-in function"), 0));
+                }
+                let out = self.builtin_values(&target, rest, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "zeros" | "ones" | "eye" | "rand" | "randn" | "true" | "false" => {
                 // `rand('seed', v)` / `rand('state', v)` (and the
                 // `'twister'` alias) — the legacy seed-setting form,
                 // still common in older scripts alongside `rng`.
@@ -3262,8 +4418,9 @@ impl Session {
                     return Err(LangError::new("eye accepts at most two dimensions", 0));
                 }
                 let m = match name {
-                    "zeros" => Matrix::zeros_nd(&dims),
-                    "ones" => Matrix::ones_nd(&dims),
+                    "zeros" | "false" => Matrix::zeros_nd(&dims),
+                    // `true`/`false` with dimensions follow zeros/ones.
+                    "ones" | "true" => Matrix::ones_nd(&dims),
                     "eye" => Matrix::eye(dims.first().copied().unwrap_or(1), dims.get(1).copied().unwrap_or(1)),
                     "rand" => {
                         let n = dims.iter().fold(1usize, |a, &d| a.saturating_mul(d));
@@ -3320,11 +4477,21 @@ impl Session {
             }
             "numel" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::len(o) as f64)));
+                    }
+                }
                 let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
                 Ok(Some(Value::Num(dims.iter().product::<usize>() as f64)))
             }
             "length" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::len(o) as f64)));
+                    }
+                }
                 let dims = v.first().map(Value::dims_vec).unwrap_or_else(|| vec![0, 0]);
                 Ok(Some(Value::Num(dims.iter().copied().max().unwrap_or(0) as f64)))
             }
@@ -3613,7 +4780,7 @@ impl Session {
                 match v.first() {
                     Some(Value::Object(o)) => {
                         // `fieldnames(obj)` lists the object's props.
-                        let names = o.props_map().field_names();
+                        let names = o.prop_names();
                         let mut c = CellArray::new(names.len(), 1);
                         for (i, k) in names.iter().enumerate() {
                             c.set_linear(i, Value::Str(k.clone()));
@@ -3632,6 +4799,83 @@ impl Session {
                     _ => Err(LangError::new("fieldnames needs a struct", 0)),
                 }
             }
+            "addprop" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("addprop needs an object", 0)),
+                };
+                if o.is_array() {
+                    return Err(LangError::new("addprop needs a scalar object", 0));
+                }
+                if !o.is_handle() {
+                    return Err(LangError::new("addprop requires a handle object (add 'dynamicprops' or 'handle' to the superclass list)", 0));
+                }
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("addprop needs a property name", 0)),
+                };
+                if prop.is_empty()
+                    || !prop.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    || !prop.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return Err(LangError::new(format!("addprop: '{prop}' is not a valid property name"), 0));
+                }
+                if o.has_prop(&prop) && o.dyn_prop(&prop).is_none() {
+                    return Err(LangError::new(format!("addprop: property '{prop}' already exists"), 0));
+                }
+                let mut target = o.clone();
+                target.add_dyn_prop(&prop);
+                let meta = target.dyn_prop(&prop).unwrap_or(DynPropMeta {
+                    name: prop.clone(),
+                    get: Access::Public,
+                    set: Access::Public,
+                    constant: false,
+                    dependent: false,
+                    hidden: false,
+                });
+                let mut p = StructArray::new();
+                p.set_field(0, "Name", Value::Str(prop))?;
+                p.set_field(0, "GetAccess", Value::Str(access_name(meta.get).into()))?;
+                p.set_field(0, "SetAccess", Value::Str(access_name(meta.set).into()))?;
+                p.set_field(0, "Constant", Value::Num(meta.constant as u8 as f64))?;
+                p.set_field(0, "Dependent", Value::Num(meta.dependent as u8 as f64))?;
+                p.set_field(0, "Hidden", Value::Num(meta.hidden as u8 as f64))?;
+                p.set_field(0, "Source", Value::Object(target))?;
+                Ok(Some(Value::Object(MObject::new("dynamicprops".into(), p, true))))
+            }
+            "dynamicprops" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("dynamicprops needs an object", 0)),
+                };
+                let names: Vec<Value> = o.dyn_props().into_iter().map(|p| Value::Str(p.name)).collect();
+                Ok(Some(Value::Cell(CellArray::col(names))))
+            }
+            "removeprop" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("removeprop needs an object", 0)),
+                };
+                if !o.is_handle() {
+                    return Err(LangError::new("removeprop requires a handle object", 0));
+                }
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    Some(Value::Object(p)) if p.class_name == "dynamicprops" => match p.prop("Name") {
+                        Some(Value::Str(s)) => s,
+                        _ => return Err(LangError::new("removeprop: dynamic property has no name", 0)),
+                    },
+                    _ => return Err(LangError::new("removeprop needs a property name or dynamicprops handle", 0)),
+                };
+                let mut target = o;
+                if !target.remove_dyn_prop(&prop) {
+                    return Err(LangError::new(format!("removeprop: '{prop}' is not a dynamic property"), 0));
+                }
+                Ok(Some(Value::Object(target)))
+            }
             "properties" | "methods" => {
                 // `properties(obj|'Class')` / `methods(…)` — a column
                 // cellstr of names, inherited included.
@@ -3641,6 +4885,15 @@ impl Session {
                     Some(Value::Str(s)) => s.clone(),
                     _ => return Err(LangError::new(format!("{name} needs an object or a class name"), 0)),
                 };
+                if let Some(Value::Object(o)) = v.first() {
+                    if name == "properties" {
+                        let mut c = CellArray::new(o.prop_names().len(), 1);
+                        for (i, p) in o.prop_names().iter().enumerate() {
+                            c.set_linear(i, Value::Str(p.clone()));
+                        }
+                        return Ok(Some(Value::Cell(c)));
+                    }
+                }
                 let chain = self.class_chain(&cname)?;
                 let mut names: Vec<String> = Vec::new();
                 for d in &chain {
@@ -3667,6 +4920,130 @@ impl Session {
             "isstruct" => {
                 let v = self.eval_args(args)?;
                 Ok(Some(Value::Num(matches!(v.first(), Some(Value::Struct(_))) as u8 as f64)))
+            }
+            "events" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("events needs an object or a class name", 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let mut names: Vec<String> = Vec::new();
+                for d in &chain {
+                    for e in &d.events {
+                        if !names.contains(e) {
+                            names.push(e.clone());
+                        }
+                    }
+                }
+                Ok(Some(Value::Cell(CellArray::col(names.into_iter().map(Value::Str).collect()))))
+            }
+            "addlistener" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("addlistener needs a handle object", 0)),
+                };
+                let event = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("addlistener needs an event name", 0)),
+                };
+                let callback = v.get(2).cloned().ok_or_else(|| LangError::new("addlistener needs a callback", 0))?;
+                self.check_event(&o, &event)?;
+                let Some(store) = o.listeners.clone() else {
+                    return Err(LangError::new(format!("addlistener requires a handle class ('{}' is a value class)", o.class_name), 0));
+                };
+                let id = self.next_listener_id;
+                self.next_listener_id += 1;
+                store.borrow_mut().push(EventListener { id, event: event.clone(), callback: callback.clone(), enabled: true });
+                let mut props = StructArray::new();
+                props.set_field(0, "Source", Value::Object(o))?;
+                props.set_field(0, "EventName", Value::Str(event))?;
+                props.set_field(0, "Callback", callback)?;
+                props.set_field(0, "Enabled", Value::Num(1.0))?;
+                props.set_field(0, "Id", Value::Num(id as f64))?;
+                Ok(Some(Value::Object(MObject::owned("listener".into(), props))))
+            }
+            "notify" => {
+                let v = self.eval_args(args)?;
+                let o = match v.first() {
+                    Some(Value::Object(o)) => o.clone(),
+                    _ => return Err(LangError::new("notify needs a handle object", 0)),
+                };
+                let event = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("notify needs an event name", 0)),
+                };
+                self.check_event(&o, &event)?;
+                let Some(store) = o.listeners.clone() else { return Ok(Some(Value::Mat(Matrix::zeros(0, 0)))) };
+                let listeners = store.borrow().iter().filter(|l| l.enabled && l.event == event).cloned().collect::<Vec<_>>();
+                let mut data = StructArray::new();
+                data.set_field(0, "Source", Value::Object(o.clone()))?;
+                data.set_field(0, "EventName", Value::Str(event))?;
+                data.set_field(0, "Data", v.get(2).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+                for l in listeners {
+                    let cb = l.callback.clone();
+                    if !matches!(cb, Value::Func(_) | Value::Str(_)) {
+                        return Err(LangError::new("listener callback must be a function handle or name", 0));
+                    }
+                    let _ = self.call_feval_target(&cb, vec![Value::Object(o.clone()), Value::Struct(data.clone())], 0)?;
+                }
+                Ok(Some(Value::Mat(Matrix::zeros(0, 0))))
+            }
+            "metaclass" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("metaclass needs an object or a class name", 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let mut props: Vec<String> = Vec::new();
+                let mut methods: Vec<String> = Vec::new();
+                let mut events: Vec<String> = Vec::new();
+                for d in &chain {
+                    for (p, _) in &d.props {
+                        if !props.contains(p) {
+                            props.push(p.clone());
+                        }
+                    }
+                    for k in d.methods.keys().chain(d.sigs.keys()) {
+                        if !methods.contains(k) {
+                            methods.push(k.clone());
+                        }
+                    }
+                    for e in &d.events {
+                        if !events.contains(e) {
+                            events.push(e.clone());
+                        }
+                    }
+                }
+                let mut supers: Vec<String> =
+                    chain.last().map(|d| d.supers.iter().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()).collect()).unwrap_or_default();
+                supers.dedup();
+                let mut s = StructArray::new();
+                s.set_field(0, "Name", Value::Str(cname))?;
+                s.set_field(0, "Properties", Value::Cell(CellArray::col(props.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Methods", Value::Cell(CellArray::col(methods.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Events", Value::Cell(CellArray::col(events.into_iter().map(Value::Str).collect())))?;
+                s.set_field(0, "Superclasses", Value::Cell(CellArray::col(supers.into_iter().map(Value::Str).collect())))?;
+                Ok(Some(Value::Struct(s)))
+            }
+            "ismethod" => {
+                let v = self.eval_args(args)?;
+                let cname = match v.first() {
+                    Some(Value::Object(o)) => o.class_name.clone(),
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs an object or a class name"), 0)),
+                };
+                let member = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a member name"), 0)),
+                };
+                let chain = self.class_chain(&cname)?;
+                let found = chain.iter().any(|d| d.methods.contains_key(&member) || d.sigs.contains_key(&member));
+                Ok(Some(Value::Num(found as u8 as f64)))
             }
             "isfield" => {
                 let v = self.eval_args(args)?;
@@ -3920,6 +5297,11 @@ impl Session {
                     return a.broadcast(&b, |x, y| if (x > y) == hi { x } else { y }).map(mat_or_num).map(Some).map_err(lang);
                 }
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                if let Value::Object(o) = v0 {
+                    if name == "mean" && o.class_name.starts_with("prob.") {
+                        return self.prob_moment(name, o).map(Some);
+                    }
+                }
                 if let Value::Cplx(cm) = v0 {
                     let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
@@ -3931,6 +5313,11 @@ impl Session {
             "std" | "var" | "median" => {
                 let v = self.eval_args(args)?;
                 let v0 = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                if let Value::Object(o) = v0 {
+                    if o.class_name.starts_with("prob.") {
+                        return self.prob_moment(name, o).map(Some);
+                    }
+                }
                 if let Value::Cplx(cm) = v0 {
                     let dim = self.dim_arg(args, &[cm.rows(), cm.cols()])?;
                     return self.creduce(name, cm, dim).map(Some);
@@ -4438,11 +5825,30 @@ impl Session {
                 // `get(obj,'prop')`/`get(obj)` — object property access.
                 if let Some(Value::Object(o)) = v.first() {
                     let o = o.clone();
+                    if o.class_name == "COM" {
+                        if let Some(session) = o.com_session() {
+                            return match v.get(1) {
+                                Some(Value::Str(s)) if s == "ProgID" => Ok(o.prop(s)),
+                                Some(Value::Str(s)) => session.borrow_mut().get(s).map(Some),
+                                None => Ok(None),
+                                _ => Err(LangError::new("get: property name must be a string", 0)),
+                            };
+                        }
+                    }
                     return match v.get(1) {
                         Some(Value::Str(s)) => {
+                            self.check_prop_access(&o, s, false)?;
                             o.prop(s).map(Some).ok_or_else(|| LangError::new(format!("get: no property '{s}' on class '{}'", o.class_name), 0))
                         }
-                        None => Ok(Some(Value::Struct(o.props_map()))),
+                        None => {
+                            let mut s = o.props_map();
+                            for n in s.field_names() {
+                                if is_internal_prop(&n) {
+                                    s.remove_field(&n);
+                                }
+                            }
+                            Ok(Some(Value::Struct(s)))
+                        }
                         Some(_) => Err(LangError::new("get: property name must be a string", 0)),
                     };
                 }
@@ -4510,6 +5916,10 @@ impl Session {
                 // `set(h,'prop',v,...)` — h=0 stores root `Default*` props,
                 // a figure number writes the props `get` reports.
                 let v = self.eval_args(args)?;
+                // `set([], …)` on an empty graphics array is a no-op.
+                if matches!(v.first(), Some(Value::Mat(m)) if m.numel() == 0) || matches!(v.first(), Some(Value::Cell(c)) if c.numel() == 0) {
+                    return Ok(None);
+                }
                 // `set(obj,'prop',v,…)` — writes through on handle
                 // classes, returns the updated object on value classes.
                 if let Some(Value::Object(o)) = v.first() {
@@ -4521,7 +5931,18 @@ impl Session {
                             _ => return Err(LangError::new("set: property name must be a string", 0)),
                         };
                         let val = v.get(i + 1).ok_or_else(|| LangError::new("set: missing value", 0))?;
-                        o.set_prop(&pname, val.clone());
+                        if self.sync_dynamic_meta(&mut o, &pname, val)? {
+                            i += 2;
+                            continue;
+                        }
+                        if o.class_name == "COM" {
+                            if let Some(session) = o.com_session() {
+                                session.borrow_mut().set(&pname, val)?;
+                            }
+                        } else {
+                            self.check_prop_access(&o, &pname, true)?;
+                            o.set_prop(&pname, val.clone());
+                        }
                         i += 2;
                     }
                     return Ok(Some(Value::Object(o)));
@@ -4844,6 +6265,16 @@ impl Session {
                 let c = if v.len() > 2 { v.scalar_at(2)? as usize } else { r };
                 match v.first() {
                     Some(Value::Cell(ca)) => ca.repmat(r, c).map(Value::Cell).map(Some),
+                    // Character/string data is scalar `Str` here, so tiling it
+                    // yields a cellstr-like array (matching `string` array
+                    // element access without a distinct string type).
+                    Some(Value::Str(s)) => {
+                        let mut ca = CellArray::new(r, c);
+                        for i in 0..r.saturating_mul(c) {
+                            ca.set_linear(i, Value::Str(s.clone()));
+                        }
+                        Ok(Some(Value::Cell(ca)))
+                    }
                     Some(Value::Cplx(cm)) => cplanes(cm, |m| repmat(m, r, c)).map(cmat_or_value).map(Some),
                     Some(x) => {
                         let m = x.to_matrix()?;
@@ -5235,6 +6666,8 @@ impl Session {
             "isempty" => {
                 let v = self.eval_args(args)?;
                 let e = match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "table" => table_num_rows(o) == 0,
+                    Some(Value::Object(o)) if o.class_name == "containers.Map" => maps::len(o) == 0,
                     Some(x) => x.dims_vec().iter().product::<usize>() == 0,
                     None => true,
                 };
@@ -5448,7 +6881,351 @@ impl Session {
                 };
                 Ok(Some(Value::Num(trapz(&x, &y))))
             }
-            "fzero" | "fminsearch" | "integral" | "quad" => self.solve_scalar(name, args),
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "intlinprog" | "fmincon"
+            | "patternsearch" => {
+                let v = self.eval_args(args)?;
+                let out = self.optimize_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
+            | "pidtune" | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable"
+            | "damp" | "bandwidth" => {
+                let v = self.eval_args(args)?;
+                let out = self.control_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
+            | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
+            | "kstest" | "adtest" | "chi2gof" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf"
+            | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random"
+            | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
+                let v = self.eval_args(args)?;
+                let out = self.stats_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
+            | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" | "convertvars" | "removevars"
+            | "renamevars" | "summary" | "findgroups" | "splitapply" | "varfun" | "rowfun" | "join" | "innerjoin" | "outerjoin" | "groupsummary"
+            | "stack" | "unstack" | "fillmissing" | "rmmissing" | "standardizeMissing" => {
+                let v = self.eval_args(args)?;
+                let out = self.xlsx_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "rgb2gray" | "imresize" | "imfilter" | "medfilt2" | "edge" | "bwlabel" | "regionprops" | "graythresh" | "imbinarize" | "imdilate"
+            | "imerode" | "imopen" | "imclose" | "imrotate" | "imcrop" | "strel" => {
+                let v = self.eval_args(args)?;
+                let out = self.image_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ga" => {
+                let v = self.eval_args(args)?;
+                let out = self.ga_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "h5read" | "h5write" | "h5create" | "h5disp" => {
+                let v = self.eval_args(args)?;
+                let out = self.hdf5_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "umap" => {
+                let v = self.eval_args(args)?;
+                let out = self.umap_call(&v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "tsne" => {
+                let v = self.eval_args(args)?;
+                let out = self.tsne_call(&v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
+                let v = self.eval_args(args)?;
+                let out = self.ode_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "inputParser" | "addRequired" | "addOptional" | "addParameter" | "addParamValue" | "addparameter" | "parse" | "string" | "strings"
+            | "isstring" | "table2array" => {
+                let v = self.eval_args(args)?;
+                let out = self.corpus_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "table" => self.table_call(args),
+            "maxNumCompThreads" => {
+                let v = self.eval_args(args)?;
+                if let Some(n) = v.first() {
+                    let n = n.scalar()?.max(1.0) as usize;
+                    let _ = matcore::set_num_threads(n);
+                    return Ok(Some(Value::Num(n as f64)));
+                }
+                Ok(Some(Value::Num(matcore::num_threads() as f64)))
+            }
+            "gpuArray" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "gpuArray" => Ok(Some(Value::Object(o.clone()))),
+                    Some(x) => Ok(Some(wrap_gpu(x.clone()))),
+                    None => Err(LangError::new("gpuArray needs data", 0)),
+                }
+            }
+            "gather" => {
+                let v = self.eval_args(args)?;
+                let out = match v.first() {
+                    Some(Value::Cell(c)) => {
+                        let mut out = c.clone();
+                        for i in 0..out.numel() {
+                            if let Some(x) = out.get_linear(i) {
+                                out.set_linear(i, gather_value(x));
+                            }
+                        }
+                        Value::Cell(out)
+                    }
+                    Some(x) => gather_value(x),
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                };
+                Ok(Some(out))
+            }
+            "canUseGPU" | "existsOnGPU" => {
+                let _ = self.eval_args(args)?;
+                Ok(Some(Value::Num(if gpu::available() { 1.0 } else { 0.0 })))
+            }
+            "gpuDevice" => {
+                let mut props = StructArray::new();
+                props.set_field(0, "Name", Value::Str(gpu::device_name()))?;
+                props.set_field(0, "Available", Value::Num(if gpu::available() { 1.0 } else { 0.0 }))?;
+                props.set_field(0, "DriverVersion", Value::Str("wgpu".into()))?;
+                props.set_field(0, "TotalMemory", Value::Num(0.0))?;
+                Ok(Some(Value::Struct(props)))
+            }
+            "parpool" => {
+                let v = self.eval_args(args)?;
+                let workers = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(1.0).max(1.0);
+                let _ = matcore::set_num_threads(workers as usize);
+                let mut props = StructArray::new();
+                props.set_field(0, "NumWorkers", Value::Num(workers))?;
+                Ok(Some(Value::Object(MObject::new("parallel.Pool".into(), props, true))))
+            }
+            "parfeval" => {
+                let v = self.eval_args(args)?;
+                let func = v.first().cloned().ok_or_else(|| LangError::new("parfeval needs a function", 0))?;
+                let nout = v.get(1).and_then(|x| x.scalar().ok()).unwrap_or(1.0).max(1.0) as usize;
+                let mut argv: Vec<Value> = v.iter().skip(2).cloned().collect();
+                if argv.is_empty() {
+                    argv = Vec::new();
+                }
+                let outputs = self.call_feval_target(&func, argv, nout)?;
+                let mut props = StructArray::new();
+                if outputs.len() == 1 {
+                    props.set_field(0, "Value", outputs.into_iter().next().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+                } else {
+                    props.set_field(0, "Value", Value::Cell(CellArray::col(outputs)))?;
+                }
+                Ok(Some(Value::Object(MObject::new("parallel.Future".into(), props, true))))
+            }
+            "fetchOutputs" => {
+                let v = self.eval_args(args)?;
+                let out = match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "parallel.Future" => o.prop("Value").unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+                    Some(x) => x.clone(),
+                    None => Value::Mat(Matrix::zeros(0, 0)),
+                };
+                Ok(Some(out))
+            }
+            "onCleanup" => {
+                let v = self.eval_args(args)?;
+                let mut props = StructArray::new();
+                props.set_field(0, "Task", v.first().cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))?;
+                Ok(Some(Value::Object(MObject::new("onCleanup".into(), props, true))))
+            }
+            "categorical" => {
+                let v = self.eval_args(args)?;
+                let items: Vec<Value> = match v.first() {
+                    Some(Value::Cell(c)) => c.items.clone(),
+                    Some(Value::Mat(m)) => m.data().iter().map(|&x| Value::Str(format!("{x}"))).collect(),
+                    Some(Value::Str(s)) => vec![Value::Str(s.clone())],
+                    Some(Value::Num(x)) => vec![Value::Str(format!("{x}"))],
+                    _ => Vec::new(),
+                };
+                Ok(Some(Value::Cell(CellArray::col(items))))
+            }
+            "reordercats" => {
+                let v = self.eval_args(args)?;
+                Ok(v.first().cloned())
+            }
+            "categories" => {
+                let v = self.eval_args(args)?;
+                let mut names: Vec<String> = match v.first() {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(s)) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                names.sort();
+                names.dedup();
+                Ok(Some(Value::Cell(CellArray::col(names.into_iter().map(Value::Str).collect()))))
+            }
+            "countcats" => {
+                let v = self.eval_args(args)?;
+                let cats: Vec<String> = match v.first() {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(s)) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                let mut uniq = cats.clone();
+                uniq.sort();
+                uniq.dedup();
+                let counts: Vec<f64> = uniq.iter().map(|u| cats.iter().filter(|x| *x == u).count() as f64).collect();
+                Ok(Some(Value::Mat(Matrix::col_vector(counts))))
+            }
+            "addcats" | "removecats" | "mergecats" | "renamecats" | "isundefined" | "isdatetime" | "isduration" | "istimetable" => {
+                let v = self.eval_args(args)?;
+                if name == "isundefined" {
+                    let out = match v.first() {
+                        Some(Value::Cell(c)) => {
+                            let mut m = Matrix::zeros(c.rows, 1);
+                            for r in 0..c.rows {
+                                let empty = matches!(c.get(r, 0), Some(Value::Str(s)) if s.is_empty());
+                                let _ = m.set(r, 0, if empty { 1.0 } else { 0.0 });
+                            }
+                            Value::Mat(m)
+                        }
+                        _ => Value::Num(0.0),
+                    };
+                    return Ok(Some(out));
+                }
+                if matches!(name, "isdatetime" | "isduration" | "istimetable") {
+                    return Ok(Some(Value::Num(0.0)));
+                }
+                Ok(v.first().cloned())
+            }
+            "datetime" | "duration" | "seconds" => {
+                let v = self.eval_args(args)?;
+                if name == "duration" || name == "seconds" {
+                    return Ok(v.first().cloned().or(Some(Value::Num(0.0))));
+                }
+                let now = self.date_call("now", &[])?.into_iter().next().unwrap_or(Value::Num(0.0));
+                let serial = match v.first() {
+                    None => now.scalar()?,
+                    Some(Value::Str(s)) if s.eq_ignore_ascii_case("now") => now.scalar()?,
+                    Some(Value::Num(x)) => *x,
+                    Some(Value::Mat(m)) if m.numel() == 1 => m.data().first().copied().unwrap_or(0.0),
+                    Some(_) => {
+                        let exprs: Vec<Expr> = v.iter().filter_map(|x| x.scalar().ok()).map(Expr::Num).collect();
+                        self.date_call("datenum", &exprs)?.first().and_then(|x| x.scalar().ok()).unwrap_or(0.0)
+                    }
+                };
+                let mut fmt = 1.0;
+                for i in 0..v.len().saturating_sub(1) {
+                    if let (Value::Str(k), Value::Str(f)) = (&v[i], &v[i + 1]) {
+                        if k.eq_ignore_ascii_case("Format") {
+                            fmt = if f.contains("yyyy-MM-dd HH:mm:ss") {
+                                31.0
+                            } else if f.contains("HH:mm:ss") {
+                                13.0
+                            } else {
+                                1.0
+                            };
+                        }
+                    }
+                }
+                let out = self.date_call("datestr", &[Expr::Num(serial), Expr::Num(fmt)])?;
+                Ok(out.into_iter().next())
+            }
+            "count" => {
+                let v = self.eval_args(args)?;
+                if let (Some(Value::Object(o)), Some(key)) = (v.first(), v.get(1)) {
+                    if o.class_name == "containers.Map" {
+                        return Ok(Some(Value::Num(maps::count(o, key) as f64)));
+                    }
+                }
+                if let (Some(Value::Str(s)), Some(Value::Str(p))) = (v.first(), v.get(1)) {
+                    if p.is_empty() {
+                        return Ok(Some(Value::Num(0.0)));
+                    }
+                    let mut n = 0usize;
+                    let mut start = 0usize;
+                    while start <= s.len() {
+                        match s.get(start..).and_then(|x| x.find(p)) {
+                            Some(i) => {
+                                n += 1;
+                                start += i + p.len().max(1);
+                            }
+                            None => break,
+                        }
+                    }
+                    return Ok(Some(Value::Num(n as f64)));
+                }
+                Err(LangError::new("count needs a map or two strings", 0))
+            }
+            "isKey" | "keys" | "values" | "remove" => {
+                let v = self.eval_args(args)?;
+                let Some(Value::Object(o)) = v.first() else {
+                    return Err(LangError::new(format!("{name} needs a containers.Map"), 0));
+                };
+                if o.class_name != "containers.Map" {
+                    return Err(LangError::new(format!("{name} needs a containers.Map"), 0));
+                }
+                match name {
+                    "keys" => Ok(Some(maps::keys(o))),
+                    "values" => Ok(Some(maps::values(o))),
+                    "isKey" => {
+                        let key = v.get(1).ok_or_else(|| LangError::new("isKey needs a key", 0))?;
+                        Ok(Some(Value::Num(if maps::is_key(o, key) { 1.0 } else { 0.0 })))
+                    }
+                    _ => {
+                        let key = v.get(1).ok_or_else(|| LangError::new("remove needs a key", 0))?;
+                        let _ = maps::remove(o, key);
+                        Ok(None)
+                    }
+                }
+            }
+            "formulaatoms" | "formulaweight" | "formulacheck" | "inferformula" | "parsereaction" | "formatreaction" | "canonicalreaction"
+            | "rxnequal" | "rxnbalance" | "gprparse" | "gpreval" | "gprgenes" | "gprmerge" | "fastaread" | "fastawrite" | "genbankread" => {
+                let v = self.eval_args(args)?;
+                let out = self.bio_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
+            | "cophenet" | "silhouette" | "randindex" | "mutualinfo" | "evalclusters" => {
+                let v = self.eval_args(args)?;
+                let out = self.metrics_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
+            | "bfsearch" | "dfsearch" | "adjacency" | "incidence" | "isgraph" => {
+                let v = self.eval_args(args)?;
+                let out = self.graph_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" | "zscore" => {
+                let v = self.eval_args(args)?;
+                let out = self.mathx_builtin(name, v)?;
+                Ok(out.into_iter().next())
+            }
+            "anova1" | "anova2" | "multcompare" | "friedman" => {
+                let v = self.eval_args(args)?;
+                let out = self.anova_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "ncread" | "ncwrite" | "ncinfo" | "ncdisp" => {
+                let v = self.eval_args(args)?;
+                let out = self.netcdf_builtin(name, v, 1)?;
+                Ok(out.into_iter().next())
+            }
+            "fzero" | "integral" | "quad" => self.solve_scalar(name, args),
             // --- linear algebra ---------------------------------------------
             "eig" | "svd" | "qr" | "lu" | "chol" | "rref" | "pinv" | "rank" | "cond" | "trace" | "null" | "orth" => self.linalg(name, args),
             // --- strings -----------------------------------------------------
@@ -5463,25 +7240,72 @@ impl Session {
                 let v = self.eval_args(args)?;
                 match v.first() {
                     Some(Value::Str(s)) => Ok(Some(Value::Num(s.trim().parse::<f64>().unwrap_or(f64::NAN)))),
+                    // Cellstr/string arrays convert elementwise to a numeric
+                    // array of the same shape (MATLAB `str2double`).
+                    Some(Value::Cell(c)) => {
+                        let mut data = Vec::with_capacity(c.numel());
+                        for i in 0..c.numel() {
+                            let x = match c.get_linear(i) {
+                                Some(Value::Str(s)) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
+                                _ => f64::NAN,
+                            };
+                            data.push(x);
+                        }
+                        let m = Matrix::from_col_major(c.rows, c.cols, data).map_err(lang)?;
+                        Ok(Some(mat_or_num(m)))
+                    }
                     Some(x) => Ok(Some(Value::Num(x.scalar()?))),
                     None => Err(LangError::new("str2double needs a string", 0)),
                 }
             }
             "strcmp" | "strcmpi" => {
                 let v = self.eval_args(args)?;
-                let (a, b) = (v.first(), v.get(1));
-                let eq = match (a, b) {
-                    (Some(Value::Str(x)), Some(Value::Str(y))) => {
-                        if name == "strcmpi" {
-                            x.eq_ignore_ascii_case(y)
-                        } else {
-                            x == y
-                        }
+                let ci = name == "strcmpi";
+                let eq_str = |x: &str, y: &str| if ci { x.eq_ignore_ascii_case(y) } else { x == y };
+                let other_at = |other: &Value, i: usize| -> Option<String> {
+                    match other {
+                        Value::Str(s) => Some(s.clone()),
+                        Value::Cell(c) => match c.get_linear(if c.numel() == 1 { 0 } else { i }) {
+                            Some(Value::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
                     }
-                    (Some(x), Some(y)) => values_equal(x, y),
-                    _ => false,
                 };
-                Ok(Some(Value::Num(if eq { 1.0 } else { 0.0 })))
+                match (v.first(), v.get(1)) {
+                    // Cellstr/string-array comparisons return a logical array
+                    // the same shape as the cell input (MATLAB rule).
+                    (Some(Value::Cell(ca)), Some(other)) => {
+                        let mut data = Vec::with_capacity(ca.numel());
+                        for i in 0..ca.numel() {
+                            let hit = match (ca.get_linear(i), other_at(other, i)) {
+                                (Some(Value::Str(a)), Some(b)) => eq_str(a, &b),
+                                _ => false,
+                            };
+                            data.push(if hit { 1.0 } else { 0.0 });
+                        }
+                        let m = Matrix::from_col_major(ca.rows, ca.cols, data).map_err(lang)?;
+                        Ok(Some(Value::Mat(m)))
+                    }
+                    (Some(Value::Str(a)), Some(Value::Cell(cb))) => {
+                        let mut data = Vec::with_capacity(cb.numel());
+                        for i in 0..cb.numel() {
+                            let hit = match cb.get_linear(i) {
+                                Some(Value::Str(b)) => eq_str(a, b),
+                                _ => false,
+                            };
+                            data.push(if hit { 1.0 } else { 0.0 });
+                        }
+                        let m = Matrix::from_col_major(cb.rows, cb.cols, data).map_err(lang)?;
+                        Ok(Some(Value::Mat(m)))
+                    }
+                    (Some(Value::Str(x)), Some(Value::Str(y))) => Ok(Some(Value::Num(if eq_str(x, y) { 1.0 } else { 0.0 }))),
+                    (Some(x), Some(y)) => {
+                        let eq = values_equal(x, y);
+                        Ok(Some(Value::Num(if eq { 1.0 } else { 0.0 })))
+                    }
+                    _ => Ok(Some(Value::Num(0.0))),
+                }
             }
             "strcat" => {
                 let v = self.eval_args(args)?;
@@ -5499,6 +7323,190 @@ impl Session {
                 match v.first() {
                     Some(Value::Str(s)) => Ok(Some(Value::Str(if name == "upper" { s.to_uppercase() } else { s.to_lowercase() }))),
                     _ => Err(LangError::new(format!("{name} needs a string"), 0)),
+                }
+            }
+            "contains" | "startswith" | "endswith" | "startsWith" | "endsWith" => {
+                let v = self.eval_args(args)?;
+                let pat = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string pattern"), 0)),
+                };
+                let test = |s: &str| -> bool {
+                    match name {
+                        "contains" => s.contains(&pat),
+                        "startswith" | "startsWith" => s.starts_with(&pat),
+                        _ => s.ends_with(&pat),
+                    }
+                };
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(if test(s) { 1.0 } else { 0.0 }))),
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let flag = match item {
+                                Value::Str(s) => test(s),
+                                _ => false,
+                            };
+                            out.set_linear(i, if flag { 1.0 } else { 0.0 });
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    _ => Err(LangError::new(format!("{name} needs a string or cell array of strings"), 0)),
+                }
+            }
+            "strsplit" => {
+                let v = self.eval_args(args)?;
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("strsplit needs a string", 0)),
+                };
+                let delim = match v.get(1) {
+                    Some(Value::Str(d)) => d.clone(),
+                    _ => " ".to_string(),
+                };
+                let parts: Vec<Value> = s.split(delim.as_str()).filter(|p| !p.is_empty()).map(|p| Value::Str(p.to_string())).collect();
+                Ok(Some(Value::Cell(CellArray::row(parts))))
+            }
+            "strjoin" => {
+                let v = self.eval_args(args)?;
+                let delim = match v.get(1) {
+                    Some(Value::Str(d)) => d.clone(),
+                    _ => " ".to_string(),
+                };
+                let items = match v.first() {
+                    Some(Value::Cell(c)) => &c.items,
+                    _ => return Err(LangError::new("strjoin needs a cell array of strings", 0)),
+                };
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Str(s) => parts.push(s.clone()),
+                        _ => return Err(LangError::new("strjoin needs a cell array of strings", 0)),
+                    }
+                }
+                Ok(Some(Value::Str(parts.join(&delim))))
+            }
+            "strlength" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(s.chars().count() as f64))),
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let n = match item {
+                                Value::Str(s) => s.chars().count() as f64,
+                                _ => 0.0,
+                            };
+                            out.set_linear(i, n);
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    _ => Err(LangError::new("strlength needs a string or cell array", 0)),
+                }
+            }
+            "fileread" => {
+                let v = self.eval_args(args)?;
+                let path = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("fileread needs a file name", 0)),
+                };
+                let bytes = std::fs::read(&path).map_err(|e| LangError::new(format!("fileread: {path}: {e}"), 0))?;
+                Ok(Some(Value::Str(String::from_utf8_lossy(&bytes).to_string())))
+            }
+            "isfolder" => {
+                let v = self.eval_args(args)?;
+                let path = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isfolder needs a path", 0)),
+                };
+                Ok(Some(Value::Num(if std::path::Path::new(&path).is_dir() { 1.0 } else { 0.0 })))
+            }
+            "rows" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Object(o)) if o.class_name == "table" => {
+                        let n = o
+                            .prop("Properties")
+                            .and_then(|p| match p {
+                                Value::Struct(s) => s.field_at(0, "NumRows").cloned(),
+                                _ => None,
+                            })
+                            .and_then(|x| x.scalar().ok())
+                            .unwrap_or(0.0);
+                        Ok(Some(Value::Num(n)))
+                    }
+                    Some(Value::Cell(c)) => Ok(Some(Value::Num(c.rows as f64))),
+                    Some(Value::Mat(m)) => Ok(Some(Value::Num(m.rows() as f64))),
+                    Some(Value::Struct(s)) => Ok(Some(Value::Num(s.rows as f64))),
+                    _ => Ok(Some(Value::Num(1.0))),
+                }
+            }
+            "array2table" => {
+                let v = self.eval_args(args)?;
+                let m = match v.first() {
+                    Some(x) => x.to_numeric()?,
+                    None => return Err(LangError::new("array2table needs a matrix", 0)),
+                };
+                let mut names = Vec::new();
+                let mut i = 1usize;
+                while i < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        if key.eq_ignore_ascii_case("VariableNames") {
+                            if let Some(Value::Cell(c)) = v.get(i + 1) {
+                                for item in &c.items {
+                                    if let Value::Str(s) = item {
+                                        names.push(s.clone());
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                if names.len() != m.cols() {
+                    names = (1..=m.cols()).map(|c| format!("Var{c}")).collect();
+                }
+                let mut props = StructArray::new();
+                for (c, name) in names.iter().enumerate() {
+                    let col: Vec<f64> = (0..m.rows()).map(|r| m.get(r, c).unwrap_or(0.0)).collect();
+                    props.set_field(0, name, Value::Mat(Matrix::col_vector(col)))?;
+                }
+                let mut p = StructArray::new();
+                p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.iter().cloned().map(Value::Str).collect())))?;
+                p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+                p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+                p.set_field(0, "NumRows", Value::Num(m.rows() as f64))?;
+                props.set_field(0, "Properties", Value::Struct(p))?;
+                Ok(Some(Value::Object(MObject::owned("table".to_string(), props))))
+            }
+            "ismissing" => {
+                let v = self.eval_args(args)?;
+                match v.first() {
+                    Some(Value::Mat(m)) => {
+                        let mut out = Matrix::zeros(m.rows(), m.cols());
+                        for r in 0..m.rows() {
+                            for c in 0..m.cols() {
+                                let _ = out.set(r, c, if m.get(r, c).map(|x| x.is_nan()).unwrap_or(true) { 1.0 } else { 0.0 });
+                            }
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    Some(Value::Cell(c)) => {
+                        let mut out = Matrix::zeros(c.rows, c.cols);
+                        for (i, item) in c.items.iter().enumerate() {
+                            let flag = match item {
+                                Value::Str(s) => s.is_empty(),
+                                Value::Mat(m) => m.numel() == 0,
+                                _ => false,
+                            };
+                            out.set_linear(i, if flag { 1.0 } else { 0.0 });
+                        }
+                        Ok(Some(Value::Mat(out)))
+                    }
+                    Some(Value::Str(s)) => Ok(Some(Value::Num(if s.is_empty() { 1.0 } else { 0.0 }))),
+                    _ => Ok(Some(Value::Num(1.0))),
                 }
             }
             "strtrim" => {
@@ -5561,6 +7569,9 @@ impl Session {
                             ));
                         }
                     }
+                }
+                if let Some(Value::Str(s)) = v.first() {
+                    return Ok(Some(Value::Str(s.clone())));
                 }
                 let m = v.first().ok_or_else(|| LangError::new("char needs an argument", 0))?.to_matrix()?;
                 let s: String = m.data().iter().map(|&x| char::from_u32(x as u32).unwrap_or(' ')).collect();
@@ -5730,23 +7741,38 @@ impl Session {
             "clc" | "home" => Ok(None),
             "addpath" | "rmpath" => {
                 let v = self.eval_args(args)?;
+                let mut at_end = false;
+                let mut dirs: Vec<std::path::PathBuf> = Vec::new();
                 for x in &v {
                     if let Value::Str(s) = x {
+                        if s.eq_ignore_ascii_case("-end") {
+                            at_end = true;
+                            continue;
+                        }
+                        if s.eq_ignore_ascii_case("-begin") {
+                            at_end = false;
+                            continue;
+                        }
                         // `addpath(genpath(pwd))` passes a `;`-separated list
                         // (MATLAB pathsep on all platforms here).
                         for part in s.split(';') {
-                            if part.is_empty() {
-                                continue;
-                            }
-                            let dir = std::path::PathBuf::from(part);
-                            if name == "addpath" {
-                                if !self.paths.contains(&dir) {
-                                    self.paths.push(dir);
-                                }
-                            } else {
-                                self.paths.retain(|p| p != &dir);
+                            if !part.is_empty() {
+                                dirs.push(std::path::PathBuf::from(part));
                             }
                         }
+                    }
+                }
+                for dir in dirs {
+                    if name == "addpath" {
+                        if !self.paths.contains(&dir) {
+                            if at_end {
+                                self.paths.push(dir);
+                            } else {
+                                self.paths.insert(0, dir);
+                            }
+                        }
+                    } else {
+                        self.paths.retain(|p| p != &dir);
                     }
                 }
                 Ok(None)
@@ -5816,10 +7842,36 @@ impl Session {
                 Ok(Some(Value::Mat(Matrix::from_col_major(r, c, data).map_err(lang)?)))
             }
             "path" => {
-                for d in &self.paths {
-                    self.print_buf.push_str(&format!("{}\n", d.display()));
+                let v = self.eval_args(args)?;
+                if let Some(first) = v.first() {
+                    let mut new_paths: Vec<std::path::PathBuf> = Vec::new();
+                    let mut add = |s: &str| {
+                        for part in s.split(';') {
+                            if !part.trim().is_empty() {
+                                let p = std::path::PathBuf::from(part.trim());
+                                if !new_paths.contains(&p) {
+                                    new_paths.push(p);
+                                }
+                            }
+                        }
+                    };
+                    match first {
+                        Value::Str(s) => add(s),
+                        Value::Cell(c) => {
+                            for item in &c.items {
+                                if let Value::Str(s) = item {
+                                    add(s);
+                                }
+                            }
+                        }
+                        _ => return Err(LangError::new("path needs a string or cellstr", 0)),
+                    }
+                    self.paths = new_paths;
+                    Ok(Some(Value::Num(0.0)))
+                } else {
+                    let joined = self.paths.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(";");
+                    Ok(Some(Value::Str(joined)))
                 }
-                Ok(None)
             }
             "pwd" => Ok(Some(Value::Str(std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default()))),
             "cd" => {
@@ -5966,15 +8018,82 @@ impl Session {
             }
             // --- extra strings --------------------------------------------------
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
-            | "regexpi" | "regexprep" => {
+            | "regexpi" | "regexprep" | "erase" | "replace" | "findstr" | "extractBefore" | "extractAfter" | "insertBefore" | "isstrprop"
+            | "isletter" | "compose" | "splitlines" | "readlines" => {
                 let outs = self.str_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
             // --- environment / system -------------------------------------------
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
-            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
-            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
-            | "inline" | "optimset" | "optimget" | "nargchk" => {
+            "version"
+            | "computer"
+            | "ispc"
+            | "isunix"
+            | "ismac"
+            | "getenv"
+            | "setenv"
+            | "system"
+            | "dos"
+            | "unix"
+            | "savepath"
+            | "fileparts"
+            | "copyfile"
+            | "movefile"
+            | "rmdir"
+            | "isdir"
+            | "isfile"
+            | "tempdir"
+            | "tempname"
+            | "evalc"
+            | "evalin"
+            | "assignin"
+            | "mfilename"
+            | "jsondecode"
+            | "jsonencode"
+            | "importdata"
+            | "detectImportOptions"
+            | "webread"
+            | "urlread"
+            | "web"
+            | "winopen"
+            | "uigetdir"
+            | "questdlg"
+            | "uimenu"
+            | "actxserver"
+            | "rethrow"
+            | "verLessThan"
+            | "inputname"
+            | "validateattributes"
+            | "validatestring"
+            | "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal"
+            | "license"
+            | "ver"
+            | "drawnow"
+            | "beep"
+            | "waitbar"
+            | "input"
+            | "ishandle"
+            | "findobj"
+            | "findall"
+            | "ishold"
+            | "gca"
+            | "help"
+            | "diary"
+            | "doc"
+            | "class"
+            | "inline"
+            | "optimset"
+            | "optimoptions"
+            | "optimget"
+            | "nargchk" => {
                 let outs = self.sys_call(name, args)?;
                 Ok(outs.into_iter().next())
             }
@@ -6075,15 +8194,357 @@ impl Session {
         &mut self.figs[self.cur_fig - 1]
     }
 
+    fn venncounts_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let mut sets = Vec::new();
+        for v in argv {
+            sets.push(metrics::set_of(v)?);
+        }
+        if !(2..=10).contains(&sets.len()) {
+            return Err(LangError::new("venncounts supports 2 to 10 sets", 0));
+        }
+        let n = sets.len();
+        let mut universe = std::collections::BTreeSet::new();
+        for s in &sets {
+            universe.extend(s.iter().cloned());
+        }
+        let mut counts = vec![0.0f64; 1usize << n];
+        for item in universe {
+            let mut mask = 0usize;
+            for (k, s) in sets.iter().enumerate() {
+                if s.contains(&item) {
+                    mask |= 1 << k;
+                }
+            }
+            if let Some(slot) = counts.get_mut(mask) {
+                *slot += 1.0;
+            }
+        }
+        let mut out = Matrix::zeros(1usize << n, n + 1);
+        for mask in 0..(1usize << n) {
+            for k in 0..n {
+                let _ = out.set(mask, k, if mask & (1 << k) != 0 { 1.0 } else { 0.0 });
+            }
+            let _ = out.set(mask, n, counts.get(mask).copied().unwrap_or(0.0));
+        }
+        Ok(Some(Value::Mat(out)))
+    }
+
+    fn volcano_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let fc = argv.first().ok_or_else(|| LangError::new("volcano needs log2 fold changes", 0))?.to_numeric()?;
+        let pv = argv.get(1).ok_or_else(|| LangError::new("volcano needs p-values", 0))?.to_numeric()?;
+        if fc.numel() != pv.numel() {
+            return Err(LangError::new("volcano: fold changes and p-values must have the same length", 0));
+        }
+        let mut alpha = 0.05f64;
+        let mut fold = 1.0f64;
+        let mut i = 2usize;
+        while i + 1 < argv.len() {
+            if let Value::Str(key) = &argv[i] {
+                let value = argv.get(i + 1).ok_or_else(|| LangError::new("volcano: missing option value", 0))?;
+                match key.to_ascii_lowercase().as_str() {
+                    "alpha" => alpha = value.scalar()?,
+                    "foldchange" | "fold" => fold = value.scalar()?,
+                    other => return Err(LangError::new(format!("volcano: unknown option '{other}'"), 0)),
+                }
+            }
+            i += 2;
+        }
+        let n = fc.numel();
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut colors = Vec::with_capacity(n);
+        let up = matplot::Rgb(0xD9, 0x53, 0x19);
+        let down = matplot::Rgb(0x00, 0x72, 0xBD);
+        let flat = matplot::Rgb(0x99, 0x99, 0x99);
+        for k in 0..n {
+            let f = fc.get_linear(k).unwrap_or(0.0);
+            let p = pv.get_linear(k).unwrap_or(1.0).clamp(1e-300, 1.0);
+            x.push(f);
+            y.push(-p.log10());
+            colors.push(if p < alpha && f >= fold {
+                up
+            } else if p < alpha && f <= -fold {
+                down
+            } else {
+                flat
+            });
+        }
+        let ymax = y.iter().copied().fold(1.0f64, f64::max);
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        self.figure_mut().push(matplot::SeriesKind::Scatter, x, y, matplot::LineSpec::new());
+        if let Some(series) = self.figure_mut().series.last_mut() {
+            series.colors = colors;
+        }
+        let mut dashed = matplot::LineSpec::new();
+        dashed.dash = matplot::DashStyle::Dashed;
+        dashed.color = Some(matplot::Rgb(0x66, 0x66, 0x66));
+        self.figure_mut().push(matplot::SeriesKind::Line, vec![-fold, -fold], vec![0.0, ymax], dashed.clone());
+        self.figure_mut().push(matplot::SeriesKind::Line, vec![fold, fold], vec![0.0, ymax], dashed.clone());
+        self.figure_mut().push(
+            matplot::SeriesKind::Line,
+            vec![-fold.abs().max(1.0), fold.abs().max(1.0)],
+            vec![-alpha.log10(), -alpha.log10()],
+            dashed,
+        );
+        self.figure_mut().title = Some("volcano".into());
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn clustergram_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let x = argv.first().ok_or_else(|| LangError::new("clustergram needs data", 0))?.to_numeric()?;
+        if x.rows() < 2 || x.cols() < 2 {
+            return Err(LangError::new("clustergram needs at least a 2-by-2 matrix", 0));
+        }
+        let dr = self.metrics_builtin("pdist", vec![Value::Mat(x.clone())], 1)?;
+        let dr = dr.first().ok_or_else(|| LangError::new("clustergram: pdist failed", 0))?.to_numeric()?;
+        let zr = self.mathx_builtin("linkage", vec![Value::Mat(dr), Value::Str("average".into())])?;
+        let zr = zr.first().ok_or_else(|| LangError::new("clustergram: row linkage failed", 0))?.to_numeric()?;
+        let dc = self.metrics_builtin("pdist", vec![Value::Mat(x.transpose())], 1)?;
+        let dc = dc.first().ok_or_else(|| LangError::new("clustergram: pdist failed", 0))?.to_numeric()?;
+        let zc = self.mathx_builtin("linkage", vec![Value::Mat(dc), Value::Str("average".into())])?;
+        let zc = zc.first().ok_or_else(|| LangError::new("clustergram: column linkage failed", 0))?.to_numeric()?;
+        let row_order = metrics::linkage_leaf_order(&zr)?;
+        let col_order = metrics::linkage_leaf_order(&zc)?;
+        let mut rows = Matrix::zeros(x.rows(), x.cols());
+        for (ri, &r) in row_order.iter().enumerate() {
+            for c in 0..x.cols() {
+                let _ = rows.set(ri, c, x.get(r, c).unwrap_or(0.0));
+            }
+        }
+        let mut ordered = Matrix::zeros(x.rows(), x.cols());
+        for (ci, &c) in col_order.iter().enumerate() {
+            for r in 0..x.rows() {
+                let _ = ordered.set(r, ci, rows.get(r, c).unwrap_or(0.0));
+            }
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        {
+            let fig = self.figure_mut();
+            fig.sub = None;
+            fig.yrev = true;
+            fig.colorbar = true;
+            fig.title = Some("clustergram".into());
+            let xs: Vec<f64> = (1..=ordered.cols()).map(|i| i as f64).collect();
+            let ys: Vec<f64> = (1..=ordered.rows()).map(|i| i as f64).collect();
+            fig.push_grid(
+                matplot::SeriesKind::Image,
+                xs,
+                ys,
+                ordered.data().to_vec(),
+                ordered.rows(),
+                ordered.cols(),
+                Vec::new(),
+                matplot::LineSpec::new(),
+            );
+        }
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn streamline_value(&mut self, argv: &[Value], slice: bool) -> Result<Option<Value>, LangError> {
+        let z = Matrix::zeros(0, 0);
+        let (x, y, u, v, sx, sy) = if slice && argv.len() >= 4 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?, z.clone(), z.clone())
+        } else if argv.len() >= 6 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?, argv[4].to_numeric()?, argv[5].to_numeric()?)
+        } else if argv.len() >= 4 {
+            (z.clone(), z.clone(), argv[0].to_numeric()?, argv[1].to_numeric()?, argv[2].to_numeric()?, argv[3].to_numeric()?)
+        } else if slice && argv.len() >= 2 {
+            (z.clone(), z.clone(), argv[0].to_numeric()?, argv[1].to_numeric()?, z.clone(), z.clone())
+        } else {
+            return Err(LangError::new(
+                if slice { "streamslice needs U,V or X,Y,U,V" } else { "streamline needs U,V,startX,startY or X,Y,U,V,startX,startY" },
+                0,
+            ));
+        };
+        let n = sx.numel().min(sy.numel());
+        let seeds: Vec<(f64, f64)> = (0..n).map(|i| (sx.get_linear(i).unwrap_or(0.0), sy.get_linear(i).unwrap_or(0.0))).collect();
+        let grid_seeds = slice && seeds.is_empty();
+        if !slice && seeds.is_empty() {
+            return Err(LangError::new("streamline needs at least one seed point", 0));
+        }
+        let lines = streams::compute(&x, &y, &u, &v, &seeds, grid_seeds);
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        for line in lines {
+            let xs: Vec<f64> = line.iter().map(|p| p.0).collect();
+            let ys: Vec<f64> = line.iter().map(|p| p.1).collect();
+            self.figure_mut().push(matplot::SeriesKind::Line, xs, ys, matplot::LineSpec::new());
+        }
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn dendrogram_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let z = argv.first().ok_or_else(|| LangError::new("dendrogram needs a linkage matrix", 0))?.to_numeric()?;
+        if z.cols() != 3 {
+            return Err(LangError::new("dendrogram: linkage matrix must have three columns", 0));
+        }
+        let n = z.rows() + 1;
+        let mut labels: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        let mut color_threshold = None;
+        let mut i = 1usize;
+        while i < argv.len() {
+            let key = match &argv[i] {
+                Value::Str(s) => s.to_ascii_lowercase(),
+                _ => return Err(LangError::new("dendrogram options must be name/value pairs", 0)),
+            };
+            let value = argv.get(i + 1).ok_or_else(|| LangError::new(format!("dendrogram: missing value for '{key}'"), 0))?;
+            match key.as_str() {
+                "labels" => labels = bio::as_string_list(value, "Labels")?,
+                "colorthreshold" => color_threshold = Some(value.scalar()?),
+                other => return Err(LangError::new(format!("dendrogram: unknown option '{other}'"), 0)),
+            }
+            i += 2;
+        }
+        if labels.len() != n {
+            return Err(LangError::new("dendrogram: Labels must match the number of leaves", 0));
+        }
+        let max_h = (0..z.rows()).map(|r| z.get(r, 2).unwrap_or(0.0)).fold(0.0f64, f64::max);
+        let threshold = color_threshold.unwrap_or(max_h * 0.7);
+        let clusters = metrics::cluster_from_linkage(&z, threshold, None)?;
+        let palette = [
+            matplot::Rgb(0x00, 0x72, 0xBD),
+            matplot::Rgb(0xD9, 0x53, 0x19),
+            matplot::Rgb(0xED, 0xB1, 0x20),
+            matplot::Rgb(0x7E, 0x2F, 0x8E),
+            matplot::Rgb(0x77, 0xAC, 0x30),
+            matplot::Rgb(0x4D, 0xBE, 0xEE),
+            matplot::Rgb(0xA2, 0x14, 0x2F),
+        ];
+        let mut colors = Vec::with_capacity(z.rows());
+        for r in 0..z.rows() {
+            let leaf = z.get(r, 0).unwrap_or(1.0).round().max(1.0) as usize;
+            let cluster = clusters.get(leaf.saturating_sub(1)).copied().unwrap_or(1.0).max(1.0) as usize;
+            colors.push(palette[(cluster - 1) % palette.len()]);
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        self.figure_mut().push_dendrogram(z.data().to_vec(), z.rows(), labels, colors);
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn venn_value(&mut self, argv: &[Value]) -> Result<Option<Value>, LangError> {
+        let mut sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        let mut labels: Option<Vec<String>> = None;
+        let mut i = 0usize;
+        while i < argv.len() {
+            match &argv[i] {
+                Value::Str(key) if key.eq_ignore_ascii_case("labels") => {
+                    labels = Some(bio::as_string_list(argv.get(i + 1).ok_or_else(|| LangError::new("venn: Labels needs a value", 0))?, "Labels")?);
+                    i += 2;
+                }
+                v => {
+                    sets.push(metrics::set_of(v)?);
+                    i += 1;
+                }
+            }
+        }
+        if !(2..=4).contains(&sets.len()) {
+            return Err(LangError::new("venn supports 2, 3 or 4 sets; use setmetrics for larger comparisons", 0));
+        }
+        let n = sets.len();
+        let mut labels = labels.unwrap_or_else(|| (0..n).map(|k| format!("S{}", k + 1)).collect());
+        if labels.len() != n {
+            return Err(LangError::new("venn: Labels must match the number of sets", 0));
+        }
+        if labels.iter().any(String::is_empty) {
+            labels = (0..n).map(|k| format!("S{}", k + 1)).collect();
+        }
+        let mut counts = vec![0.0f64; 1usize << n];
+        let mut universe = std::collections::BTreeSet::new();
+        for s in &sets {
+            universe.extend(s.iter().cloned());
+        }
+        for item in universe {
+            let mut mask = 0usize;
+            for (k, s) in sets.iter().enumerate() {
+                if s.contains(&item) {
+                    mask |= 1 << k;
+                }
+            }
+            if mask != 0 {
+                if let Some(slot) = counts.get_mut(mask) {
+                    *slot += 1.0;
+                }
+            }
+        }
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        self.figure_mut().push_venn(labels, counts, Vec::new());
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
+    fn quiver_value(&mut self, argv: &[Value], three_d: bool) -> Result<Option<Value>, LangError> {
+        let (x, y, z, u, vv, w) = if three_d {
+            if argv.len() < 6 {
+                return Err(LangError::new("quiver3 needs X,Y,Z,U,V,W", 0));
+            }
+            (
+                argv[0].to_numeric()?,
+                argv[1].to_numeric()?,
+                argv[2].to_numeric()?,
+                argv[3].to_numeric()?,
+                argv[4].to_numeric()?,
+                Some(argv[5].to_numeric()?),
+            )
+        } else if argv.len() >= 4 {
+            (argv[0].to_numeric()?, argv[1].to_numeric()?, Matrix::zeros(0, 0), argv[2].to_numeric()?, argv[3].to_numeric()?, None)
+        } else if argv.len() >= 2 {
+            let u = argv[0].to_numeric()?;
+            let vv = argv[1].to_numeric()?;
+            let n = u.numel().min(vv.numel());
+            // With matrix components, lay the arrows out on the same grid as
+            // `meshgrid` (x across columns, y down rows); vectors are a 1-D row.
+            let (x, y) = if u.rows() > 1 && u.cols() > 1 && u.dims() == vv.dims() {
+                let rows = u.rows();
+                let xs: Vec<f64> = (0..n).map(|k| (k / rows + 1) as f64).collect();
+                let ys: Vec<f64> = (0..n).map(|k| (k % rows + 1) as f64).collect();
+                (Matrix::row_vector(xs), Matrix::row_vector(ys))
+            } else {
+                (Matrix::row_vector((1..=n).map(|k| k as f64).collect()), Matrix::row_vector(vec![0.0; n]))
+            };
+            (x, y, Matrix::zeros(0, 0), u, vv, None)
+        } else {
+            return Err(LangError::new("quiver needs U,V or X,Y,U,V", 0));
+        };
+        let n = x.numel().min(y.numel()).min(u.numel()).min(vv.numel());
+        if n == 0 || (three_d && z.numel() < n) || w.as_ref().is_some_and(|m| m.numel() < n) {
+            return Err(LangError::new("quiver: coordinate and vector lengths must match", 0));
+        }
+        let vectors: Vec<(f64, f64, f64)> = (0..n)
+            .map(|i| (u.get_linear(i).unwrap_or(0.0), vv.get_linear(i).unwrap_or(0.0), w.as_ref().and_then(|m| m.get_linear(i)).unwrap_or(0.0)))
+            .collect();
+        if !self.figure_mut().hold {
+            self.figure_mut().reset_axes();
+        }
+        self.figure_mut().push_quiver(
+            if three_d { matplot::SeriesKind::Quiver3 } else { matplot::SeriesKind::Quiver },
+            x.data().to_vec(),
+            y.data().to_vec(),
+            z.data().to_vec(),
+            vectors,
+            matplot::LineSpec::new(),
+        );
+        Ok(Some(Value::Num(self.cur_fig as f64)))
+    }
+
     /// Evaluate args then apply a figure-related command.
     fn fig_command(&mut self, name: &str, args: &[Expr]) -> Result<Option<Value>, LangError> {
         use matplot::SeriesKind;
         match name {
             "figure" => {
                 let v = self.eval_args(args)?;
+                // `figure(n)` selects/creates figure n; property/value pairs
+                // (`figure('Position', …, 'Color', 'w')`) just create one.
                 let n = match v.first() {
+                    Some(Value::Str(_)) | None => self.figs.len() + 1,
                     Some(val) => val.scalar()? as usize,
-                    None => self.figs.len() + 1,
                 };
                 if n > MAX_FIGURES {
                     return Err(LangError::new("figure number exceeds limit", 0));
@@ -6221,8 +8682,8 @@ impl Session {
                 self.figure_mut().push_err(SeriesKind::ErrorBar, x.data().to_vec(), y.data().to_vec(), Some(e.data().to_vec()), spec);
                 Ok(None)
             }
-            "vline" => {
-                // vline(x [, spec]) — a vertical line at each x, spanning
+            "vline" | "xline" => {
+                // vline(x [, spec]) / xline - a vertical line at each x, spanning
                 // the current y limits (auto when unset). Always appends,
                 // like hold on; name/value pairs beyond the spec are
                 // accepted but ignored. Returns the line count.
@@ -6479,6 +8940,25 @@ impl Session {
                 };
                 Ok(None)
             }
+            "lighting" => {
+                let v = self.eval_args(args)?;
+                let mode = match v.first() {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    Some(_) => return Err(LangError::new("lighting needs a mode string", 0)),
+                    None => return Ok(Some(Value::Str(if self.figure_mut().lighting { "flat" } else { "none" }.into()))),
+                };
+                match mode.as_str() {
+                    "none" => self.figure_mut().lighting = false,
+                    "flat" | "gouraud" | "phong" => self.figure_mut().lighting = true,
+                    other => return Err(LangError::new(format!("lighting: unknown mode '{other}'"), 0)),
+                }
+                Ok(None)
+            }
+            "light" => {
+                let _ = self.eval_args(args)?;
+                self.figure_mut().lighting = true;
+                Ok(None)
+            }
             "caxis" | "clim" => {
                 let v = self.eval_args(args)?;
                 if v.is_empty() {
@@ -6680,8 +9160,8 @@ impl Session {
                 self.figure_mut().push_pie(m.data().to_vec(), labels);
                 Ok(None)
             }
-            "contour" => {
-                // contour(Z[,n|v]) | contour(X,Y,Z[,n|v])
+            "contour" | "contourf" | "contour3" => {
+                // contour/contourf/contour3(Z[,n|v]) | (X,Y,Z[,n|v])
                 let v = self.eval_args(args)?;
                 let (xv, yv, zm, spec_arg): (Vec<f64>, Vec<f64>, Matrix, Option<&Value>) = match v.len() {
                     1 | 2 => {
@@ -6699,7 +9179,7 @@ impl Session {
                             if ym.numel() == zm.rows() { ym.data().to_vec() } else { (0..zm.rows()).map(|r| ym.get(r, 0).unwrap_or(0.0)).collect() };
                         (x, y, zm, v.get(3))
                     }
-                    _ => return Err(LangError::new("contour needs (Z), (Z,n|v) or (X,Y,Z[,n|v])", 0)),
+                    _ => return Err(LangError::new(format!("{name} needs (Z), (Z,n|v) or (X,Y,Z[,n|v])"), 0)),
                 };
                 let (rows, cols) = zm.shape();
                 check_elems(rows.saturating_mul(cols))?;
@@ -6727,7 +9207,12 @@ impl Session {
                 if !self.figure_mut().hold {
                     self.figure_mut().reset_axes();
                 }
-                self.figure_mut().push_grid(SeriesKind::Contour, xv, yv, zm.data().to_vec(), rows, cols, levels, matplot::LineSpec::new());
+                let kind = match name {
+                    "contourf" => SeriesKind::ContourF,
+                    "contour3" => SeriesKind::Contour3,
+                    _ => SeriesKind::Contour,
+                };
+                self.figure_mut().push_grid(kind, xv, yv, zm.data().to_vec(), rows, cols, levels, matplot::LineSpec::new());
                 Ok(None)
             }
             "plot3" => {
@@ -6759,9 +9244,9 @@ impl Session {
                 }
                 Ok(None)
             }
-            "surf" | "mesh" => {
-                // surf(Z) | surf(X,Y,Z) — X/Y vectors or meshgrid matrices.
-                let kind = if name == "surf" { SeriesKind::Surf } else { SeriesKind::Mesh };
+            "surf" | "surfl" | "mesh" | "surfc" => {
+                // surf/surfc/mesh(Z) | (X,Y,Z) — vectors or meshgrid matrices.
+                let kind = if matches!(name, "surf" | "surfl" | "surfc") { SeriesKind::Surf } else { SeriesKind::Mesh };
                 let v = self.eval_args(args)?;
                 let zm = match v.len() {
                     1 => v[0].to_matrix()?,
@@ -6802,8 +9287,184 @@ impl Session {
                 if !self.figure_mut().hold {
                     self.figure_mut().reset_axes();
                 }
-                self.figure_mut().push_grid(kind, xf, yf, zm.data().to_vec(), rows, cols, Vec::new(), matplot::LineSpec::new());
+                let zdata = zm.data().to_vec();
+                if name == "surfc" {
+                    self.figure_mut().push_grid(
+                        SeriesKind::Surf,
+                        xf.clone(),
+                        yf.clone(),
+                        zdata.clone(),
+                        rows,
+                        cols,
+                        Vec::new(),
+                        matplot::LineSpec::new(),
+                    );
+                    self.figure_mut().push_grid(SeriesKind::Contour3Base, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
+                } else {
+                    self.figure_mut().push_grid(kind, xf, yf, zdata, rows, cols, Vec::new(), matplot::LineSpec::new());
+                }
+                if name == "surfl" {
+                    self.figure_mut().lighting = true;
+                }
                 Ok(None)
+            }
+            "daspect" => {
+                let v = self.eval_args(args)?;
+                if let Some(val) = v.first() {
+                    let _ = val;
+                    Ok(None)
+                } else {
+                    Ok(Some(Value::Mat(Matrix::row_vector(vec![1.0, 1.0, 1.0]))))
+                }
+            }
+            "rectangle" => {
+                // rectangle('Position',[x y w h], 'Curvature',c, …) - draw the
+                // outline as a closed polyline (curved corners are not filled).
+                let v = self.eval_args(args)?;
+                let mut pos = [0.0f64, 0.0, 1.0, 1.0];
+                let mut curvature = [0.0f64, 0.0];
+                let mut spec = matplot::LineSpec::new();
+                let mut i = 0;
+                while i < v.len() {
+                    let Value::Str(key) = &v[i] else {
+                        i += 1;
+                        continue;
+                    };
+                    let Some(val) = v.get(i + 1) else {
+                        return Err(LangError::new(format!("rectangle: '{key}' needs a value"), 0));
+                    };
+                    match key.trim().to_ascii_lowercase().as_str() {
+                        "position" => {
+                            let m = val.to_matrix()?;
+                            let d = m.data();
+                            if d.len() < 4 {
+                                return Err(LangError::new("rectangle: Position needs [x y w h]", 0));
+                            }
+                            pos.copy_from_slice(&d[..4]);
+                        }
+                        "curvature" => {
+                            let m = val.to_matrix()?;
+                            let d = m.data();
+                            curvature[0] = d.first().copied().unwrap_or(0.0).abs();
+                            curvature[1] = d.get(1).copied().unwrap_or(curvature[1]).abs();
+                        }
+                        "facecolor" | "edgecolor" => {
+                            if let Value::Str(s) = val {
+                                if s.eq_ignore_ascii_case("none") {
+                                    i += 2;
+                                    continue;
+                                }
+                                spec.color = named_rgb(s);
+                            } else {
+                                let m = val.to_matrix()?;
+                                let d = m.data();
+                                if d.len() >= 3 {
+                                    spec.color = Some(matplot::Rgb(
+                                        (d[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (d[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (d[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    ));
+                                }
+                            }
+                        }
+                        other => apply_plot_prop(&mut spec, other, val)?,
+                    }
+                    i += 2;
+                }
+                let [x, y, w, h] = pos;
+                let (mut xs, mut ys) = (Vec::new(), Vec::new());
+                if curvature[0] > 0.0 || curvature[1] > 0.0 {
+                    let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                    let steps = 64;
+                    for k in 0..=steps {
+                        let t = std::f64::consts::TAU * k as f64 / steps as f64;
+                        xs.push(cx + w / 2.0 * t.cos());
+                        ys.push(cy + h / 2.0 * t.sin());
+                    }
+                } else {
+                    xs = vec![x, x + w, x + w, x, x];
+                    ys = vec![y, y, y + h, y + h, y];
+                }
+                spec.dash = matplot::DashStyle::Solid;
+                self.figure_mut().push_err(matplot::SeriesKind::Line, xs, ys, None, spec);
+                Ok(None)
+            }
+            "patch" => {
+                // patch(X, Y, colour, …) - outlined polygon through the points.
+                let v = self.eval_args(args)?;
+                if v.len() < 2 {
+                    return Err(LangError::new("patch needs X and Y", 0));
+                }
+                let xm = v[0].to_matrix()?;
+                let ym = v[1].to_matrix()?;
+                if xm.numel() != ym.numel() || xm.numel() < 3 {
+                    return Err(LangError::new("patch: X and Y must be equal-length vectors", 0));
+                }
+                let mut spec = matplot::LineSpec::new();
+                if let Some(c) = v.get(2) {
+                    match c {
+                        Value::Str(s) => spec.color = named_rgb(s),
+                        _ => {
+                            let m = c.to_matrix()?;
+                            let d = m.data();
+                            if d.len() >= 3 {
+                                spec.color = Some(matplot::Rgb(
+                                    (d[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (d[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (d[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let mut i = 3;
+                while i + 1 < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        apply_plot_prop(&mut spec, key, &v[i + 1])?;
+                    }
+                    i += 2;
+                }
+                let mut xs: Vec<f64> = (0..xm.numel()).map(|k| xm.get_linear(k).unwrap_or(0.0)).collect();
+                let mut ys: Vec<f64> = (0..ym.numel()).map(|k| ym.get_linear(k).unwrap_or(0.0)).collect();
+                if let (Some(&x0), Some(&y0)) = (xs.first(), ys.first()) {
+                    xs.push(x0);
+                    ys.push(y0);
+                }
+                spec.dash = matplot::DashStyle::Solid;
+                self.figure_mut().push_err(matplot::SeriesKind::Line, xs, ys, None, spec);
+                Ok(None)
+            }
+            #[allow(clippy::approx_constant)] // documented colour values, not log10(2)
+            "lines" => {
+                // lines(n): n rows of the MATLAB default colour order,
+                // repeating the documented seven-colour cycle.
+                let v = self.eval_args(args)?;
+                let n = match v.first() {
+                    Some(val) => val.scalar()?.max(0.0) as usize,
+                    None => 7,
+                };
+                let cycle = [
+                    [0.0000, 0.4470, 0.7410],
+                    [0.8500, 0.3250, 0.0980],
+                    [0.9290, 0.6940, 0.1250],
+                    [0.4940, 0.1840, 0.5560],
+                    [0.4660, 0.6740, 0.1880],
+                    [0.3010, 0.7450, 0.9330],
+                    [0.6350, 0.0780, 0.1840],
+                ];
+                let mut out = Matrix::zeros(n, 3);
+                for i in 0..n {
+                    for (j, &val) in cycle[i % cycle.len()].iter().enumerate() {
+                        let _ = out.set(i, j, val);
+                    }
+                }
+                Ok(Some(Value::Mat(out)))
+            }
+            "validatecolor" => {
+                let v = self.eval_args(args)?;
+                let multiple = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("multiple")));
+                let out = validate_color(v.first(), multiple)?;
+                Ok(Some(Value::Mat(out)))
             }
             "saveas" | "exportgraphics" => {
                 let v = self.eval_args(args)?;
@@ -6842,6 +9503,446 @@ impl Session {
                 self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
                 Ok(None)
             }
+            "boxplot" => {
+                let v = self.eval_args(args)?;
+                let data = v.first().ok_or_else(|| LangError::new("boxplot needs data", 0))?.to_matrix()?;
+                let labels = v.windows(2).find_map(|w| match (&w[0], &w[1]) {
+                    (Value::Str(k), Value::Cell(c)) if k.eq_ignore_ascii_case("Labels") => Some(
+                        c.items
+                            .iter()
+                            .filter_map(|x| match x {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                });
+                if !self.figure_mut().hold {
+                    self.figure_mut().reset_axes();
+                }
+                let q = |vals: &[f64], p: f64| -> f64 {
+                    if vals.is_empty() {
+                        return f64::NAN;
+                    }
+                    let pos = (vals.len().saturating_sub(1)) as f64 * p;
+                    let lo = pos.floor() as usize;
+                    let hi = pos.ceil() as usize;
+                    vals.get(lo).copied().unwrap_or(f64::NAN) * (1.0 - (pos - lo as f64))
+                        + vals.get(hi).copied().unwrap_or(f64::NAN) * (pos - lo as f64)
+                };
+                let cols = data.cols();
+                for c in 0..cols {
+                    let mut vals: Vec<f64> = (0..data.rows()).filter_map(|r| data.get(r, c).filter(|x| x.is_finite())).collect();
+                    if vals.is_empty() {
+                        continue;
+                    }
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let (q1, med, q3) = (q(&vals, 0.25), q(&vals, 0.5), q(&vals, 0.75));
+                    let iqr = q3 - q1;
+                    let lo = vals.iter().copied().find(|x| *x >= q1 - 1.5 * iqr).unwrap_or(q1);
+                    let hi = vals.iter().rev().copied().find(|x| *x <= q3 + 1.5 * iqr).unwrap_or(q3);
+                    let x = (c + 1) as f64;
+                    let w = 0.32;
+                    let spec = matplot::LineSpec::new();
+                    self.figure_mut().push(SeriesKind::Line, vec![x - w, x + w, x + w, x - w, x - w], vec![q1, q1, q3, q3, q1], spec.clone());
+                    self.figure_mut().push(SeriesKind::Line, vec![x - w, x + w], vec![med, med], spec.clone());
+                    self.figure_mut().push(SeriesKind::Line, vec![x, x], vec![lo, q1], spec.clone());
+                    self.figure_mut().push(SeriesKind::Line, vec![x, x], vec![q3, hi], spec.clone());
+                    self.figure_mut().push(SeriesKind::Line, vec![x - w / 2.0, x + w / 2.0], vec![lo, lo], spec.clone());
+                    self.figure_mut().push(SeriesKind::Line, vec![x - w / 2.0, x + w / 2.0], vec![hi, hi], spec.clone());
+                    let outliers: Vec<f64> = vals.iter().copied().filter(|x| *x < lo || *x > hi).collect();
+                    if !outliers.is_empty() {
+                        let xs = vec![x; outliers.len()];
+                        self.figure_mut().push(SeriesKind::Scatter, xs, outliers, matplot::LineSpec::new());
+                    }
+                }
+                self.figure_mut().xticks = Some((1..=cols).map(|i| i as f64).collect());
+                if let Some(labels) = labels {
+                    if !labels.is_empty() {
+                        self.figure_mut().xticklabels = Some(labels);
+                    }
+                }
+                Ok(None)
+            }
+            "axes" => {
+                let v = self.eval_args(args)?;
+                if let Some(Value::Num(n)) = v.first() {
+                    if *n >= 1.0 {
+                        self.cur_fig = *n as usize;
+                    }
+                }
+                let _ = self.figure_mut();
+                Ok(Some(Value::Num(self.cur_fig as f64)))
+            }
+            "xticks" | "yticks" => {
+                let v = self.eval_args(args)?;
+                let slot = if name == "xticks" { &mut self.figure_mut().xticks } else { &mut self.figure_mut().yticks };
+                if let Some(x) = v.first() {
+                    let m = x.to_matrix()?;
+                    if m.numel() == 0 {
+                        *slot = None;
+                    } else {
+                        *slot = Some(m.data().to_vec());
+                    }
+                }
+                Ok(Some(Value::Mat(Matrix::row_vector(slot.clone().unwrap_or_default()))))
+            }
+            "xticklabels" | "yticklabels" => {
+                let v = self.eval_args(args)?;
+                let labels: Vec<String> = match v.first() {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(s)) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                if name == "xticklabels" {
+                    self.figure_mut().xticklabels = if labels.is_empty() { None } else { Some(labels.clone()) };
+                } else {
+                    self.figure_mut().yticklabels = if labels.is_empty() { None } else { Some(labels.clone()) };
+                }
+                Ok(Some(Value::Cell(CellArray::row(labels.into_iter().map(Value::Str).collect()))))
+            }
+            "xtickangle" | "ytickangle" => {
+                let v = self.eval_args(args)?;
+                let angle = v.first().map(|x| x.scalar()).transpose()?;
+                if name == "xtickangle" {
+                    self.figure_mut().xtickangle = angle;
+                } else {
+                    self.figure_mut().ytickangle = angle;
+                }
+                Ok(Some(Value::Num(angle.unwrap_or(0.0))))
+            }
+            "sgtitle" => {
+                let v = self.eval_args(args)?;
+                let text = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                self.figure_mut().sgtitle = if text.is_empty() { None } else { Some(text) };
+                Ok(None)
+            }
+            "tiledlayout" => {
+                let v = self.eval_args(args)?;
+                let nums: Vec<usize> = v
+                    .iter()
+                    .take_while(|x| matches!(x, Value::Num(_) | Value::Mat(_)))
+                    .filter_map(|x| x.scalar().ok())
+                    .map(|x| x.max(1.0) as usize)
+                    .collect();
+                let (rows, cols) = if nums.len() >= 3 {
+                    self.cur_fig = nums[0].max(1);
+                    (nums[1], nums[2])
+                } else if nums.len() >= 2 {
+                    (nums[0], nums[1])
+                } else {
+                    (1, 1)
+                };
+                self.tile_layout = Some((rows, cols));
+                self.tile_next = 0;
+                let mut props = StructArray::new();
+                props.set_field(0, "Rows", Value::Num(rows as f64))?;
+                props.set_field(0, "Cols", Value::Num(cols as f64))?;
+                props.set_field(0, "NextTile", Value::Num(1.0))?;
+                props.set_field(0, "Figure", Value::Num(self.cur_fig.max(1) as f64))?;
+                Ok(Some(Value::Object(MObject::new("TiledChartLayout".into(), props, true))))
+            }
+            "nexttile" => {
+                let v = self.eval_args(args)?;
+                let mut rows = self.tile_layout.map(|l| l.0).unwrap_or(1);
+                let mut cols = self.tile_layout.map(|l| l.1).unwrap_or(1);
+                let mut next = self.tile_next + 1;
+                let mut layout_obj: Option<MObject> = None;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "TiledChartLayout" {
+                        rows = o.prop("Rows").and_then(|x| x.scalar().ok()).unwrap_or(rows as f64) as usize;
+                        cols = o.prop("Cols").and_then(|x| x.scalar().ok()).unwrap_or(cols as f64) as usize;
+                        next = o.prop("NextTile").and_then(|x| x.scalar().ok()).unwrap_or(1.0).max(1.0) as usize;
+                        layout_obj = Some(o.clone());
+                    }
+                }
+                if let Some(idx) = v.get(1).and_then(|x| x.scalar().ok()) {
+                    next = idx.max(1.0) as usize;
+                }
+                let cell = next.min(rows.saturating_mul(cols).max(1));
+                self.figure_mut().subplot(rows, cols, &[cell]);
+                if let Some(mut o) = layout_obj {
+                    o.set_prop("NextTile", Value::Num((cell + 1) as f64));
+                } else {
+                    self.tile_next = cell;
+                }
+                Ok(Some(Value::Num(self.cur_fig as f64)))
+            }
+            "yline" => {
+                let v = self.eval_args(args)?;
+                let m = v.first().ok_or_else(|| LangError::new("yline needs y positions", 0))?.to_matrix()?;
+                let spec = v
+                    .iter()
+                    .skip(1)
+                    .find_map(|val| match val {
+                        Value::Str(s) => Some(matplot::LineSpec::parse(s)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let (x0, x1) = {
+                    let fig = self.figure_mut();
+                    match fig.xlim {
+                        Some(l) => l,
+                        None => {
+                            let (a, b, _, _) = matplot::view_limits(fig);
+                            if a.is_finite() && b.is_finite() {
+                                (a, b)
+                            } else {
+                                (0.0, 1.0)
+                            }
+                        }
+                    }
+                };
+                let fig = self.figure_mut();
+                let mut n = 0.0;
+                for y in m.data() {
+                    if !y.is_finite() {
+                        continue;
+                    }
+                    fig.push(SeriesKind::Line, vec![x0, x1], vec![*y, *y], spec.clone());
+                    n += 1.0;
+                }
+                Ok(Some(Value::Num(n)))
+            }
+            "barh" => {
+                let v = self.eval_args(args)?;
+                let (values, positions) = match v.len() {
+                    1 => {
+                        let y = v[0].to_matrix()?;
+                        (y, None)
+                    }
+                    _ => {
+                        let x = v[0].to_matrix()?;
+                        let y = v[1].to_matrix()?;
+                        (y, Some(x))
+                    }
+                };
+                if !self.figure_mut().hold {
+                    self.figure_mut().reset_axes();
+                }
+                let rows = values.rows();
+                let cols = values.cols();
+                let pos: Vec<f64> = match positions {
+                    Some(p) if p.numel() >= rows => (0..rows).map(|r| p.get_linear(r).unwrap_or(r as f64 + 1.0)).collect(),
+                    _ => (1..=rows).map(|r| r as f64).collect(),
+                };
+                for c in 0..cols {
+                    let vals: Vec<f64> = (0..rows).map(|r| values.get(r, c).unwrap_or(f64::NAN)).collect();
+                    let shift = if cols > 1 { (c as f64 - (cols as f64 - 1.0) / 2.0) * 0.8 / cols as f64 } else { 0.0 };
+                    let ypos: Vec<f64> = pos.iter().map(|&p| p + shift).collect();
+                    self.figure_mut().push(SeriesKind::BarH, vals, ypos, matplot::LineSpec::new());
+                }
+                Ok(None)
+            }
+            "annotation" => {
+                let _ = self.eval_args(args)?;
+                Ok(Some(Value::Num(1.0)))
+            }
+            "gobjects" => {
+                let v = self.eval_args(args)?;
+                let (r, c) = match v.len() {
+                    0 => (1, 1),
+                    1 => {
+                        let n = v[0].scalar()?.max(0.0) as usize;
+                        (1, n)
+                    }
+                    _ => (v[0].scalar()?.max(0.0) as usize, v[1].scalar()?.max(0.0) as usize),
+                };
+                Ok(Some(Value::Mat(Matrix::zeros(r, c))))
+            }
+            "isprop" => {
+                let v = self.eval_args(args)?;
+                let prop = match v.get(1) {
+                    Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let yes = match v.first() {
+                    Some(Value::Object(o)) => o.prop_names().iter().any(|p| p.eq_ignore_ascii_case(&prop)),
+                    Some(Value::Str(cname)) => {
+                        let chain = self.class_chain(cname)?;
+                        chain.iter().any(|d| d.props.iter().any(|(p, _)| p.eq_ignore_ascii_case(&prop)))
+                    }
+                    Some(Value::Num(_)) => matches!(
+                        prop.as_str(),
+                        "position"
+                            | "color"
+                            | "parent"
+                            | "type"
+                            | "string"
+                            | "xdata"
+                            | "ydata"
+                            | "linewidth"
+                            | "fontsize"
+                            | "visible"
+                            | "children"
+                            | "tag"
+                            | "userdata"
+                            | "xlim"
+                            | "ylim"
+                            | "title"
+                            | "xlabel"
+                            | "ylabel"
+                            | "nextplot"
+                    ),
+                    _ => false,
+                };
+                Ok(Some(Value::Num(if yes { 1.0 } else { 0.0 })))
+            }
+            "isgraphics" => {
+                let v = self.eval_args(args)?;
+                let yes = match v.first() {
+                    Some(Value::Num(n)) => n.is_finite() && *n >= 0.0,
+                    Some(Value::Object(o)) => !matches!(o.class_name.as_str(), "table" | "containers.Map"),
+                    _ => false,
+                };
+                Ok(Some(Value::Num(if yes { 1.0 } else { 0.0 })))
+            }
+            "allchild" => Ok(Some(Value::Cell(CellArray::new(0, 0)))),
+            "ancestor" => {
+                let v = self.eval_args(args)?;
+                Ok(v.first().cloned())
+            }
+            "getappdata" => {
+                let v = self.eval_args(args)?;
+                let fig = v.first().and_then(|x| x.scalar().ok()).unwrap_or(0.0).max(0.0) as usize;
+                let key = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Ok(None),
+                };
+                Ok(self.appdata.get(&(fig, key)).cloned())
+            }
+            "setappdata" => {
+                let v = self.eval_args(args)?;
+                let fig = v.first().and_then(|x| x.scalar().ok()).unwrap_or(0.0).max(0.0) as usize;
+                if let (Some(Value::Str(name)), Some(value)) = (v.get(1), v.get(2)) {
+                    self.appdata.insert((fig, name.clone()), value.clone());
+                }
+                Ok(None)
+            }
+            "gcp" => Ok(Some(Value::Mat(Matrix::row_vector(vec![0.0, 0.0, 0.0])))),
+            "cla" => {
+                self.figure_mut().reset_axes();
+                Ok(None)
+            }
+            "colororder" => {
+                let v = self.eval_args(args)?;
+                if let Some(x) = v.iter().rev().find(|x| matches!(x, Value::Mat(_) | Value::Num(_))) {
+                    let m = x.to_matrix()?;
+                    if m.cols() >= 3 {
+                        let palette: Vec<matplot::Rgb> = (0..m.rows())
+                            .map(|r| {
+                                matplot::Rgb(
+                                    (m.get(r, 0).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (m.get(r, 1).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (m.get(r, 2).unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                                )
+                            })
+                            .collect();
+                        self.figure_mut().palette = Some(palette);
+                    }
+                }
+                Ok(None)
+            }
+            "getpixelposition" => Ok(Some(Value::Mat(Matrix::row_vector(vec![0.0, 0.0, 560.0, 420.0])))),
+            "savefig" => {
+                let v = self.eval_args(args)?;
+                let file = v
+                    .iter()
+                    .rev()
+                    .find_map(|x| match x {
+                        Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| LangError::new("savefig needs a filename", 0))?;
+                let ext = file.rsplit('.').next().unwrap_or("fig").to_ascii_lowercase();
+                let fmt = if ext == "fig" { "svg".to_string() } else { ext };
+                let bytes = export_figure(self.figure_mut(), &file, Some(&fmt))?;
+                crate::write_file(std::path::Path::new(&file), &bytes).map_err(|e| LangError::new(format!("cannot write {file}: {e}"), 0))?;
+                self.print_buf.push_str(&format!("wrote {file} ({} bytes)\n", bytes.len()));
+                Ok(None)
+            }
+            "hsv" | "parula" | "cool" => {
+                let v = self.eval_args(args)?;
+                let n = v.first().map(|x| x.scalar()).transpose()?.unwrap_or(64.0).max(1.0) as usize;
+                let mut out = Matrix::zeros(n, 3);
+                for i in 0..n {
+                    let t = if n > 1 { i as f64 / (n - 1) as f64 } else { 0.0 };
+                    let rgb = match name {
+                        "parula" => matplot::Colormap::Parula.map(t),
+                        "cool" => matplot::Rgb((t * 255.0) as u8, ((1.0 - t) * 255.0) as u8, 255),
+                        _ => {
+                            let h = t * 6.0;
+                            let x = 1.0 - (h % 2.0 - 1.0).abs();
+                            let (r, g, b) = match h as usize {
+                                0 => (1.0, x, 0.0),
+                                1 => (x, 1.0, 0.0),
+                                2 => (0.0, 1.0, x),
+                                3 => (0.0, x, 1.0),
+                                4 => (x, 0.0, 1.0),
+                                _ => (1.0, 0.0, x),
+                            };
+                            matplot::Rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                        }
+                    };
+                    let _ = out.set(i, 0, rgb.0 as f64 / 255.0);
+                    let _ = out.set(i, 1, rgb.1 as f64 / 255.0);
+                    let _ = out.set(i, 2, rgb.2 as f64 / 255.0);
+                }
+                Ok(Some(Value::Mat(out)))
+            }
+            "dendrogram" => {
+                let v = self.eval_args(args)?;
+                self.dendrogram_value(&v)
+            }
+            "clustergram" => {
+                let v = self.eval_args(args)?;
+                self.clustergram_value(&v)
+            }
+            "streamline" => {
+                let v = self.eval_args(args)?;
+                self.streamline_value(&v, false)
+            }
+            "streamslice" => {
+                let v = self.eval_args(args)?;
+                self.streamline_value(&v, true)
+            }
+            "venn" => {
+                let v = self.eval_args(args)?;
+                self.venn_value(&v)
+            }
+            "quiver" => {
+                let v = self.eval_args(args)?;
+                self.quiver_value(&v, false)
+            }
+            "quiver3" => {
+                let v = self.eval_args(args)?;
+                self.quiver_value(&v, true)
+            }
+            "heatmap" => {
+                let out = self.fig_command("imagesc", args)?;
+                self.figure_mut().colorbar = true;
+                self.figure_mut().title = Some("heatmap".into());
+                Ok(out)
+            }
+            "volcano" => {
+                let v = self.eval_args(args)?;
+                self.volcano_value(&v)
+            }
+            "venncounts" => {
+                let v = self.eval_args(args)?;
+                self.venncounts_value(&v)
+            }
             _ => Err(LangError::new(format!("unknown function or variable '{name}'"), 0)),
         }
     }
@@ -6851,6 +9952,11 @@ impl Session {
     /// expands to one series per column.
     fn add_series(&mut self, kind: matplot::SeriesKind, args: &[Expr]) -> Result<Option<Value>, LangError> {
         let v = self.eval_args(args)?;
+        if let Some(Value::Object(o)) = v.first() {
+            if o.class_name == "graph" || o.class_name == "digraph" {
+                return self.plot_graph_object(o);
+            }
+        }
         if !self.figure_mut().hold {
             self.figure_mut().reset_axes();
         }
@@ -6952,6 +10058,9 @@ impl Session {
         if self.funcs.contains_key(name) || self.classes.contains_key(name) {
             return Ok(true);
         }
+        if self.resolve_imported(name)?.is_some() {
+            return Ok(true);
+        }
         self.load_function_file(name)
     }
 
@@ -6986,8 +10095,136 @@ impl Session {
         if self.funcs.contains_key(name) || self.classes.contains_key(name) {
             return Ok(());
         }
+        if name.contains('.') && self.resolve_package_member(name)? {
+            return Ok(());
+        }
+        if self.resolve_imported(name)?.is_some() {
+            return Ok(());
+        }
         let _ = self.load_function_file(name)?;
         Ok(())
+    }
+
+    /// Path of a package member: `pkg.Class` -> `<path>/+pkg/Class.m`,
+    /// `pkg.inner.f` -> `<path>/+pkg/+inner/f.m`.
+    fn package_file(&self, qualified: &str) -> Option<std::path::PathBuf> {
+        let parts: Vec<&str> = qualified.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let last = parts.last()?;
+        for dir in &self.paths {
+            let mut p = dir.clone();
+            for comp in &parts[..parts.len() - 1] {
+                p.push(format!("+{comp}"));
+            }
+            p.push(format!("{last}.m"));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Load a qualified package member and register it under its qualified
+    /// name. Returns true when a function or class became available.
+    fn resolve_package_member(&mut self, qualified: &str) -> Result<bool, LangError> {
+        if self.funcs.contains_key(qualified) || self.classes.contains_key(qualified) {
+            return Ok(true);
+        }
+        let Some(file) = self.package_file(qualified) else { return Ok(false) };
+        let parts: Vec<&str> = qualified.split('.').filter(|p| !p.is_empty()).collect();
+        let Some(bare) = parts.last().copied() else { return Ok(false) };
+        let file_s = file.display().to_string();
+        self.absorb_file(&file, bare)?;
+        let mut found = false;
+        if let Some(mut def) = self.classes.get(bare).cloned() {
+            if def.file == file_s {
+                def.name = qualified.to_string();
+                for m in def.methods.values_mut() {
+                    m.owner = Some(qualified.to_string());
+                }
+                if let Some((pkg, _)) = qualified.rsplit_once('.') {
+                    for s in &mut def.supers {
+                        if !s.contains('.') {
+                            let q = format!("{pkg}.{s}");
+                            if self.package_file(&q).is_some() {
+                                *s = q;
+                            }
+                        }
+                    }
+                }
+                self.classes.insert(qualified.to_string(), def);
+                self.classes.remove(bare);
+                found = true;
+            }
+        }
+        if let Some(def) = self.funcs.get(bare).cloned() {
+            if def.file == file_s {
+                self.funcs.insert(qualified.to_string(), def);
+                self.funcs.remove(bare);
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    /// Resolve a bare name through `import pkg.*` / `import pkg.Name`.
+    fn resolve_imported(&mut self, name: &str) -> Result<Option<String>, LangError> {
+        if name.contains('.') {
+            return Ok(self.resolve_package_member(name)?.then(|| name.to_string()));
+        }
+        for spec in self.imports.clone() {
+            if let Some(prefix) = spec.strip_suffix(".*") {
+                let q = format!("{prefix}.{name}");
+                if self.resolve_package_member(&q)? {
+                    return Ok(Some(q));
+                }
+            } else if spec.rsplit('.').next() == Some(name) && self.resolve_package_member(&spec)? {
+                return Ok(Some(spec));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Flatten a dotted `Ident`/`Field` chain (`pkg.Class.member`).
+    fn expr_dotted_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n) => Some(n.clone()),
+            Expr::Field(b, f) => Self::expr_dotted_name(b).map(|p| format!("{p}.{f}")),
+            _ => None,
+        }
+    }
+
+    /// Resolve `pkg.Enum.Member` / `Class.Member` enumeration constants
+    /// from a dotted value expression.
+    fn resolve_dotted_value(&mut self, full: &str) -> Result<Option<Value>, LangError> {
+        let parts: Vec<&str> = full.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return Ok(None);
+        }
+        let class = parts[..parts.len() - 1].join(".");
+        let member = parts[parts.len() - 1];
+        if self.resolve_package_member(&class)? || self.classes.contains_key(&class) {
+            return self.enum_value(&class, member);
+        }
+        Ok(None)
+    }
+
+    /// Resolve a dotted expression used as a call: first as a package
+    /// function/class constructor, then as `package.Class.method`.
+    fn resolve_package_call(&mut self, full: &str) -> Result<Option<(String, Option<String>)>, LangError> {
+        if self.resolve_package_member(full)? {
+            return Ok(Some((full.to_string(), None)));
+        }
+        let parts: Vec<&str> = full.split('.').filter(|p| !p.is_empty()).collect();
+        for i in (2..parts.len()).rev() {
+            let class = parts[..i].join(".");
+            if self.resolve_package_member(&class)? && self.classes.contains_key(&class) {
+                return Ok(Some((class, Some(parts[i..].join(".")))));
+            }
+        }
+        Ok(None)
     }
 
     /// Parse a `.m` file and absorb its definitions: a top-level
@@ -7010,6 +10247,19 @@ impl Session {
         Ok(self.funcs.contains_key(name) || self.classes.contains_key(name))
     }
 
+    /// Reattach handle semantics to objects loaded from a MAT-file when
+    /// their class is known and inherits `handle`.
+    fn restore_loaded_value(&mut self, v: Value) -> Result<Value, LangError> {
+        if let Value::Object(o) = &v {
+            let chain = self.class_chain(&o.class_name)?;
+            let handle = chain.iter().any(|d| d.supers.iter().any(|s| s == "handle"));
+            if handle {
+                return Ok(Value::Object(o.clone().into_handle()));
+            }
+        }
+        Ok(v)
+    }
+
     /// The class plus its resolvable superclasses, ancestors first.
     /// Unknown superclasses (`handle`, builtin types, missing files) end
     /// the walk.
@@ -7024,7 +10274,7 @@ impl Session {
             }
             self.ensure_loaded(&cn)?;
             let Some(def) = self.classes.get(&cn).cloned() else { break };
-            cur = def.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string());
+            cur = def.supers.first().cloned();
             chain.push(def);
         }
         chain.reverse();
@@ -7046,6 +10296,26 @@ impl Session {
     /// ctor's first output, run the ctor method when one exists.
     fn construct_object(&mut self, name: &str, argv: Vec<Value>) -> Result<Value, LangError> {
         let chain = self.class_chain(name)?;
+        if chain.last().is_some_and(|d| d.attr_flag("Abstract")) {
+            return Err(LangError::new(format!("cannot instantiate abstract class '{name}'"), 0));
+        }
+        if chain.iter().take(chain.len().saturating_sub(1)).any(|d| d.attr_flag("Sealed")) {
+            return Err(LangError::new(format!("class '{name}' cannot inherit from a sealed superclass"), 0));
+        }
+        let mut pending: Vec<String> = Vec::new();
+        for def in &chain {
+            for (m, a) in &def.method_attrs {
+                if a.abstract_ {
+                    pending.push(m.clone());
+                }
+            }
+            for m in def.methods.keys() {
+                pending.retain(|p| p != m);
+            }
+        }
+        if let Some(m) = pending.first() {
+            return Err(LangError::new(format!("cannot instantiate class '{name}': abstract method '{m}' is not implemented"), 0));
+        }
         let mut sa = StructArray::new();
         for def in &chain {
             for (pname, dexpr) in &def.props {
@@ -7060,8 +10330,9 @@ impl Session {
         // storage — writes inside methods land on the caller's object.
         let handle = chain.iter().any(|d| d.supers.iter().any(|s| s == "handle"));
         let obj = Value::Object(MObject::new(name.to_string(), sa, handle));
-        let Some(ctor) = self.find_method(name, name)? else { return Ok(obj) };
-        let outs = self.call_def(name, &ctor, argv, 1, Some(obj.clone()))?;
+        let ctor_name = name.rsplit('.').next().unwrap_or(name);
+        let Some(ctor) = self.find_method(name, ctor_name)? else { return Ok(obj) };
+        let outs = self.call_def(ctor_name, &ctor, argv, 1, Some(obj.clone()))?;
         Ok(outs.into_iter().next().unwrap_or(obj))
     }
 
@@ -7080,15 +10351,29 @@ impl Session {
             let def = self.classes.get(&cn).cloned();
             if let Some(d) = &def {
                 if let Some(m) = d.methods.get(method) {
+                    self.check_method_access(m, method)?;
                     return Ok(Some(m.clone()));
                 }
             }
             if let Some(m) = self.load_at_dir_method(&cn, method)? {
+                self.check_method_access(&m, method)?;
                 return Ok(Some(m));
             }
-            cur = def.and_then(|d| d.supers.first().map(|s| s.rsplit('.').next().unwrap_or(s).to_string()));
+            cur = def.and_then(|d| d.supers.first().cloned());
         }
         Ok(None)
+    }
+
+    fn check_method_access(&mut self, def: &FuncDef, method: &str) -> Result<(), LangError> {
+        let Some(owner) = def.owner.clone() else { return Ok(()) };
+        let access = self.classes.get(&owner).and_then(|d| d.method_attrs.get(method)).map(|a| a.access).unwrap_or(Access::Public);
+        if !self.access_allowed(&owner, access)? {
+            return Err(LangError::new(
+                format!("method '{method}' has {} access in class '{owner}'", if access == Access::Private { "private" } else { "protected" }),
+                0,
+            ));
+        }
+        Ok(())
     }
 
     /// `@class/method.m` on the search path → the method's `FuncDef`
@@ -7116,6 +10401,8 @@ impl Session {
                     }
                 }
                 if let Some(d) = d {
+                    let mut d = d;
+                    d.owner = Some(class.to_string());
                     self.method_cache.insert(key, d.clone());
                     return Ok(Some(d));
                 }
@@ -7137,7 +10424,32 @@ impl Session {
     /// `obj.name` — property first, then `Class.enum_member`, then a
     /// zero-extra-arg method call (`obj.m` invokes `m`).
     fn object_dot(&mut self, o: &MObject, name: &str) -> Result<Option<Value>, LangError> {
+        if let Some(session) = o.com_session() {
+            if name == "ProgID" {
+                if let Some(v) = o.prop(name) {
+                    return Ok(Some(v));
+                }
+            }
+            let got = session.borrow_mut().get(name);
+            return match got {
+                Ok(v) => Ok(Some(v)),
+                Err(_) => session.borrow_mut().invoke(name, &[]).map(Some),
+            };
+        }
+        if !self.subs_dot_guard {
+            if let Some(def) = self.find_method(&o.class_name, "subsref")? {
+                let mut s = StructArray::new();
+                s.set_field(0, "type", Value::Str(".".into()))?;
+                s.set_field(0, "subs", Value::Cell(CellArray::row(vec![Value::Str(name.into())])))?;
+                let saved = self.subs_dot_guard;
+                self.subs_dot_guard = true;
+                let result = self.call_def("subsref", &def, vec![Value::Object(o.clone()), Value::Struct(s)], 1, None);
+                self.subs_dot_guard = saved;
+                return result?.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0)).map(Some);
+            }
+        }
         if let Some(v) = o.prop(name) {
+            self.check_prop_access(o, name, false)?;
             return Ok(Some(v));
         }
         if let Some(v) = self.enum_value(&o.class_name, name)? {
@@ -7152,16 +10464,116 @@ impl Session {
         }
     }
 
-    /// `Class.member` — evaluate a class's `enumeration` member.
+    /// Find the nearest declaration of `prop` in `class`'s chain.
+    fn prop_attr_for(&mut self, class: &str, prop: &str) -> Result<Option<(PropAttr, String)>, LangError> {
+        let chain = self.class_chain(class)?;
+        for def in chain.iter().rev() {
+            if let Some(attr) = def.prop_attrs.get(prop) {
+                return Ok(Some((attr.clone(), def.name.clone())));
+            }
+            if def.props.iter().any(|(p, _)| p == prop) {
+                return Ok(Some((PropAttr::default(), def.name.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    fn access_allowed(&mut self, owner: &str, access: Access) -> Result<bool, LangError> {
+        if access == Access::Public {
+            return Ok(true);
+        }
+        let Some(caller) = self.cur_class.clone() else { return Ok(false) };
+        let subclass = !caller.eq_ignore_ascii_case(owner) && self.is_a(&caller, owner)?;
+        Ok(access.allows(owner, Some(&caller), subclass))
+    }
+
+    /// Mirror an access-attribute assignment on a `dynamicprops` handle
+    /// into the source object's hidden metadata. Returns whether the field
+    /// was a dynamic-property attribute.
+    fn sync_dynamic_meta(&mut self, handle: &mut MObject, field: &str, value: &Value) -> Result<bool, LangError> {
+        if handle.class_name != "dynamicprops" || !matches!(field, "GetAccess" | "SetAccess" | "Constant" | "Dependent" | "Hidden") {
+            return Ok(false);
+        }
+        let name = match handle.prop("Name") {
+            Some(Value::Str(s)) => s,
+            _ => return Err(LangError::new("dynamicprops handle has no Name", 0)),
+        };
+        let Some(Value::Object(mut source)) = handle.prop("Source") else {
+            return Err(LangError::new("dynamicprops handle has no Source", 0));
+        };
+        if !source.update_dyn_prop_attr(&name, field, value) {
+            return Err(LangError::new(format!("dynamicprops: '{name}' is no longer a dynamic property"), 0));
+        }
+        handle.set_prop(field, value.clone());
+        Ok(true)
+    }
+
+    fn check_prop_access(&mut self, o: &MObject, name: &str, write: bool) -> Result<(), LangError> {
+        if let Some(meta) = o.dyn_prop(name) {
+            if write && meta.constant {
+                return Err(LangError::new(format!("cannot set Constant property '{name}' of class '{}'", o.class_name), 0));
+            }
+            if write && meta.dependent {
+                return Err(LangError::new(format!("cannot set Dependent property '{name}' of class '{}'", o.class_name), 0));
+            }
+            let access = if write { meta.set } else { meta.get };
+            if !self.access_allowed(&o.class_name, access)? {
+                return Err(LangError::new(
+                    format!("'{name}' has {} access in class '{}'", if access == Access::Private { "private" } else { "protected" }, o.class_name),
+                    0,
+                ));
+            }
+            return Ok(());
+        }
+        let Some((attr, owner)) = self.prop_attr_for(&o.class_name, name)? else { return Ok(()) };
+        if write && attr.constant {
+            return Err(LangError::new(format!("cannot set Constant property '{name}' of class '{}'", o.class_name), 0));
+        }
+        if write && attr.dependent {
+            return Err(LangError::new(format!("cannot set Dependent property '{name}' of class '{}'", o.class_name), 0));
+        }
+        let access = if write { attr.set_access } else { attr.get_access };
+        if !self.access_allowed(&owner, access)? {
+            return Err(LangError::new(
+                format!("'{name}' has {} access in class '{}'", if access == Access::Private { "private" } else { "protected" }, o.class_name),
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Declared event names for a class (inherited included).
+    fn class_events(&mut self, class: &str) -> Result<Vec<String>, LangError> {
+        let mut out = Vec::new();
+        for def in self.class_chain(class)? {
+            for e in def.events {
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn check_event(&mut self, o: &MObject, event: &str) -> Result<(), LangError> {
+        let declared = self.class_events(&o.class_name)?;
+        if !declared.is_empty() && !declared.iter().any(|e| e == event) {
+            return Err(LangError::new(format!("event '{event}' is not defined by class '{}'", o.class_name), 0));
+        }
+        Ok(())
+    }
+
+    /// `Class.member` - construct an enumeration-member object.
     fn enum_value(&mut self, class: &str, member: &str) -> Result<Option<Value>, LangError> {
         self.ensure_loaded(class)?;
         let Some(def) = self.classes.get(class).cloned() else { return Ok(None) };
         for (n, e) in &def.enums {
             if n == member {
-                return Ok(Some(match e {
-                    Some(x) => self.eval(x)?,
-                    None => Value::Mat(Matrix::zeros(0, 0)),
-                }));
+                let argv = match e {
+                    Some(x) => vec![self.eval(x)?],
+                    None => Vec::new(),
+                };
+                return Ok(Some(self.construct_object(class, argv)?));
             }
         }
         Ok(None)
@@ -7299,7 +10711,60 @@ impl Session {
                 .into_iter()
                 .next()
                 .ok_or_else(|| LangError::new("concatenation produced no value", 0)),
-            None => Err(LangError::new(format!("'[…]' concatenation is not defined for class '{cname}' (no '{mname}' method)"), 0)),
+            None => {
+                let (Value::Object(oa), Value::Object(ob)) = (&a, &b) else {
+                    return Err(LangError::new(format!("'[…]' concatenation is not defined for class '{cname}' (no '{mname}' method)"), 0));
+                };
+                if !oa.class_name.eq_ignore_ascii_case(&ob.class_name) {
+                    return Err(LangError::new("cannot concatenate objects of different classes", 0));
+                }
+                let ad = oa.array_dims();
+                let bd = ob.array_dims();
+                let ae = oa.array_elements();
+                let be = ob.array_elements();
+                let (ar, ac) = (ad.first().copied().unwrap_or(1), ad.get(1).copied().unwrap_or(1));
+                let (br, bc) = (bd.first().copied().unwrap_or(1), bd.get(1).copied().unwrap_or(1));
+                let (rows, cols) = if mname == "horzcat" {
+                    if ar != br {
+                        return Err(LangError::new("horizontal concatenation needs the same number of rows", 0));
+                    }
+                    (ar, ac.saturating_add(bc))
+                } else {
+                    if ac != bc {
+                        return Err(LangError::new("vertical concatenation needs the same number of columns", 0));
+                    }
+                    (ar.saturating_add(br), ac)
+                };
+                let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+                if mname == "horzcat" {
+                    for r in 0..ar {
+                        for c in 0..ac {
+                            if let Some(v) = ae.get(r + c * ar) {
+                                out.push(v.clone());
+                            }
+                        }
+                        for c in 0..bc {
+                            if let Some(v) = be.get(r + c * br) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                } else {
+                    for c in 0..ac {
+                        for r in 0..ar {
+                            if let Some(v) = ae.get(r + c * ar) {
+                                out.push(v.clone());
+                            }
+                        }
+                        for r in 0..br {
+                            if let Some(v) = be.get(r + c * br) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(MObject::array(oa.class_name.clone(), out, (rows, cols))))
+            }
         }
     }
 
@@ -7313,11 +10778,16 @@ impl Session {
     /// `call_function` with pre-evaluated argument values — used by
     /// `feval`/function-handle dispatch where args arrive as `Value`s.
     fn call_function_argv(&mut self, name: &str, argv: Vec<Value>, nargout: usize) -> Result<Vec<Value>, LangError> {
-        match self.funcs.get(name).cloned() {
-            Some(def) => self.call_def(name, &def, argv, nargout, None),
-            // `Name(args)` where Name is a classdef — construct an instance.
-            None if self.classes.contains_key(name) => {
-                let obj = self.construct_object(name, argv)?;
+        let key = if self.funcs.contains_key(name) || self.classes.contains_key(name) {
+            name.to_string()
+        } else {
+            self.resolve_imported(name)?.unwrap_or_else(|| name.to_string())
+        };
+        match self.funcs.get(&key).cloned() {
+            Some(def) => self.call_def(&key, &def, argv, nargout, None),
+            // `Name(args)` where Name is a classdef - construct an instance.
+            None if self.classes.contains_key(&key) => {
+                let obj = self.construct_object(&key, argv)?;
                 Ok(vec![obj])
             }
             None => Err(LangError::new(format!("unknown function '{name}'"), 0)),
@@ -7356,6 +10826,7 @@ impl Session {
         let saved_globals = std::mem::take(&mut self.frame_globals);
         let saved_persist = std::mem::take(&mut self.frame_persist);
         let saved_key = self.cur_func_key.replace(format!("{}::{}", def.file, name));
+        let saved_class = std::mem::replace(&mut self.cur_class, def.owner.clone());
         let saved_ctx = self.call_ctx.replace((argv.len(), nargout));
         let vararg = def.params.last().map(|p| p == "varargin").unwrap_or(false);
         let fixed = if vararg { def.params.len().saturating_sub(1) } else { def.params.len() };
@@ -7430,6 +10901,7 @@ impl Session {
         self.frame_globals = saved_globals;
         self.frame_persist = saved_persist;
         self.cur_func_key = saved_key;
+        self.cur_class = saved_class;
         self.call_ctx = saved_ctx;
         result
     }
@@ -7535,6 +11007,18 @@ impl Session {
     /// multi-output form (caller reports "not a function").
     fn builtin_multi(&mut self, name: &str, args: &[Expr], nout: usize) -> Result<Option<Vec<Value>>, LangError> {
         let out = match name {
+            "builtin" => {
+                let v = self.eval_args(args)?;
+                let target = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("builtin needs a function name as its first argument", 0)),
+                };
+                if !self.is_builtin(&target) {
+                    return Err(LangError::new(format!("builtin: '{target}' is not a built-in function"), 0));
+                }
+                let rest = v.get(1..).unwrap_or(&[]).to_vec();
+                self.builtin_values(&target, rest, nout)?
+            }
             "feval" => {
                 // `[a,b] = feval(@f, x)` — multi-output call through a handle.
                 let v = self.eval_args(args)?;
@@ -7735,15 +11219,161 @@ impl Session {
                 self.index_call(name, args)?
             }
             "int2str" | "mat2str" | "strncmp" | "strncmpi" | "strtok" | "strmatch" | "cellstr" | "blanks" | "deblank" | "str2mat" | "regexp"
-            | "regexpi" | "regexprep" => self.str_call(name, args)?,
-            "version" | "computer" | "ispc" | "isunix" | "ismac" | "getenv" | "setenv" | "system" | "fileparts" | "copyfile" | "movefile"
-            | "rmdir" | "isdir" | "isfile" | "tempdir" | "tempname" | "evalc" | "evalin" | "assignin" | "mfilename" | "license" | "ver"
-            | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
-            | "inline" | "optimset" | "optimget" | "nargchk" => self.sys_call(name, args)?,
+            | "regexpi" | "regexprep" | "erase" | "replace" => self.str_call(name, args)?,
+            "version"
+            | "computer"
+            | "ispc"
+            | "isunix"
+            | "ismac"
+            | "getenv"
+            | "setenv"
+            | "system"
+            | "dos"
+            | "unix"
+            | "savepath"
+            | "fileparts"
+            | "copyfile"
+            | "movefile"
+            | "rmdir"
+            | "isdir"
+            | "isfile"
+            | "tempdir"
+            | "tempname"
+            | "evalc"
+            | "evalin"
+            | "assignin"
+            | "mfilename"
+            | "jsondecode"
+            | "jsonencode"
+            | "importdata"
+            | "detectImportOptions"
+            | "webread"
+            | "urlread"
+            | "web"
+            | "winopen"
+            | "uigetdir"
+            | "questdlg"
+            | "uimenu"
+            | "actxserver"
+            | "rethrow"
+            | "verLessThan"
+            | "inputname"
+            | "validateattributes"
+            | "validatestring"
+            | "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal"
+            | "license"
+            | "ver"
+            | "drawnow"
+            | "beep"
+            | "waitbar"
+            | "input"
+            | "ishandle"
+            | "findobj"
+            | "findall"
+            | "ishold"
+            | "gca"
+            | "help"
+            | "diary"
+            | "doc"
+            | "class"
+            | "inline"
+            | "optimset"
+            | "optimoptions"
+            | "optimget"
+            | "nargchk" => self.sys_call(name, args)?,
             "cov" | "prctile" | "quantile" | "hist" | "histc" => self.stat_call(name, args)?,
             "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args, nout)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
             "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
+            "fminbnd" | "fminsearch" | "fminunc" | "fsolve" | "lsqnonlin" | "lsqcurvefit" | "linprog" | "quadprog" | "intlinprog" | "fmincon"
+            | "patternsearch" => {
+                let v = self.eval_args(args)?;
+                self.optimize_builtin(name, v, nout)?
+            }
+            "tf" | "ss" | "zpk" | "tfdata" | "ssdata" | "zpkdata" | "pole" | "zero" | "dcgain" | "series" | "parallel" | "feedback" | "tf2ss"
+            | "pidtune" | "ss2tf" | "step" | "impulse" | "initial" | "lsim" | "bode" | "freqresp" | "pid" | "margin" | "nyquist" | "isstable"
+            | "damp" | "bandwidth" => {
+                let v = self.eval_args(args)?;
+                self.control_builtin(name, v, nout)?
+            }
+            "normpdf" | "normcdf" | "norminv" | "exppdf" | "expcdf" | "expinv" | "unifpdf" | "unifcdf" | "unifinv" | "poisspdf" | "poisscdf"
+            | "poissinv" | "binopdf" | "binocdf" | "binoinv" | "wblpdf" | "wblcdf" | "wblinv" | "lognpdf" | "logncdf" | "logninv" | "exprnd"
+            | "unifrnd" | "poissrnd" | "binornd" | "wblrnd" | "lognrnd" | "iqr" | "corrcoef" | "regress" | "kmeans" | "ttest" | "ttest2"
+            | "kstest" | "adtest" | "chi2gof" | "pca" | "gampdf" | "gamcdf" | "gaminv" | "betapdf" | "betacdf" | "betainv" | "chi2pdf"
+            | "chi2cdf" | "chi2inv" | "tpdf" | "tcdf" | "tinv" | "fpdf" | "fcdf" | "finv" | "fitdist" | "pdf" | "cdf" | "icdf" | "random"
+            | "cmdscale" | "pcoa" | "bonferroni" | "holm" | "sidak" | "benjamini_hochberg" | "mafdr" | "signrank" | "ranksum" | "kruskalwallis" => {
+                let v = self.eval_args(args)?;
+                self.stats_builtin(name, v, nout)?
+            }
+            "xlsread" | "xlswrite" | "readcell" | "writecell" | "readtable" | "writetable" | "height" | "width" | "istable" | "table2cell"
+            | "cell2table" | "struct2table" | "struct2cell" | "cell2struct" | "addvars" | "setvartype" | "convertvars" | "removevars"
+            | "renamevars" | "summary" | "findgroups" | "splitapply" | "varfun" | "rowfun" | "join" | "innerjoin" | "outerjoin" | "groupsummary"
+            | "stack" | "unstack" | "fillmissing" | "rmmissing" | "standardizeMissing" => {
+                let v = self.eval_args(args)?;
+                self.xlsx_builtin(name, v, nout)?
+            }
+            "rgb2gray" | "imresize" | "imfilter" | "medfilt2" | "edge" | "bwlabel" | "regionprops" | "graythresh" | "imbinarize" | "imdilate"
+            | "imerode" | "imopen" | "imclose" | "imrotate" | "imcrop" | "strel" => {
+                let v = self.eval_args(args)?;
+                self.image_builtin(name, v, nout)?
+            }
+            "ga" => {
+                let v = self.eval_args(args)?;
+                self.ga_builtin(name, v, nout)?
+            }
+            "h5read" | "h5write" | "h5create" | "h5disp" => {
+                let v = self.eval_args(args)?;
+                self.hdf5_builtin(name, v, nout)?
+            }
+            "umap" => {
+                let v = self.eval_args(args)?;
+                self.umap_call(&v, nout)?
+            }
+            "tsne" => {
+                let v = self.eval_args(args)?;
+                self.tsne_call(&v, nout)?
+            }
+            "ode45" | "ode15s" | "ode23" | "ode23s" | "dde23" | "odeset" | "odeget" | "deval" => {
+                let v = self.eval_args(args)?;
+                self.ode_builtin(name, v, nout)?
+            }
+            "formulaatoms" | "formulaweight" | "formulacheck" | "inferformula" | "parsereaction" | "formatreaction" | "canonicalreaction"
+            | "rxnequal" | "rxnbalance" | "gprparse" | "gpreval" | "gprgenes" | "gprmerge" | "fastaread" | "fastawrite" | "genbankread" => {
+                let v = self.eval_args(args)?;
+                self.bio_builtin(name, v, nout)?
+            }
+            "pdist" | "pdist2" | "jaccard" | "jaccarddistance" | "setmetrics" | "confusionmat" | "clustermetrics" | "cluster" | "clusterdata"
+            | "cophenet" | "silhouette" | "randindex" | "mutualinfo" | "evalclusters" => {
+                let v = self.eval_args(args)?;
+                self.metrics_builtin(name, v, nout)?
+            }
+            "graph" | "digraph" | "gplot" | "numnodes" | "numedges" | "degree" | "conncomp" | "neighbors" | "shortestpath" | "distances"
+            | "bfsearch" | "dfsearch" | "adjacency" | "incidence" | "isgraph" => {
+                let v = self.eval_args(args)?;
+                self.graph_builtin(name, v, nout)?
+            }
+            "nchoosek" | "gammaln" | "hygecdf" | "tabulate" | "corr" | "squareform" | "vecnorm" | "blkdiag" | "mat2cell" | "gradient" | "expm"
+            | "isbetween" | "isoutlier" | "partialcorr" | "linkage" | "fitlm" | "optimalleaforder" | "zscore" => {
+                let v = self.eval_args(args)?;
+                self.mathx_builtin(name, v)?
+            }
+            "anova1" | "anova2" | "multcompare" | "friedman" => {
+                let v = self.eval_args(args)?;
+                self.anova_builtin(name, v, nout)?
+            }
+            "ncread" | "ncwrite" | "ncinfo" | "ncdisp" => {
+                let v = self.eval_args(args)?;
+                self.netcdf_builtin(name, v, nout)?
+            }
             "log2" => {
                 // [F,E] = log2(X): X = F .* 2.^E with |F| in [0.5,1).
                 let v = self.eval_args(args)?;
@@ -8152,6 +11782,20 @@ impl Session {
                                 }
                             }
                         }
+                        Value::Object(o) if o.class_name == "COM" => {
+                            if let Some(session) = o.com_session() {
+                                session.borrow_mut().release();
+                            }
+                        }
+                        Value::Object(o) if o.class_name == "listener" => {
+                            let id = o.prop("Id").and_then(|x| x.scalar().ok()).unwrap_or(-1.0);
+                            if let Some(Value::Object(src)) = o.prop("Source") {
+                                if let Some(store) = src.listeners.as_ref() {
+                                    store.borrow_mut().retain(|l| (l.id as f64) != id);
+                                }
+                            }
+                        }
+                        Value::Object(o) if matches!(o.class_name.as_str(), "parallel.Pool" | "onCleanup" | "parallel.Future") => {}
                         other => {
                             // Numeric → figure handle: delete(n) closes
                             // figure n (same as `close(n)`).
@@ -8664,6 +12308,72 @@ impl Session {
             }
             "sortrows" => {
                 let v = self.eval_args(args)?;
+                if let Some(Value::Object(o)) = v.first() {
+                    if o.class_name == "table" {
+                        let names = table_var_names(o);
+                        let nrows = table_num_rows(o);
+                        let mut key_col = 0usize;
+                        let mut desc = false;
+                        for item in v.iter().skip(1) {
+                            match item {
+                                Value::Str(s) if s.eq_ignore_ascii_case("ascend") => desc = false,
+                                Value::Str(s) if s.eq_ignore_ascii_case("descend") => desc = true,
+                                Value::Str(s) => {
+                                    key_col = names
+                                        .iter()
+                                        .position(|n| n == s)
+                                        .ok_or_else(|| LangError::new(format!("sortrows: unknown variable '{s}'"), 0))?;
+                                }
+                                other => {
+                                    let k = other.scalar()? as i64;
+                                    let c = k.unsigned_abs().saturating_sub(1) as usize;
+                                    if k == 0 || c >= names.len() {
+                                        return Err(LangError::new("sortrows: variable index out of range", 0));
+                                    }
+                                    key_col = c;
+                                    desc = k < 0;
+                                }
+                            }
+                        }
+                        let key = names.get(key_col).and_then(|name| o.prop(name)).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+                        let mut order: Vec<usize> = (0..nrows).collect();
+                        order.sort_by(|&r1, &r2| {
+                            let ord = match &key {
+                                Value::Mat(m) => {
+                                    let a = m.get(r1, 0).unwrap_or(f64::NAN);
+                                    let b = m.get(r2, 0).unwrap_or(f64::NAN);
+                                    match (a.is_nan(), b.is_nan()) {
+                                        (true, true) => std::cmp::Ordering::Equal,
+                                        (true, false) => std::cmp::Ordering::Greater,
+                                        (false, true) => std::cmp::Ordering::Less,
+                                        _ => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                                    }
+                                }
+                                Value::Cell(c) => {
+                                    let a = match c.get(r1, 0) {
+                                        Some(Value::Str(s)) => s.as_str(),
+                                        _ => "",
+                                    };
+                                    let b = match c.get(r2, 0) {
+                                        Some(Value::Str(s)) => s.as_str(),
+                                        _ => "",
+                                    };
+                                    a.cmp(b)
+                                }
+                                _ => std::cmp::Ordering::Equal,
+                            };
+                            if desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
+                        });
+                        let rows: Vec<usize> = order.iter().map(|&r| r.saturating_add(1)).collect();
+                        let table = table_subset(o, &rows, &(1..=names.len()).collect::<Vec<_>>())?;
+                        let idx: Vec<f64> = rows.iter().map(|&r| r as f64).collect();
+                        return Ok(vec![table, Value::Mat(Matrix::col_vector(idx))]);
+                    }
+                }
                 let m = v.first().ok_or_else(|| LangError::new("sortrows needs a matrix", 0))?.to_numeric()?;
                 need_2d(&m, name)?;
                 let (rows, cols) = m.shape();
@@ -8825,6 +12535,165 @@ impl Session {
                     }
                     _ => Ok(vec![Value::Num(0.0)]),
                 }
+            }
+            "erase" | "replace" => {
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string pattern"), 0)),
+                };
+                let apply = |s: &str| -> String {
+                    if name == "erase" {
+                        s.replace(&pat, "")
+                    } else {
+                        match v.get(2) {
+                            Some(Value::Str(r)) => s.replace(&pat, r),
+                            _ => s.to_string(),
+                        }
+                    }
+                };
+                match v.first() {
+                    Some(Value::Str(s)) => Ok(vec![Value::Str(apply(s))]),
+                    Some(Value::Cell(c)) => {
+                        let mut out = CellArray::new(c.rows, c.cols);
+                        for i in 0..c.numel() {
+                            let text = match c.get_linear(i) {
+                                Some(Value::Str(s)) => apply(s),
+                                Some(other) => fmt_value(other, false).to_string(),
+                                None => String::new(),
+                            };
+                            out.set_linear(i, Value::Str(text));
+                        }
+                        Ok(vec![Value::Cell(out)])
+                    }
+                    _ => Err(LangError::new(format!("{name} needs a string or cellstr"), 0)),
+                }
+            }
+            "findstr" => {
+                let a = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("findstr needs two strings", 0)),
+                };
+                let b = match v.get(1) {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("findstr needs two strings", 0)),
+                };
+                let (hay, needle) = if a.chars().count() >= b.chars().count() { (a, b) } else { (b, a) };
+                let mut hits = Vec::new();
+                if !needle.is_empty() {
+                    let mut start = 0usize;
+                    while start <= hay.len() {
+                        match hay.get(start..).and_then(|s| s.find(&needle)) {
+                            Some(p) => {
+                                hits.push((start + p + 1) as f64);
+                                start += p + 1;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Ok(vec![Value::Mat(Matrix::row_vector(hits))])
+            }
+            "extractBefore" | "extractAfter" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string"), 0)),
+                };
+                let (pos, plen) = match v.get(1) {
+                    Some(Value::Str(p)) => match s.find(p) {
+                        Some(i) => (i, p.len()),
+                        None => (s.len(), 0),
+                    },
+                    Some(x) => {
+                        let n = x.scalar()?.max(1.0) as usize;
+                        let byte = s.char_indices().nth(n.saturating_sub(1)).map(|(i, _)| i).unwrap_or(s.len());
+                        (byte, 0)
+                    }
+                    None => return Err(LangError::new(format!("{name} needs a pattern or position"), 0)),
+                };
+                let out = if name == "extractBefore" {
+                    s.get(..pos).unwrap_or("").to_string()
+                } else {
+                    s.get(pos.saturating_add(plen)..).unwrap_or("").to_string()
+                };
+                Ok(vec![Value::Str(out)])
+            }
+            "insertBefore" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("insertBefore needs a string", 0)),
+                };
+                let pat = match v.get(1) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => return Err(LangError::new("insertBefore needs a pattern", 0)),
+                };
+                let ins = match v.get(2) {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => String::new(),
+                };
+                let out = match s.find(&pat) {
+                    Some(i) => format!("{}{}{}", s.get(..i).unwrap_or(""), ins, s.get(i..).unwrap_or("")),
+                    None => s,
+                };
+                Ok(vec![Value::Str(out)])
+            }
+            "isstrprop" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isstrprop needs a string", 0)),
+                };
+                let prop = match v.get(1) {
+                    Some(Value::Str(p)) => p.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let data: Vec<f64> = s
+                    .chars()
+                    .map(|c| {
+                        let ok = match prop.as_str() {
+                            "alpha" | "letter" => c.is_alphabetic(),
+                            "digit" => c.is_ascii_digit(),
+                            "alphanum" => c.is_alphanumeric(),
+                            "lower" => c.is_lowercase(),
+                            "upper" => c.is_uppercase(),
+                            "space" | "wspace" => c.is_whitespace(),
+                            "punct" => c.is_ascii_punctuation(),
+                            "cntrl" => c.is_control(),
+                            "graph" => !c.is_whitespace() && !c.is_control(),
+                            "print" => !c.is_control(),
+                            _ => false,
+                        };
+                        if ok {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                Ok(vec![Value::Mat(Matrix::row_vector(data))])
+            }
+            "isletter" => {
+                let s = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new("isletter needs a string", 0)),
+                };
+                let data: Vec<f64> = s.chars().map(|c| if c.is_alphabetic() { 1.0 } else { 0.0 }).collect();
+                Ok(vec![Value::Mat(Matrix::row_vector(data))])
+            }
+            "compose" => {
+                let (f, rest) = split_format_args(&v)?;
+                Ok(vec![Value::Str(sprintf_impl(&f, &rest)?)])
+            }
+            "splitlines" | "readlines" => {
+                let text = match v.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Err(LangError::new(format!("{name} needs a string or file"), 0)),
+                };
+                let text = if name == "readlines" {
+                    std::fs::read_to_string(text.trim()).map_err(|e| LangError::new(format!("readlines: {e}"), 0))?
+                } else {
+                    text
+                };
+                let lines: Vec<Value> = text.lines().map(|l| Value::Str(l.trim_end_matches('\r').to_string())).collect();
+                Ok(vec![Value::Cell(CellArray::col(lines))])
             }
             "strtok" => {
                 let s = match v.first() {
@@ -9067,6 +12936,209 @@ impl Session {
             }
         };
         match name {
+            "diary" => {
+                self.diary_touched = true;
+                match v.first() {
+                    None => self.diary_active = !self.diary_active,
+                    Some(Value::Str(s)) if s.eq_ignore_ascii_case("on") => self.diary_active = true,
+                    Some(Value::Str(s)) if s.eq_ignore_ascii_case("off") => self.diary_active = false,
+                    Some(Value::Str(s)) => {
+                        self.diary_file = Some(std::path::PathBuf::from(s));
+                        self.diary_active = true;
+                    }
+                    Some(_) => return Err(LangError::new("diary needs 'on', 'off' or a file name", 0)),
+                }
+                if self.diary_active && self.diary_file.is_none() {
+                    self.diary_file = Some(std::path::PathBuf::from("diary.txt"));
+                }
+                Ok(vec![])
+            }
+            "jsondecode" => {
+                let text = sarg(0).ok_or_else(|| LangError::new("jsondecode needs a string", 0))?;
+                let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| LangError::new(format!("jsondecode: {e}"), 0))?;
+                Ok(vec![json_to_value(&parsed)])
+            }
+            "jsonencode" => {
+                let value = v.first().ok_or_else(|| LangError::new("jsonencode needs a value", 0))?;
+                let json = value_to_json(value)?;
+                Ok(vec![Value::Str(serde_json::to_string(&json).unwrap_or_default())])
+            }
+            "importdata" => {
+                let path = sarg(0).ok_or_else(|| LangError::new("importdata needs a file name", 0))?;
+                Ok(vec![importdata_value(path)?])
+            }
+            "detectImportOptions" => {
+                let path = sarg(0).ok_or_else(|| LangError::new("detectImportOptions needs a file name", 0))?;
+                let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "FileType".to_string(),
+                    Value::Str(if matches!(ext.as_str(), "csv" | "tsv" | "txt" | "dat") { "text".into() } else { "spreadsheet".into() }),
+                );
+                m.insert("Delimiter".to_string(), Value::Str(if ext == "tsv" { "\t".into() } else { ",".into() }));
+                m.insert("ReadVariableNames".to_string(), Value::Num(1.0));
+                m.insert("VariableNamingRule".to_string(), Value::Str("modify".into()));
+                m.insert("TextType".to_string(), Value::Str("char".into()));
+                Ok(vec![Value::Struct(StructArray::from_map(m))])
+            }
+            "rethrow" => {
+                let msg = match v.first() {
+                    Some(Value::Struct(s)) => s
+                        .field_at(0, "message")
+                        .and_then(|x| match x {
+                            Value::Str(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "rethrown error".to_string()),
+                    Some(Value::Object(o)) => o
+                        .prop("message")
+                        .and_then(|x| match x {
+                            Value::Str(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "rethrown error".to_string()),
+                    _ => "rethrown error".to_string(),
+                };
+                Err(LangError::new(msg, 0))
+            }
+            "verLessThan" => Ok(vec![Value::Num(0.0)]),
+            "inputname" => Ok(vec![Value::Str(String::new())]),
+            "validateattributes" => {
+                let a = v.first().ok_or_else(|| LangError::new("validateattributes needs a value", 0))?;
+                let attrs = match v.get(2) {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(s) => Some(s.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let scalar = a.to_matrix().map(|m| m.numel() == 1).unwrap_or(false);
+                for attr in &attrs {
+                    let ok = match attr.as_str() {
+                        "scalar" => scalar,
+                        "nonempty" => a.to_matrix().map(|m| m.numel() > 0).unwrap_or(true),
+                        "positive" => a.to_matrix().map(|m| m.data().iter().all(|&x| x > 0.0)).unwrap_or(false),
+                        "nonnegative" => a.to_matrix().map(|m| m.data().iter().all(|&x| x >= 0.0)).unwrap_or(false),
+                        "finite" => a.to_matrix().map(|m| m.data().iter().all(|x| x.is_finite())).unwrap_or(false),
+                        "integer" => a.to_matrix().map(|m| m.data().iter().all(|x| x.fract() == 0.0)).unwrap_or(false),
+                        "real" => a.to_matrix().map(|m| m.data().iter().all(|x| x.is_finite())).unwrap_or(false),
+                        "2d" => a.to_matrix().map(|m| m.is_matrix()).unwrap_or(false),
+                        _ => true,
+                    };
+                    if !ok {
+                        return Err(LangError::new(format!("validateattributes: value failed '{attr}'"), 0));
+                    }
+                }
+                Ok(vec![])
+            }
+            "validatestring" => {
+                let s = sarg(0).ok_or_else(|| LangError::new("validatestring needs a string", 0))?;
+                let valid: Vec<String> = match v.get(1) {
+                    Some(Value::Cell(c)) => c
+                        .items
+                        .iter()
+                        .filter_map(|x| match x {
+                            Value::Str(x) => Some(x.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(Value::Str(x)) => vec![x.clone()],
+                    _ => Vec::new(),
+                };
+                let hit = valid.iter().find(|x| x.eq_ignore_ascii_case(s)).cloned().or_else(|| {
+                    let lower = s.to_ascii_lowercase();
+                    let hits: Vec<String> = valid.iter().filter(|x| x.to_ascii_lowercase().starts_with(&lower)).cloned().collect();
+                    if hits.len() == 1 {
+                        hits.into_iter().next()
+                    } else {
+                        None
+                    }
+                });
+                match hit {
+                    Some(x) => Ok(vec![Value::Str(x)]),
+                    None => Err(LangError::new(format!("validatestring: '{s}' is not a valid option"), 0)),
+                }
+            }
+            "mustBeNumeric"
+            | "mustBeNonempty"
+            | "mustBePositive"
+            | "mustBeInteger"
+            | "mustBeMember"
+            | "mustBeText"
+            | "mustBeA"
+            | "mustBeScalarOrEmpty"
+            | "mustBeFinite"
+            | "mustBeReal" => {
+                let a = v.first().ok_or_else(|| LangError::new(format!("{name} needs an argument"), 0))?;
+                let m = a.to_matrix();
+                let ok = match name {
+                    "mustBeNonempty" => m.as_ref().map(|x| x.numel() > 0).unwrap_or(true),
+                    "mustBePositive" => m.as_ref().map(|x| x.data().iter().all(|&v| v > 0.0)).unwrap_or(false),
+                    "mustBeInteger" => m.as_ref().map(|x| x.data().iter().all(|v| v.fract() == 0.0)).unwrap_or(false),
+                    "mustBeScalarOrEmpty" => m.as_ref().map(|x| x.numel() <= 1).unwrap_or(false),
+                    "mustBeFinite" | "mustBeReal" => m.as_ref().map(|x| x.data().iter().all(|v| v.is_finite())).unwrap_or(false),
+                    "mustBeText" => matches!(a, Value::Str(_) | Value::Cell(_)),
+                    _ => true,
+                };
+                if !ok {
+                    return Err(LangError::new(format!("{name}: validation failed"), 0));
+                }
+                Ok(vec![])
+            }
+            "webread" | "urlread" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use std::io::Read;
+                    // Bound both wait time and response size — URLs and
+                    // remote bodies are untrusted input.
+                    const WEBREAD_TIMEOUT_SECS: u64 = 30;
+                    const WEBREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
+                    let url = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a URL"), 0))?;
+                    let config = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(WEBREAD_TIMEOUT_SECS))).build();
+                    let agent = ureq::Agent::new_with_config(config);
+                    match agent.get(url).call() {
+                        Ok(mut resp) => {
+                            let mut body = String::new();
+                            resp.body_mut()
+                                .as_reader()
+                                .take(WEBREAD_MAX_BYTES)
+                                .read_to_string(&mut body)
+                                .map_err(|e| LangError::new(format!("{name}: failed reading response body: {e}"), 0))?;
+                            Ok(vec![Value::Str(body), Value::Num(1.0)])
+                        }
+                        Err(e) => Err(LangError::new(format!("{name}: {e}"), 0)),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Err(LangError::new(format!("{name} is not available on wasm"), 0))
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "web" | "winopen" => {
+                let target = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a target"), 0))?;
+                // explorer.exe takes the target as a literal argv value —
+                // unlike `cmd /C start` it never reparses it as shell syntax.
+                #[cfg(target_os = "windows")]
+                let spawned = std::process::Command::new("explorer.exe").arg(target).spawn();
+                #[cfg(target_os = "macos")]
+                let spawned = std::process::Command::new("open").arg(target).spawn();
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let spawned = std::process::Command::new("xdg-open").arg(target).spawn();
+                Ok(vec![Value::Num(if spawned.is_ok() { 0.0 } else { 1.0 })])
+            }
+            // Interactive dialogs have no honest headless answer — error
+            // instead of silently returning canned choices/paths.
+            "uigetdir" | "questdlg" | "uimenu" => Err(LangError::new(format!("{name}: interactive UI dialogs are not available in this session"), 0)),
+            "actxserver" => {
+                let prog = sarg(0).unwrap_or("").to_string();
+                let session = com::ComSession::start(&prog)?;
+                Ok(vec![Value::Object(MObject::com_object(&prog, session))])
+            }
             "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
             "ver" => {
                 // struct with Name/Version/Release fields.
@@ -9099,10 +13171,10 @@ impl Session {
                 std::env::set_var(&n, &val);
                 Ok(vec![Value::Num(0.0)])
             }
-            "system" => {
+            "system" | "dos" | "unix" => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let cmd = sarg(0).ok_or_else(|| LangError::new("system needs a command string", 0))?;
+                    let cmd = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a command string"), 0))?;
                     let shell = if cfg!(target_os = "windows") { ("cmd", "/c") } else { ("sh", "-c") };
                     match std::process::Command::new(shell.0).args([shell.1, cmd]).output() {
                         Ok(o) => {
@@ -9113,7 +13185,20 @@ impl Session {
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
-                    Err(LangError::new("system is not available on wasm", 0))
+                    Err(LangError::new(format!("{name} is not available on wasm"), 0))
+                }
+            }
+            "savepath" => {
+                let file = sarg(0).map(std::path::PathBuf::from).unwrap_or_else(path_store_file);
+                if let Some(parent) = file.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                let text = self.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                match std::fs::write(&file, text) {
+                    Ok(()) => Ok(vec![Value::Num(0.0), Value::Str(String::new())]),
+                    Err(e) => Ok(vec![Value::Num(1.0), Value::Str(e.to_string())]),
                 }
             }
             "fileparts" => {
@@ -9184,6 +13269,10 @@ impl Session {
             }
             "mfilename" => {
                 let cur = self.file_stack.last().cloned().unwrap_or_default();
+                let full = matches!(v.first(), Some(Value::Str(s)) if s.eq_ignore_ascii_case("fullpath"));
+                if full {
+                    return Ok(vec![Value::Str(cur)]);
+                }
                 let stem = std::path::Path::new(&cur).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
                 Ok(vec![Value::Str(stem)])
             }
@@ -9355,6 +13444,20 @@ impl Session {
                     }
                     _ => StructArray::new(),
                 };
+                while let (Some(Value::Str(k)), Some(val)) = (iter.next(), iter.next()) {
+                    if !s.has_field(k) {
+                        s.add_field(k);
+                    }
+                    s.set_field(0, k, val.clone())?;
+                }
+                Ok(vec![Value::Struct(s)])
+            }
+            "optimoptions" => {
+                // optimoptions('solver','Name',value,…) — the modern
+                // options builder; the solver name is accepted and the
+                // name/value pairs become a struct the solvers read.
+                let mut s = StructArray::new();
+                let mut iter = v.iter().skip(if matches!(v.first(), Some(Value::Str(_))) { 1 } else { 0 });
                 while let (Some(Value::Str(k)), Some(val)) = (iter.next(), iter.next()) {
                     if !s.has_field(k) {
                         s.add_field(k);
@@ -9873,7 +13976,7 @@ impl Session {
                     _ => return Err(LangError::new("imread needs a filename", 0)),
                 };
                 let bytes = std::fs::read(&fname).map_err(|e| LangError::new(format!("imread: cannot read {fname}: {e}"), 0))?;
-                let (w, h, px, ch) = crate::imgpng::decode(&bytes)?;
+                let (w, h, px, ch) = if bytes.starts_with(&[0xFF, 0xD8]) { decode_jpeg(&bytes)? } else { crate::imgpng::decode(&bytes)? };
                 check_elems(h.saturating_mul(w).saturating_mul(ch))?;
                 if ch == 1 {
                     let mut data = Vec::with_capacity(w * h);
@@ -9922,8 +14025,24 @@ impl Session {
                         }
                     }
                 }
-                let png = crate::imgpng::encode(w, h, &px, ch)?;
-                crate::write_file(std::path::Path::new(&fname), &png)
+                let ext = fname.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                let mut quality = 90u8;
+                let mut i = 2usize;
+                while i + 1 < v.len() {
+                    if let Value::Str(key) = &v[i] {
+                        if key.eq_ignore_ascii_case("quality") {
+                            let q = v.get(i + 1).and_then(|x| x.scalar().ok()).unwrap_or(90.0).round();
+                            if !q.is_finite() || !(0.0..=100.0).contains(&q) {
+                                return Err(LangError::new("imwrite: Quality must be between 0 and 100", 0));
+                            }
+                            quality = q as u8;
+                        }
+                    }
+                    i += 2;
+                }
+                let bytes =
+                    if matches!(ext.as_str(), "jpg" | "jpeg") { encode_jpeg(w, h, &px, ch, quality)? } else { crate::imgpng::encode(w, h, &px, ch)? };
+                crate::write_file(std::path::Path::new(&fname), &bytes)
                     .map_err(|e| LangError::new(format!("imwrite: cannot write {fname}: {e}"), 0))?;
                 Ok(None)
             }
@@ -10161,6 +14280,23 @@ impl Session {
                 _ => None,
             }
         };
+        if name == "readmatrix" {
+            if let Some(Value::Str(fname)) = v.first() {
+                if fname.to_ascii_lowercase().ends_with(".xlsx") {
+                    let mut xv = vec![Value::Str(fname.clone())];
+                    xv.extend(v.iter().skip(1).cloned());
+                    return self.xlsx_builtin("xlsread", xv, 1);
+                }
+            }
+        } else if name == "writematrix" {
+            if let Some(Value::Str(fname)) = v.get(1) {
+                if fname.to_ascii_lowercase().ends_with(".xlsx") {
+                    let mut xv = vec![Value::Str(fname.clone()), v.first().cloned().unwrap_or(Value::Num(0.0))];
+                    xv.extend(v.iter().skip(2).cloned());
+                    return self.xlsx_builtin("xlswrite", xv, 1);
+                }
+            }
+        }
         match name {
             "dlmread" | "readmatrix" => {
                 let fname = sarg(0).ok_or_else(|| LangError::new(format!("{name} needs a filename"), 0))?.to_string();
@@ -11110,45 +15246,6 @@ impl Session {
                 // False position may pin one endpoint — return the tighter one.
                 Ok(Some(Value::Num(if fa.abs() <= fb.abs() { a } else { b })))
             }
-            "fminsearch" => {
-                // Nelder–Mead on a scalar parameter.
-                let x0 = v.scalar_at(1).unwrap_or(0.0);
-                let (mut lo, mut hi) = (x0, if x0 == 0.0 { 1.0 } else { x0 * 1.05 + 0.00025 });
-                if hi == lo {
-                    hi = lo + 1.0;
-                }
-                let (mut flo, mut fhi) = (f(self, lo)?, f(self, hi)?);
-                for _ in 0..500 {
-                    if flo > fhi {
-                        std::mem::swap(&mut lo, &mut hi);
-                        std::mem::swap(&mut flo, &mut fhi);
-                    }
-                    if (hi - lo).abs() < 1e-12 {
-                        break;
-                    }
-                    let mid = (lo + hi) / 2.0;
-                    let reflect = mid + (mid - hi); // reflect worst
-                    let fr = f(self, reflect)?;
-                    if fr < flo {
-                        let expand = mid + 2.0 * (mid - hi);
-                        let fe = f(self, expand)?;
-                        if fe < fr {
-                            hi = expand;
-                            fhi = fe;
-                        } else {
-                            hi = reflect;
-                            fhi = fr;
-                        }
-                    } else if fr < fhi {
-                        hi = reflect;
-                        fhi = fr;
-                    } else {
-                        hi = mid;
-                        fhi = f(self, mid)?;
-                    }
-                }
-                Ok(Some(Value::Num(if flo <= fhi { lo } else { hi })))
-            }
             _ => {
                 // integral / quad: adaptive Simpson.
                 let a = v.scalar_at(1)?;
@@ -11276,6 +15373,7 @@ impl Session {
         };
         if name == "save" {
             let ascii = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("-ascii") || s.eq_ignore_ascii_case("-ascii-")));
+            let mcos = v.iter().any(|x| matches!(x, Value::Str(s) if s.eq_ignore_ascii_case("-mcos")));
             let is_mat = path.to_ascii_lowercase().ends_with(".mat") && !ascii;
             let mut out = String::from("# matcraft 1\n");
             let named: Vec<String> = v
@@ -11295,8 +15393,13 @@ impl Session {
             }
             if is_mat {
                 let vars: Vec<(String, Value)> = names.iter().filter_map(|n| self.vars.get(n).map(|val| (n.clone(), val.clone()))).collect();
-                crate::matfile::write(&path, &vars).map_err(|e| LangError::new(e, 0))?;
-                self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5)\n", vars.len()));
+                if mcos {
+                    crate::matfile::write_mcos(&path, &vars).map_err(|e| LangError::new(e, 0))?;
+                    self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5 MCOS)\n", vars.len()));
+                } else {
+                    crate::matfile::write(&path, &vars).map_err(|e| LangError::new(e, 0))?;
+                    self.print_buf.push_str(&format!("saved {} variable(s) to {path} (MAT v5)\n", vars.len()));
+                }
                 return Ok(None);
             }
             for n in &names {
@@ -11380,6 +15483,7 @@ impl Session {
                 if !name_filter.is_empty() && !name_filter.iter().any(|f| f == &n) {
                     continue;
                 }
+                let val = self.restore_loaded_value(val)?;
                 self.vars.insert(n.clone(), val.clone());
                 loaded.push((n, val));
             }
@@ -11545,6 +15649,436 @@ impl IndexSpec {
 /// An evaluated index value → a list of 1-based indices into a dimension
 /// of `dim_len`. Carries the logical-mask heuristic and strict integer
 /// validation shared by every indexing path.
+fn json_to_value(j: &serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::Mat(Matrix::zeros(0, 0)),
+        serde_json::Value::Bool(b) => Value::Num(if *b { 1.0 } else { 0.0 }),
+        serde_json::Value::Number(n) => Value::Num(n.as_f64().unwrap_or(f64::NAN)),
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(a) => {
+            if a.iter().all(|x| x.is_number()) {
+                let data: Vec<f64> = a.iter().map(|x| x.as_f64().unwrap_or(f64::NAN)).collect();
+                Value::Mat(Matrix::col_vector(data))
+            } else if a.iter().all(|x| x.is_object()) {
+                let mut sa = StructArray::with_dims(a.len(), 1);
+                for (i, item) in a.iter().enumerate() {
+                    if let serde_json::Value::Object(m) = item {
+                        for (k, v) in m {
+                            let _ = sa.set_field(i, k, json_to_value(v));
+                        }
+                    }
+                }
+                Value::Struct(sa)
+            } else {
+                Value::Cell(CellArray::col(a.iter().map(json_to_value).collect()))
+            }
+        }
+        serde_json::Value::Object(m) => {
+            let mut sa = StructArray::new();
+            for (k, v) in m {
+                let _ = sa.set_field(0, k, json_to_value(v));
+            }
+            Value::Struct(sa)
+        }
+    }
+}
+
+fn value_to_json(v: &Value) -> Result<serde_json::Value, LangError> {
+    Ok(match v {
+        Value::Num(x) => serde_json::json!(x),
+        Value::Mat(m) if m.numel() == 1 => serde_json::json!(m.data().first().copied().unwrap_or(0.0)),
+        Value::Mat(m) => {
+            let rows: Vec<serde_json::Value> = (0..m.rows())
+                .map(|r| serde_json::Value::Array((0..m.cols()).map(|c| serde_json::json!(m.get(r, c).unwrap_or(0.0))).collect()))
+                .collect();
+            serde_json::Value::Array(rows)
+        }
+        Value::Str(s) => serde_json::Value::String(s.clone()),
+        Value::Cell(c) => serde_json::Value::Array(c.items.iter().map(value_to_json).collect::<Result<_, _>>()?),
+        Value::Struct(s) => {
+            if s.rows().saturating_mul(s.cols()) <= 1 {
+                let mut map = serde_json::Map::new();
+                for name in s.field_names() {
+                    if let Some(x) = s.field_at(0, &name) {
+                        map.insert(name, value_to_json(x)?);
+                    }
+                }
+                serde_json::Value::Object(map)
+            } else {
+                let mut out = Vec::new();
+                for i in 0..s.rows().saturating_mul(s.cols()) {
+                    let mut map = serde_json::Map::new();
+                    for name in s.field_names() {
+                        if let Some(x) = s.field_at(i, &name) {
+                            map.insert(name, value_to_json(x)?);
+                        }
+                    }
+                    out.push(serde_json::Value::Object(map));
+                }
+                serde_json::Value::Array(out)
+            }
+        }
+        Value::Object(o) if o.class_name == "table" => {
+            let mut map = serde_json::Map::new();
+            for name in table_var_names(o) {
+                if let Some(x) = o.prop(&name) {
+                    map.insert(name, value_to_json(&x)?);
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Object(o) => serde_json::json!(format!("{} object", o.class_name)),
+        Value::Cplx(_) => return Err(LangError::new("jsonencode: complex numbers are not supported", 0)),
+        Value::Sparse(_) => return Err(LangError::new("jsonencode: sparse arrays are not supported", 0)),
+        Value::Func(_) => return Err(LangError::new("jsonencode: function handles are not supported", 0)),
+    })
+}
+
+fn importdata_value(path: &str) -> Result<Value, LangError> {
+    let text = std::fs::read_to_string(path).map_err(|e| LangError::new(format!("importdata: {e}"), 0))?;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut all_numeric = true;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('%') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == ',' || c == '\t').filter(|s| !s.is_empty()).collect();
+        let nums: Vec<f64> = parts.iter().map(|s| s.parse::<f64>().unwrap_or(f64::NAN)).collect();
+        if nums.iter().any(|x| x.is_nan()) {
+            all_numeric = false;
+        }
+        rows.push(nums);
+    }
+    if all_numeric && !rows.is_empty() {
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut m = Matrix::zeros(rows.len(), cols);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &x) in row.iter().enumerate() {
+                let _ = m.set(r, c, x);
+            }
+        }
+        Ok(mat_or_num(m))
+    } else {
+        Ok(Value::Cell(CellArray::col(text.lines().map(|l| Value::Str(l.to_string())).collect())))
+    }
+}
+
+fn wrap_gpu(v: Value) -> Value {
+    let mut props = StructArray::new();
+    let _ = props.set_field(0, "Data", v);
+    let _ = props.set_field(0, "Device", Value::Str(gpu::device_name()));
+    Value::Object(MObject::owned("gpuArray".into(), props))
+}
+
+fn gather_value(v: &Value) -> Value {
+    match v {
+        Value::Object(o) if o.class_name == "gpuArray" => o.prop("Data").unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))),
+        other => other.clone(),
+    }
+}
+
+fn diary_write_to(path: &std::path::Path, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+fn table_var_names(o: &MObject) -> Vec<String> {
+    o.prop("Properties")
+        .and_then(|p| match p {
+            Value::Struct(s) => s.field_at(0, "VariableNames").cloned(),
+            _ => None,
+        })
+        .map(|v| match v {
+            Value::Cell(c) => c
+                .items
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Value::Str(s) => vec![s],
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+fn value_row_count(v: &Value) -> usize {
+    match v {
+        Value::Mat(m) => m.rows(),
+        Value::Cell(c) => c.rows,
+        Value::Struct(s) => s.rows(),
+        Value::Num(_) | Value::Str(_) => 1,
+        _ => 1,
+    }
+}
+
+fn table_num_rows(o: &MObject) -> usize {
+    o.prop("Properties")
+        .and_then(|p| match p {
+            Value::Struct(s) => s.field_at(0, "NumRows").cloned(),
+            _ => None,
+        })
+        .and_then(|v| v.scalar().ok())
+        .unwrap_or(0.0)
+        .max(0.0) as usize
+}
+
+/// Build a table from 1-based row and variable indices.
+fn table_subset(o: &MObject, rows: &[usize], cols: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let mut props = StructArray::new();
+    let mut out_names = Vec::with_capacity(cols.len());
+    for &c in cols {
+        let name = names.get(c.saturating_sub(1)).cloned().unwrap_or_default();
+        let value = o.prop(&name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        let sliced = slice_table_rows(&value, rows)?;
+        props.set_field(0, &name, sliced)?;
+        out_names.push(name);
+    }
+    let mut p = StructArray::new();
+    p.set_field(0, "VariableNames", Value::Cell(CellArray::row(out_names.iter().cloned().map(Value::Str).collect())))?;
+    p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+    p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+    p.set_field(0, "NumRows", Value::Num(rows.len() as f64))?;
+    props.set_field(0, "Properties", Value::Struct(p))?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+/// Select rows (1-based indices) from one table variable, preserving its
+/// column layout.
+fn slice_table_rows(v: &Value, rows: &[usize]) -> Result<Value, LangError> {
+    match v {
+        Value::Mat(m) => {
+            if !m.is_matrix() {
+                return Err(LangError::new("table: matrix-valued variables are not supported", 0));
+            }
+            let cols = m.cols();
+            let mut out = Matrix::zeros(rows.len(), cols);
+            for (i, &r) in rows.iter().enumerate() {
+                for c in 0..cols {
+                    let _ = out.set(i, c, m.get(r.saturating_sub(1), c).unwrap_or(f64::NAN));
+                }
+            }
+            Ok(mat_or_num(out))
+        }
+        Value::Cell(c) => {
+            let mut out = CellArray::new(rows.len(), c.cols);
+            for (i, &r) in rows.iter().enumerate() {
+                for col in 0..c.cols {
+                    if let Some(x) = c.get(r.saturating_sub(1), col) {
+                        out.set(i, col, x.clone());
+                    }
+                }
+            }
+            Ok(Value::Cell(out))
+        }
+        _ if rows.is_empty() => Ok(Value::Mat(Matrix::zeros(0, 0))),
+        other => Ok(other.clone()),
+    }
+}
+
+fn table_properties(names: &[String], nrows: usize) -> Result<Value, LangError> {
+    let mut p = StructArray::new();
+    p.set_field(0, "VariableNames", Value::Cell(CellArray::row(names.iter().cloned().map(Value::Str).collect())))?;
+    p.set_field(0, "RowNames", Value::Cell(CellArray::row(Vec::new())))?;
+    p.set_field(0, "DimensionNames", Value::Cell(CellArray::row(vec![Value::Str("Row".into()), Value::Str("Variables".into())])))?;
+    p.set_field(0, "NumRows", Value::Num(nrows as f64))?;
+    Ok(Value::Struct(p))
+}
+
+fn table_delete_rows(o: &MObject, rows: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let nrows = table_num_rows(o);
+    let mut keep = vec![true; nrows];
+    for &r in rows {
+        if let Some(slot) = keep.get_mut(r.saturating_sub(1)) {
+            *slot = false;
+        }
+    }
+    let kept: Vec<usize> = keep.iter().enumerate().filter_map(|(i, &k)| k.then_some(i + 1)).collect();
+    let mut props = StructArray::new();
+    for name in &names {
+        let value = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        props.set_field(0, name, slice_table_rows(&value, &kept)?)?;
+    }
+    props.set_field(0, "Properties", table_properties(&names, kept.len())?)?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+fn table_delete_vars(o: &MObject, keep: &[usize]) -> Result<Value, LangError> {
+    let names = table_var_names(o);
+    let nrows = table_num_rows(o);
+    let mut kept_names = Vec::with_capacity(keep.len());
+    let mut props = StructArray::new();
+    for &c in keep {
+        let Some(name) = names.get(c.saturating_sub(1)) else { continue };
+        let value = o.prop(name).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
+        props.set_field(0, name, value)?;
+        kept_names.push(name.clone());
+    }
+    let nrows = if kept_names.is_empty() { 0 } else { nrows };
+    props.set_field(0, "Properties", table_properties(&kept_names, nrows)?)?;
+    Ok(Value::Object(MObject::owned("table".into(), props)))
+}
+
+/// Pick the per-variable column of a numeric/cell right-hand side.
+fn table_rhs_column(rhs: &Value, j: usize, ncols: usize, nrows: usize) -> Result<Value, LangError> {
+    match rhs {
+        Value::Mat(m) => {
+            if m.numel() == 1 {
+                return Ok(Value::Num(m.get_linear(0).unwrap_or(0.0)));
+            }
+            if m.rows() == 1 && m.cols() == ncols {
+                return Ok(Value::Num(m.get(0, j).unwrap_or(0.0)));
+            }
+            if ncols == 1 && m.cols() == 1 && m.rows() == nrows {
+                return Ok(Value::Mat(m.clone()));
+            }
+            if ncols == 1 && m.rows() == 1 && m.cols() == nrows {
+                return Ok(Value::Mat(Matrix::col_vector(m.data().to_vec())));
+            }
+            if m.rows() == nrows && m.cols() == ncols {
+                let mut out = Matrix::zeros(nrows, 1);
+                for r in 0..nrows {
+                    let _ = out.set(r, 0, m.get(r, j).unwrap_or(0.0));
+                }
+                return Ok(Value::Mat(out));
+            }
+            Err(LangError::new("table: right-hand side size does not match the selected variables", 0))
+        }
+        Value::Cell(c) => {
+            if c.numel() == 1 {
+                return Ok(c.get_linear(0).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+            }
+            if c.rows == 1 && c.cols == ncols {
+                return Ok(c.get(0, j).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))));
+            }
+            if ncols == 1 && c.cols == 1 && c.rows == nrows {
+                return Ok(Value::Cell(c.clone()));
+            }
+            if c.rows == nrows && c.cols == ncols {
+                let mut out = CellArray::new(nrows, 1);
+                for r in 0..nrows {
+                    if let Some(v) = c.get(r, j) {
+                        out.set(r, 0, v.clone());
+                    }
+                }
+                return Ok(Value::Cell(out));
+            }
+            Err(LangError::new("table: right-hand cell size does not match the selected variables", 0))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn assign_table_rows(target: &Value, rows: &[usize], src: &Value) -> Result<Value, LangError> {
+    match target {
+        Value::Mat(m) => {
+            let mut out = m.clone();
+            let scalar = match src {
+                Value::Num(x) => Some(*x),
+                Value::Mat(s) if s.numel() == 1 => s.get_linear(0),
+                _ => None,
+            };
+            if let Some(x) = scalar {
+                for &r in rows {
+                    for c in 0..out.cols() {
+                        let _ = out.set(r.saturating_sub(1), c, x);
+                    }
+                }
+                return Ok(mat_or_num(out));
+            }
+            let s = src.to_matrix()?;
+            if s.rows() == rows.len() && s.cols() == out.cols() {
+                for (i, &r) in rows.iter().enumerate() {
+                    for c in 0..out.cols() {
+                        let _ = out.set(r.saturating_sub(1), c, s.get(i, c).unwrap_or(0.0));
+                    }
+                }
+                return Ok(mat_or_num(out));
+            }
+            if rows.len() == 1 && s.numel() == out.cols() {
+                for c in 0..out.cols() {
+                    let _ = out.set(rows[0].saturating_sub(1), c, s.get_linear(c).unwrap_or(0.0));
+                }
+                return Ok(mat_or_num(out));
+            }
+            if out.cols() == 1 && s.numel() == rows.len() {
+                for (i, &r) in rows.iter().enumerate() {
+                    let _ = out.set(r.saturating_sub(1), 0, s.get_linear(i).unwrap_or(0.0));
+                }
+                return Ok(mat_or_num(out));
+            }
+            Err(LangError::new("table: variable value size does not match the selected rows", 0))
+        }
+        Value::Cell(c) => {
+            let mut out = c.clone();
+            let src_cell = match src {
+                Value::Cell(sc) => sc.clone(),
+                other => {
+                    let mut one = CellArray::new(1, 1);
+                    one.set(0, 0, other.clone());
+                    one
+                }
+            };
+            if src_cell.numel() != 1 && src_cell.rows != rows.len() {
+                return Err(LangError::new("table: cell value size does not match the selected rows", 0));
+            }
+            for (i, &r) in rows.iter().enumerate() {
+                for col in 0..out.cols {
+                    let pick = if src_cell.numel() == 1 {
+                        src_cell.get_linear(0).cloned()
+                    } else {
+                        src_cell.get(i, col.min(src_cell.cols.saturating_sub(1))).cloned()
+                    };
+                    if let Some(v) = pick {
+                        out.set(r.saturating_sub(1), col, v);
+                    }
+                }
+            }
+            Ok(Value::Cell(out))
+        }
+        Value::Num(_) | Value::Str(_) => {
+            if rows.len() == 1 {
+                Ok(src.clone())
+            } else {
+                Err(LangError::new("table: scalar variables cannot be assigned across multiple rows", 0))
+            }
+        }
+        _ => Err(LangError::new("table: unsupported variable type for assignment", 0)),
+    }
+}
+
+fn builtin_binop(name: &str) -> Option<BinOp> {
+    Some(match name {
+        "plus" => BinOp::Add,
+        "minus" => BinOp::Sub,
+        "mtimes" => BinOp::Mul,
+        "times" => BinOp::ElemMul,
+        "mrdivide" => BinOp::Div,
+        "rdivide" => BinOp::ElemDiv,
+        "mldivide" => BinOp::Backslash,
+        "mpower" => BinOp::Pow,
+        "power" => BinOp::ElemPow,
+        "eq" => BinOp::Eq,
+        "ne" => BinOp::Neq,
+        "lt" => BinOp::Lt,
+        "le" => BinOp::Le,
+        "gt" => BinOp::Gt,
+        "ge" => BinOp::Ge,
+        "and" => BinOp::And,
+        "or" => BinOp::Or,
+        _ => return None,
+    })
+}
+
 fn index_list(v: &Value, dim_len: usize) -> Result<Vec<usize>, LangError> {
     let m = v.to_matrix()?;
     // Logical indexing: a 0/1 mask the length of the indexed dimension
@@ -12033,6 +16567,44 @@ fn named_rgb(s: &str) -> Option<matplot::Rgb> {
     .color
 }
 
+/// `validatecolor(c)` / `validatecolor(c,'multiple')`: turn a colour name or
+/// RGB triplet(s) into an n×3 matrix with components in [0,1].
+fn validate_color(v: Option<&Value>, multiple: bool) -> Result<Matrix, LangError> {
+    let value = v.ok_or_else(|| LangError::new("validatecolor needs a colour", 0))?;
+    let rows: Vec<[f64; 3]> = match value {
+        Value::Str(s) => {
+            let rgb = named_rgb(s).ok_or_else(|| LangError::new(format!("validatecolor: unknown colour '{s}'"), 0))?;
+            vec![[rgb.0 as f64 / 255.0, rgb.1 as f64 / 255.0, rgb.2 as f64 / 255.0]]
+        }
+        Value::Mat(m) if m.numel() == 0 => Vec::new(),
+        Value::Mat(m) => {
+            if m.cols() != 3 {
+                return Err(LangError::new("validatecolor: RGB values must have three columns", 0));
+            }
+            if m.rows() > 1 && !multiple {
+                return Err(LangError::new("validatecolor: expected a single colour (use 'multiple' for rows)", 0));
+            }
+            let mut out = Vec::with_capacity(m.rows());
+            for r in 0..m.rows() {
+                let rgb = [m.get(r, 0).unwrap_or(0.0), m.get(r, 1).unwrap_or(0.0), m.get(r, 2).unwrap_or(0.0)];
+                if rgb.iter().any(|x| x.is_nan() || !(0.0..=1.0).contains(x)) {
+                    return Err(LangError::new("validatecolor: RGB components must be between 0 and 1", 0));
+                }
+                out.push(rgb);
+            }
+            out
+        }
+        _ => return Err(LangError::new("validatecolor: expected a colour name or an RGB matrix", 0)),
+    };
+    let mut out = Matrix::zeros(rows.len(), 3);
+    for (r, rgb) in rows.iter().enumerate() {
+        for (c, &x) in rgb.iter().enumerate() {
+            let _ = out.set(r, c, x);
+        }
+    }
+    Ok(out)
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
@@ -12426,6 +16998,32 @@ fn trapz(x: &Matrix, y: &Matrix) -> f64 {
 /// Histogram bin counts and edges over `nb` equal-width bins.
 /// Pick an output format for `saveas`/`exportgraphics`/`print` and render
 /// the figure to bytes. `fmt` overrides the extension (`-dpng` &c.).
+fn decode_jpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>, usize), LangError> {
+    let img = ::image::load_from_memory_with_format(bytes, ::image::ImageFormat::Jpeg)
+        .map_err(|e| LangError::new(format!("imread: JPEG decode failed: {e}"), 0))?;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    match img {
+        ::image::DynamicImage::ImageLuma8(g) => Ok((w, h, g.into_raw(), 1)),
+        ::image::DynamicImage::ImageRgb8(r) => Ok((w, h, r.into_raw(), 3)),
+        other => {
+            let rgb = other.to_rgb8();
+            Ok((w, h, rgb.into_raw(), 3))
+        }
+    }
+}
+
+fn encode_jpeg(w: usize, h: usize, px: &[u8], ch: usize, quality: u8) -> Result<Vec<u8>, LangError> {
+    if w == 0 || h == 0 || w > u16::MAX as usize || h > u16::MAX as usize {
+        return Err(LangError::new("imwrite: JPEG dimensions must be between 1 and 65535", 0));
+    }
+    let mut out = Vec::new();
+    let color = if ch == 1 { ::image::ExtendedColorType::L8 } else { ::image::ExtendedColorType::Rgb8 };
+    ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode(px, w as u32, h as u32, color)
+        .map_err(|e| LangError::new(format!("imwrite: JPEG encode failed: {e}"), 0))?;
+    Ok(out)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn export_figure(fig: &matplot::Figure, file: &str, fmt: Option<&str>) -> Result<Vec<u8>, LangError> {
     let kind = fmt.map(str::to_string).unwrap_or_else(|| file.rsplit('.').next().unwrap_or("svg").to_ascii_lowercase());
@@ -12545,6 +17143,8 @@ fn histcounts(m: &Matrix, nb: usize) -> (Vec<f64>, Vec<f64>) {
 pub const BUILTIN_NAMES: &[&str] = &[
     "zeros",
     "ones",
+    "true",
+    "false",
     "eye",
     "magic",
     "rand",
@@ -12590,6 +17190,15 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "isobject",
     "methods",
     "properties",
+    "events",
+    "metaclass",
+    "ismethod",
+    "isprop",
+    "addlistener",
+    "notify",
+    "addprop",
+    "dynamicprops",
+    "removeprop",
     "fieldnames",
     "isfield",
     "rmfield",
@@ -12701,7 +17310,298 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "interp1",
     "trapz",
     "fzero",
+    "fminbnd",
     "fminsearch",
+    "fminunc",
+    "fsolve",
+    "lsqnonlin",
+    "lsqcurvefit",
+    "linprog",
+    "quadprog",
+    "intlinprog",
+    "fmincon",
+    "patternsearch",
+    "tf",
+    "ss",
+    "zpk",
+    "tfdata",
+    "ssdata",
+    "zpkdata",
+    "pole",
+    "zero",
+    "dcgain",
+    "series",
+    "parallel",
+    "feedback",
+    "tf2ss",
+    "ss2tf",
+    "step",
+    "impulse",
+    "initial",
+    "lsim",
+    "bode",
+    "freqresp",
+    "pid",
+    "pidtune",
+    "margin",
+    "nyquist",
+    "isstable",
+    "damp",
+    "bandwidth",
+    "normpdf",
+    "normcdf",
+    "norminv",
+    "exppdf",
+    "expcdf",
+    "expinv",
+    "unifpdf",
+    "unifcdf",
+    "unifinv",
+    "poisspdf",
+    "poisscdf",
+    "poissinv",
+    "binopdf",
+    "binocdf",
+    "binoinv",
+    "wblpdf",
+    "wblcdf",
+    "wblinv",
+    "lognpdf",
+    "logncdf",
+    "logninv",
+    "exprnd",
+    "unifrnd",
+    "poissrnd",
+    "binornd",
+    "wblrnd",
+    "lognrnd",
+    "iqr",
+    "corrcoef",
+    "regress",
+    "kmeans",
+    "ttest",
+    "ttest2",
+    "kstest",
+    "adtest",
+    "chi2gof",
+    "pca",
+    "gampdf",
+    "gamcdf",
+    "gaminv",
+    "betapdf",
+    "betacdf",
+    "betainv",
+    "chi2pdf",
+    "chi2cdf",
+    "chi2inv",
+    "tpdf",
+    "tcdf",
+    "tinv",
+    "fpdf",
+    "fcdf",
+    "finv",
+    "fitdist",
+    "pdf",
+    "cdf",
+    "icdf",
+    "random",
+    "cmdscale",
+    "pcoa",
+    "bonferroni",
+    "holm",
+    "sidak",
+    "benjamini_hochberg",
+    "mafdr",
+    "signrank",
+    "ranksum",
+    "kruskalwallis",
+    "umap",
+    "tsne",
+    "ode45",
+    "ode15s",
+    "ode23",
+    "ode23s",
+    "dde23",
+    "deval",
+    "odeset",
+    "odeget",
+    "inputParser",
+    "addRequired",
+    "addOptional",
+    "addParameter",
+    "addParamValue",
+    "addparameter",
+    "parse",
+    "string",
+    "strings",
+    "isstring",
+    "table",
+    "table2array",
+    "parpool",
+    "maxNumCompThreads",
+    "gpuArray",
+    "gather",
+    "canUseGPU",
+    "existsOnGPU",
+    "gpuDevice",
+    "parfeval",
+    "fetchOutputs",
+    "onCleanup",
+    "categorical",
+    "reordercats",
+    "categories",
+    "countcats",
+    "addcats",
+    "removecats",
+    "mergecats",
+    "renamecats",
+    "isundefined",
+    "isdatetime",
+    "isduration",
+    "istimetable",
+    "datetime",
+    "duration",
+    "seconds",
+    "formulaatoms",
+    "formulaweight",
+    "formulacheck",
+    "inferformula",
+    "parsereaction",
+    "formatreaction",
+    "canonicalreaction",
+    "rxnequal",
+    "rxnbalance",
+    "gprparse",
+    "gpreval",
+    "gprgenes",
+    "gprmerge",
+    "fastaread",
+    "fastawrite",
+    "genbankread",
+    "pdist2",
+    "jaccard",
+    "jaccarddistance",
+    "setmetrics",
+    "confusionmat",
+    "clustermetrics",
+    "cluster",
+    "clusterdata",
+    "cophenet",
+    "silhouette",
+    "randindex",
+    "mutualinfo",
+    "evalclusters",
+    "dendrogram",
+    "venn",
+    "venncounts",
+    "quiver",
+    "quiver3",
+    "heatmap",
+    "clustergram",
+    "streamline",
+    "streamslice",
+    "volcano",
+    "graph",
+    "digraph",
+    "gplot",
+    "numnodes",
+    "numedges",
+    "degree",
+    "conncomp",
+    "neighbors",
+    "shortestpath",
+    "distances",
+    "bfsearch",
+    "dfsearch",
+    "adjacency",
+    "incidence",
+    "isgraph",
+    "nchoosek",
+    "gammaln",
+    "hygecdf",
+    "tabulate",
+    "corr",
+    "pdist",
+    "squareform",
+    "vecnorm",
+    "blkdiag",
+    "mat2cell",
+    "gradient",
+    "expm",
+    "isbetween",
+    "zscore",
+    "isoutlier",
+    "partialcorr",
+    "linkage",
+    "fitlm",
+    "optimalleaforder",
+    "isKey",
+    "count",
+    "keys",
+    "values",
+    "remove",
+    "anova1",
+    "anova2",
+    "multcompare",
+    "friedman",
+    "xlsread",
+    "xlswrite",
+    "readcell",
+    "writecell",
+    "readtable",
+    "writetable",
+    "height",
+    "width",
+    "istable",
+    "table2cell",
+    "cell2table",
+    "struct2table",
+    "struct2cell",
+    "cell2struct",
+    "addvars",
+    "setvartype",
+    "convertvars",
+    "removevars",
+    "renamevars",
+    "summary",
+    "findgroups",
+    "splitapply",
+    "varfun",
+    "rowfun",
+    "join",
+    "innerjoin",
+    "outerjoin",
+    "groupsummary",
+    "stack",
+    "unstack",
+    "fillmissing",
+    "rmmissing",
+    "standardizeMissing",
+    "rgb2gray",
+    "imresize",
+    "imfilter",
+    "medfilt2",
+    "edge",
+    "bwlabel",
+    "regionprops",
+    "graythresh",
+    "imbinarize",
+    "imdilate",
+    "imerode",
+    "imopen",
+    "imclose",
+    "imrotate",
+    "imcrop",
+    "strel",
+    "ga",
+    "h5read",
+    "h5write",
+    "h5create",
+    "h5disp",
+    "ncread",
+    "ncwrite",
+    "ncinfo",
+    "ncdisp",
     "integral",
     "quad",
     "eig",
@@ -12727,6 +17627,19 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "strtrim",
     "strrep",
     "strfind",
+    "contains",
+    "startswith",
+    "endswith",
+    "startsWith",
+    "endsWith",
+    "strsplit",
+    "strjoin",
+    "strlength",
+    "fileread",
+    "isfolder",
+    "rows",
+    "array2table",
+    "ismissing",
     "double",
     "logical",
     "char",
@@ -12770,6 +17683,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "narginchk",
     "nargoutchk",
     "feval",
+    "builtin",
     "func2str",
     "str2func",
     "functions",
@@ -12777,6 +17691,34 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cellfun",
     "lasterror",
     "figure",
+    "axes",
+    "boxplot",
+    "xticks",
+    "yticks",
+    "xticklabels",
+    "yticklabels",
+    "xtickangle",
+    "ytickangle",
+    "sgtitle",
+    "tiledlayout",
+    "nexttile",
+    "yline",
+    "barh",
+    "annotation",
+    "gobjects",
+    "isgraphics",
+    "allchild",
+    "ancestor",
+    "getappdata",
+    "setappdata",
+    "gcp",
+    "cla",
+    "colororder",
+    "getpixelposition",
+    "savefig",
+    "hsv",
+    "parula",
+    "cool",
     "gcf",
     "clf",
     "close",
@@ -12798,15 +17740,26 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "view",
     "colormap",
     "colorbar",
+    "lighting",
+    "light",
+    "lines",
+    "validatecolor",
     "caxis",
     "clim",
     "imagesc",
     "image",
     "text",
+    "rectangle",
+    "patch",
+    "daspect",
     "pie",
     "contour",
+    "contourf",
+    "contour3",
     "plot3",
     "surf",
+    "surfc",
+    "surfl",
     "mesh",
     "saveas",
     "exportgraphics",
@@ -12892,6 +17845,17 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "regexp",
     "regexpi",
     "regexprep",
+    "erase",
+    "replace",
+    "findstr",
+    "extractBefore",
+    "extractAfter",
+    "insertBefore",
+    "isstrprop",
+    "isletter",
+    "compose",
+    "splitlines",
+    "readlines",
     "version",
     "computer",
     "ispc",
@@ -12900,6 +17864,9 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "getenv",
     "setenv",
     "system",
+    "dos",
+    "unix",
+    "savepath",
     "fileparts",
     "copyfile",
     "movefile",
@@ -12913,6 +17880,34 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "assignin",
     "mfilename",
     "license",
+    "diary",
+    "jsondecode",
+    "jsonencode",
+    "webread",
+    "urlread",
+    "web",
+    "winopen",
+    "uigetdir",
+    "questdlg",
+    "uimenu",
+    "actxserver",
+    "importdata",
+    "detectImportOptions",
+    "rethrow",
+    "verLessThan",
+    "inputname",
+    "validateattributes",
+    "validatestring",
+    "mustBeNumeric",
+    "mustBeNonempty",
+    "mustBePositive",
+    "mustBeInteger",
+    "mustBeMember",
+    "mustBeText",
+    "mustBeA",
+    "mustBeScalarOrEmpty",
+    "mustBeFinite",
+    "mustBeReal",
     "ver",
     "drawnow",
     "beep",
@@ -12928,6 +17923,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "class",
     "inline",
     "optimset",
+    "optimoptions",
     "optimget",
     "nargchk",
     "single",
@@ -12992,6 +17988,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "set",
     "argv",
     "vline",
+    "xline",
     "wmean",
 ];
 
@@ -13931,7 +18928,10 @@ pub fn describe(v: &Value) -> String {
         Value::Str(s) => format!("1x{} char", s.chars().count()),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
-        Value::Object(o) => format!("1x1 {}", o.class_name),
+        Value::Object(o) => {
+            let d = o.array_dims();
+            format!("{}x{} {}", d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1), o.class_name)
+        }
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(_) => "1x1 function_handle".into(),
     }
@@ -14129,7 +19129,10 @@ fn fmt_cell_item(v: &Value, long: bool) -> String {
         Value::Str(s) => format!("'{s}'"),
         Value::Cell(c) => format!("{}x{} cell", c.shape().0, c.shape().1),
         Value::Struct(s) => format!("{}x{} struct", s.rows(), s.cols()),
-        Value::Object(o) => format!("1x1 {}", o.class_name),
+        Value::Object(o) => {
+            let d = o.array_dims();
+            format!("{}x{} {}", d.first().copied().unwrap_or(1), d.get(1).copied().unwrap_or(1), o.class_name)
+        }
         Value::Sparse(s) => format!("{}x{} sparse double", s.rows(), s.cols()),
         Value::Func(h) => func_text(h),
     }
@@ -14174,7 +19177,8 @@ pub fn fmt_value(v: &Value, long: bool) -> impl fmt::Display + '_ {
                     // `Foo` object with properties: — class tag + field list.
                     let props = o.props_map();
                     writeln!(f, "   {} object with properties:", o.class_name)?;
-                    for name in props.field_names() {
+                    let hidden: Vec<String> = o.dyn_props().into_iter().filter(|p| p.hidden).map(|p| p.name).collect();
+                    for name in props.field_names().into_iter().filter(|n| !is_internal_prop(n) && !hidden.contains(n)) {
                         let val = props.field_at(0, &name).cloned().unwrap_or(Value::Mat(Matrix::zeros(0, 0)));
                         writeln!(f, "       {name}: {}", fmt_cell_item(&val, self.1))?;
                     }
@@ -15067,11 +20071,38 @@ legend('sig'); grid on; saveas('{f}')"
         assert_eq!(fig.series[0].levels.len(), 3);
         assert!(matplot::to_svg(fig).contains("<path"));
 
+        s.run("clf; [X,Y]=meshgrid(-2:2,-2:2); contourf(X.^2+Y.^2, 3)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series[0].kind, SeriesKind::ContourF);
+        assert!(matplot::to_svg(fig).matches("fill=\"").count() > 3);
+
+        s.run("clf; [X,Y]=meshgrid(-2:2,-2:2); contour3(X.^2+Y.^2, 3)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series[0].kind, SeriesKind::Contour3);
+        assert!(matplot::to_svg(fig).contains("<path"));
+
         s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surf(X,Y,X.^2+Y.^2)").unwrap();
         let fig = &s.figs[0];
         assert_eq!(fig.series[0].kind, SeriesKind::Surf);
         assert_eq!(fig.series[0].zshape, (3, 3));
         assert!(matplot::to_svg(fig).contains("<path"));
+
+        s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surfc(X,Y,X.^2+Y.^2)").unwrap();
+        let fig = &s.figs[0];
+        assert_eq!(fig.series.len(), 2);
+        assert_eq!(fig.series[0].kind, SeriesKind::Surf);
+        assert_eq!(fig.series[1].kind, SeriesKind::Contour3Base);
+        assert!(matplot::to_svg(fig).contains("<path"));
+
+        s.run("clf; [X,Y]=meshgrid(-1:1,-1:1); surf(X,Y,X.^2+Y.^2); lighting flat").unwrap();
+        assert!(s.figs[0].lighting);
+        let lit = matplot::to_svg(&s.figs[0]);
+        s.run("lighting none").unwrap();
+        assert!(!s.figs[0].lighting);
+        let plain = matplot::to_svg(&s.figs[0]);
+        assert_ne!(lit, plain);
+        s.run("light").unwrap();
+        assert!(s.figs[0].lighting);
 
         s.run("clf; mesh(-1:1, -1:1, [1 2 3; 4 5 6; 7 8 9])").unwrap();
         assert_eq!(s.figs[0].series[0].kind, SeriesKind::Mesh);
@@ -15153,6 +20184,28 @@ legend('sig'); grid on; saveas('{f}')"
         assert_eq!(s.get("rp").unwrap().scalar().unwrap(), 1.0);
         assert!((s.get("tp").unwrap().scalar().unwrap() - 0.1).abs() < 1e-12);
         assert!((s.get("dp").unwrap().scalar().unwrap() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn image_jpeg_roundtrip() {
+        let dir = m_dir("jpeg");
+        let rgb = dir.join("color.jpg");
+        let gray = dir.join("gray.jpg");
+        let p = rgb.to_string_lossy().replace('\\', "/");
+        let g = gray.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "A = zeros(8,8,3); for r=1:8, for c=1:8, A(r,c,1)=r*30; A(r,c,2)=c*30; A(r,c,3)=128; end; end; \
+             imwrite(A, '{p}', 'Quality', 95); B = imread('{p}'); sz = size(B); err = max(max(max(abs(B - A)))); \
+             G = round(linspace(0, 255, 16)); G = reshape(G, 4, 4); imwrite(G, '{g}'); H = imread('{g}'); gsz = size(H);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("sz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![8.0, 8.0, 3.0]));
+        assert!(s.get("err").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY) < 15.0);
+        assert_eq!(s.get("gsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![4.0, 4.0]));
+        let bytes = std::fs::read(&rgb).unwrap();
+        assert_eq!(bytes.get(..2), Some(&[0xFF, 0xD8][..]));
+        rm_dir(&dir);
     }
 
     #[test]
@@ -17120,9 +22173,17 @@ end",
     properties (SetAccess = protected, GetAccess = public, Dependent)
         c = 2
     end
+    properties (Constant)
+        k = 7
+    end
     methods ( Access = public , Static = false , Abstract = false )
         function obj = Att()
             obj.a = 1;
+        end
+    end
+    methods (Access = private)
+        function y = secret(obj)
+            y = 42;
         end
     end
     methods (Static)
@@ -17133,12 +22194,415 @@ end",
 end",
         )
         .unwrap();
-        s.run("o = Att(); v = o.c; w = o.twice(4);").unwrap();
+        s.run("o = Att(); v = o.c; w = o.twice(4); kk = o.k;").unwrap();
         assert_eq!(s.get("v"), Some(&Value::Num(2.0)));
         assert_eq!(s.get("w"), Some(&Value::Num(8.0)));
-        // `b` had no default — reads back as the empty matrix.
-        s.run("e = isempty(o.b);").unwrap();
-        assert_eq!(s.get("e"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("kk"), Some(&Value::Num(7.0)));
+        // Private reads, Constant writes, Dependent writes and private
+        // methods are rejected outside the class.
+        s.run(
+            "try, q = o.b; catch e, msg = e.message; end\n\
+             try, o.k = 8; catch e2, msg2 = e2.message; end\n\
+             try, o.c = 5; catch e3, msg3 = e3.message; end\n\
+             try, o.secret; catch e4, msg4 = e4.message; end",
+        )
+        .unwrap();
+        let msg = |s: &Session, n: &str| match s.get(n) {
+            Some(Value::Str(v)) => v.clone(),
+            _ => String::new(),
+        };
+        assert!(msg(&s, "msg").contains("private access"), "msg = {}", msg(&s, "msg"));
+        assert!(msg(&s, "msg2").contains("Constant"), "msg2 = {}", msg(&s, "msg2"));
+        assert!(msg(&s, "msg3").contains("Dependent"), "msg3 = {}", msg(&s, "msg3"));
+        assert!(msg(&s, "msg4").contains("private access"), "msg4 = {}", msg(&s, "msg4"));
+    }
+
+    #[test]
+    fn classdef_events_and_listeners() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Emitter < handle
+    properties
+        hits = 0
+    end
+    events
+        Ping
+    end
+    methods
+        function fire(obj)
+            notify(obj, 'Ping');
+        end
+    end
+end
+function bump(src, evt)
+    src.hits = src.hits + 1;
+end",
+        )
+        .unwrap();
+        s.run("e = Emitter(); l = addlistener(e, 'Ping', @bump); e.fire(); n1 = e.hits; ev = events(e);").unwrap();
+        assert_eq!(s.get("n1"), Some(&Value::Num(1.0)));
+        if let Some(Value::Cell(ev)) = s.get("ev") {
+            assert!((0..ev.numel()).any(|i| matches!(ev.get_linear(i), Some(Value::Str(x)) if x == "Ping")));
+        } else {
+            panic!("events(e) is not a cell");
+        }
+        s.run("delete(l); notify(e, 'Ping'); n2 = e.hits;").unwrap();
+        assert_eq!(s.get("n2"), Some(&Value::Num(1.0)));
+
+        // Value classes cannot own listeners.
+        s.run("classdef ValueOnly\n properties\n x = 1\n end\n end").unwrap();
+        s.run("v = ValueOnly(); try, addlistener(v, 'Ping', @bump); catch le, lmsg = le.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("lmsg") {
+            assert!(m.contains("handle class"), "listener error = {m}");
+        } else {
+            panic!("value-class addlistener did not error");
+        }
+    }
+
+    #[test]
+    fn classdef_abstract_and_sealed() {
+        let mut s = Session::new();
+        s.run(
+            "classdef AbsBase
+    properties
+        x = 1
+    end
+    methods (Abstract)
+        y = compute(obj)
+    end
+end
+classdef AbsImpl < AbsBase
+    methods
+        function y = compute(obj)
+            y = obj.x + 1;
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("try, a = AbsBase(); catch ae, amsg = ae.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("abstract"), "abstract error = {m}");
+        } else {
+            panic!("abstract class instantiated");
+        }
+        s.run("b = AbsImpl(); y = b.compute();").unwrap();
+        assert_eq!(s.get("y"), Some(&Value::Num(2.0)));
+
+        s.run("classdef (Sealed) Seal\n properties\n x = 1\n end\n end\nclassdef SealKid < Seal\n end").unwrap();
+        s.run("try, sk = SealKid(); catch se, smsg = se.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("smsg") {
+            assert!(m.contains("sealed"), "sealed error = {m}");
+        } else {
+            panic!("sealed superclass was subclassed");
+        }
+    }
+
+    #[test]
+    fn classdef_object_arrays() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Pt
+    properties
+        x = 0
+    end
+    methods
+        function obj = Pt(v)
+            if nargin >= 1
+                obj.x = v;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("a = Pt(1); a(2) = Pt(2); sz = size(a); n = numel(a); y = a(2).x; a(1).x = 9; z = a(1).x;").unwrap();
+        assert_eq!(s.get("sz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("n"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("z"), Some(&Value::Num(9.0)));
+        s.run("a(3).x = 7; w = a(3).x; sz2 = size(a);").unwrap();
+        assert_eq!(s.get("w"), Some(&Value::Num(7.0)));
+        assert_eq!(s.get("sz2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        s.run("c = [a(1) a(2)]; szc = size(c); yc = c(2).x;").unwrap();
+        assert_eq!(s.get("szc").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("yc"), Some(&Value::Num(2.0)));
+        s.run("a(2) = []; n2 = numel(a);").unwrap();
+        assert_eq!(s.get("n2"), Some(&Value::Num(2.0)));
+    }
+
+    #[test]
+    fn classdef_object_mat_roundtrip() {
+        let dir = m_dir("matobj");
+        let file = dir.join("objects.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedPt
+    properties
+        x = 0
+    end
+    methods
+        function obj = SavedPt(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("p = SavedPt(3); q = SavedPt(4); a = [p q]; save('{path}', 'p', 'a'); clear p a; load('{path}');")).unwrap();
+        s.run("px = p.x; ax = a(2).x; asz = size(a);").unwrap();
+        assert_eq!(s.get("px"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("ax"), Some(&Value::Num(4.0)));
+        assert_eq!(s.get("asz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_roundtrip() {
+        let dir = m_dir("mcosobj");
+        let file = dir.join("mcos.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedMc
+    properties
+        x = 0
+        label = ''
+    end
+    methods
+        function obj = SavedMc(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("o = SavedMc(5); o.label = 'm'; save('{path}', 'o', '-mcos'); clear o; load('{path}'); x = o.x; l = o.label; c = class(o);"))
+            .unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(5.0)));
+        assert_eq!(s.get("l"), Some(&Value::Str("m".into())));
+        assert_eq!(s.get("c"), Some(&Value::Str("SavedMc".into())));
+        let bytes = std::fs::read(&file).unwrap();
+        let off = bytes.get(116..124).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).unwrap_or(0);
+        assert!(off > 128, "MCOS subsystem offset = {off}");
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_cycle() {
+        let dir = m_dir("mcoscycle");
+        let file = dir.join("cycle.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef CycleNode < handle
+                properties
+                    value = 0
+                    next
+                end
+            end",
+        )
+        .unwrap();
+        s.run(&format!(
+            "a = CycleNode(); a.value = 1; b = CycleNode(); b.value = 2; a.next = b; b.next = a; \
+             save('{path}', 'a', '-mcos'); clear a b; load('{path}'); \
+             c1 = a.value; c2 = a.next.value; c3 = a.next.next.value; c4 = a.next.next.next.value; cclass = class(a.next);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("c1"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("c2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("c3"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("c4"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("cclass"), Some(&Value::Str("CycleNode".into())));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_object_mcos_array_nested() {
+        let dir = m_dir("mcoscomplex");
+        let file = dir.join("complex.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run("classdef McPart\n properties\n  x = 0\n end\nend").unwrap();
+        s.run("classdef McHolder\n properties\n  child\n end\nend").unwrap();
+        s.run(&format!(
+            "p1 = McPart(); p1.x = 1; p2 = McPart(); p2.x = 2; a = [p1 p2]; \
+             h = McHolder(); h.child = p1; save('{path}', 'a', 'h', '-mcos'); clear a h p1 p2; load('{path}'); \
+             ax2 = a(2).x; asz = size(a); hx = h.child.x; hc = class(h.child);"
+        ))
+        .unwrap();
+        assert_eq!(s.get("ax2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("asz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("hx"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("hc"), Some(&Value::Str("McPart".into())));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_handle_mat_roundtrip() {
+        let dir = m_dir("mathandle");
+        let file = dir.join("handle.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef SavedH < handle
+    properties
+        x = 0
+    end
+    methods
+        function obj = SavedH(x)
+            if nargin >= 1
+                obj.x = x;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run(&format!("h = SavedH(1); save('{path}', 'h'); clear h; load('{path}'); h2 = h; h2.x = 7; hx = h.x;")).unwrap();
+        assert_eq!(s.get("hx"), Some(&Value::Num(7.0)));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn package_qualified_and_imported_members() {
+        let dir = m_dir("packages");
+        std::fs::create_dir_all(dir.join("+pkg").join("+inner")).unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Thing.m"),
+            "classdef Thing\n properties\n  x = 0\n end\n methods\n  function obj = Thing(v)\n   if nargin >= 1\n    obj.x = v;\n   end\n  end\n  function y = getx(obj)\n   y = obj.x;\n  end\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("+pkg").join("helper.m"), "function y = helper(x)\ny = x + 1;\nend\n").unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Base.m"),
+            "classdef Base\n properties\n  a = 1\n end\n methods\n  function y = baseval(obj)\n   y = obj.a;\n  end\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("+pkg").join("Derived.m"), "classdef Derived < Base\n properties\n  b = 2\n end\nend\n").unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("Color.m"),
+            "classdef Color\n properties\n  value = 0\n end\n methods\n  function obj = Color(v)\n   if nargin >= 1\n    obj.value = v;\n   end\n  end\n end\n enumeration\n  red (1)\n  blue (2)\n end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("+pkg").join("+inner").join("Tool.m"),
+            "classdef Tool\n properties\n  x = 0\n end\n methods\n  function obj = Tool(v)\n   if nargin >= 1\n    obj.x = v;\n   end\n  end\n end\nend\n",
+        )
+        .unwrap();
+        let mut s = Session::new();
+        s.add_path(&dir);
+        s.run("a = pkg.Thing(3); b = pkg.helper(4); c = pkg.inner.Tool(5); ca = class(a); xa = a.x; xb = a.getx();").unwrap();
+        assert_eq!(s.get("ca"), Some(&Value::Str("pkg.Thing".into())));
+        assert_eq!(s.get("xa"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("xb"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(5.0)));
+        assert_eq!(
+            s.get("c").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.inner.Tool".into())
+        );
+        s.run("import pkg.*; d = Thing(6); e = helper(7); import pkg.inner.*; f = Tool(8);").unwrap();
+        assert_eq!(
+            s.get("d").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.Thing".into())
+        );
+        assert_eq!(s.get("e"), Some(&Value::Num(8.0)));
+        assert_eq!(
+            s.get("f").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.inner.Tool".into())
+        );
+        s.run("import pkg.Thing; g = Thing(9); dv = pkg.Derived(); dval = dv.baseval(); dcls = class(dv);").unwrap();
+        assert_eq!(s.get("dval"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("dcls"), Some(&Value::Str("pkg.Derived".into())));
+        s.run("ec = pkg.Color.blue; ecv = ec.value; ecc = class(ec);").unwrap();
+        assert_eq!(s.get("ecv"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("ecc"), Some(&Value::Str("pkg.Color".into())));
+        assert_eq!(
+            s.get("g").and_then(|v| match v {
+                Value::Object(o) => Some(o.class_name.clone()),
+                _ => None,
+            }),
+            Some("pkg.Thing".into())
+        );
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn classdef_subsref_subsasgn() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Proxy
+    properties
+        data
+    end
+    methods
+        function obj = Proxy(d)
+            obj.data = d;
+        end
+        function r = subsref(obj, s)
+            if strcmp(s.type, '()')
+                r = obj.data(s.subs{1});
+            elseif strcmp(s.type, '{}')
+                r = obj.data{s.subs{1}};
+            elseif strcmp(s.type, '.')
+                r = obj.data;
+            end
+        end
+        function obj = subsasgn(obj, s, v)
+            if strcmp(s.type, '()')
+                obj.data(s.subs{1}) = v;
+            elseif strcmp(s.type, '{}')
+                obj.data{s.subs{1}} = v;
+            elseif strcmp(s.type, '.')
+                obj.data = v;
+            end
+        end
+    end
+end",
+        )
+        .unwrap();
+        s.run("p = Proxy(1:5); dd = p.data;").unwrap();
+        assert_eq!(s.get("dd").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+        s.run("x = p(2); p(3) = 9; y = p.data(3);").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(9.0)));
+        s.run("q = Proxy({10, 20});").unwrap();
+        s.run("a = q{2};").unwrap();
+        s.run("q{1} = 11;").unwrap();
+        s.run("b = q.data{1};").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(20.0)));
+        assert_eq!(s.get("b"), Some(&Value::Num(11.0)));
+        s.run("r = Proxy(1:5); d = r.data; r.data = 7; d2 = r.data;").unwrap();
+        assert_eq!(s.get("d").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+        assert_eq!(s.get("d2"), Some(&Value::Num(7.0)));
+    }
+
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    #[test]
+    fn com_automation_bridge() {
+        let mut s = Session::new();
+        if s.run("w = actxserver('WScript.Shell');").is_err() {
+            return; // COM unavailable in this environment
+        }
+        s.run("p = w.ExpandEnvironmentStrings('%SystemRoot%'); w.CurrentDirectory = 'C:\\Windows'; d = w.CurrentDirectory; c = class(w); pid = get(w, 'ProgID'); delete(w);").unwrap();
+        assert!(matches!(s.get("p"), Some(Value::Str(v)) if v.eq_ignore_ascii_case("C:\\Windows")));
+        assert!(matches!(s.get("d"), Some(Value::Str(v)) if v.eq_ignore_ascii_case("C:\\Windows")));
+        assert_eq!(s.get("c"), Some(&Value::Str("COM".into())));
+        assert_eq!(s.get("pid"), Some(&Value::Str("WScript.Shell".into())));
     }
 
     #[test]
@@ -17272,6 +22736,19 @@ end",
         let mut s = Session::new();
         s.run(
             "classdef Col
+    properties
+        value
+    end
+    methods
+        function obj = Col(v)
+            if nargin >= 1
+                obj.value = v;
+            end
+        end
+        function r = eq(a, b)
+            r = a.value == b.value;
+        end
+    end
     enumeration
         red (1)
         blue (2)
@@ -17279,10 +22756,12 @@ end",
 end",
         )
         .unwrap();
-        // `Class.member` evaluates the member's backing value.
-        s.run("a = Col.red; b = Col.blue;").unwrap();
-        assert_eq!(s.get("a"), Some(&Value::Num(1.0)));
-        assert_eq!(s.get("b"), Some(&Value::Num(2.0)));
+        // Enumeration members are class instances carrying the backing value.
+        s.run("a = Col.red; b = Col.blue; ca = class(a); va = a.value; vb = b.value; eq = (a == b);").unwrap();
+        assert_eq!(s.get("ca"), Some(&Value::Str("Col".into())));
+        assert_eq!(s.get("va"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("vb"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("eq"), Some(&Value::Num(0.0)));
     }
 
     #[test]
@@ -17358,6 +22837,10 @@ end",
             y = obj.a;
         end
     end
+    events
+        Changed
+        Closed
+    end
 end",
         )
         .unwrap();
@@ -17393,6 +22876,26 @@ end",
         } else {
             panic!("fieldnames(o) is not a cell");
         }
+        s.run("ev = events(o); mc = metaclass(o); im = ismethod(o,'geta'); ip = isprop(o,'a');").unwrap();
+        if let Some(Value::Cell(ev)) = s.get("ev") {
+            let names: Vec<&str> = (0..ev.numel())
+                .filter_map(|i| match ev.get_linear(i) {
+                    Some(Value::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"Changed") && names.contains(&"Closed"));
+        } else {
+            panic!("events(o) is not a cell");
+        }
+        if let Some(Value::Struct(mc)) = s.get("mc") {
+            assert_eq!(mc.field_at(0, "Name"), Some(&Value::Str("Mp".into())));
+            assert!(matches!(mc.field_at(0, "Events"), Some(Value::Cell(_))));
+        } else {
+            panic!("metaclass(o) is not a struct");
+        }
+        assert_eq!(s.get("im"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("ip"), Some(&Value::Num(1.0)));
     }
 
     #[test]
@@ -17432,5 +22935,2326 @@ end",
         // Gray M×N: values > 1 read as 0–255; `[]` scales to the data range.
         s.run("clf; imshow(magic(4), [])").unwrap();
         assert_eq!(s.figs[0].series[0].kind, SeriesKind::ImageRgb);
+    }
+
+    #[test]
+    fn optimization_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // fminbnd: bounded quadratic minimum, multi-output form.
+        s.run("opts = optimset('Display','off','TolX',1e-10); [xb, fb] = fminbnd(@(t) (t-2).^2 + 1, 0, 5, opts);").unwrap();
+        assert!((scalar(&s, "xb") - 2.0).abs() < 1e-5);
+        assert!((scalar(&s, "fb") - 1.0).abs() < 1e-8);
+
+        // fminsearch: N-parameter Nelder–Mead.
+        s.run("p = fminsearch(@(v) (v(1)-1).^2 + (v(2)-3).^2, [0 0], optimset('MaxIter',2000,'TolX',1e-9,'TolFun',1e-12));").unwrap();
+        let p = vec(&s, "p");
+        assert!((p[0] - 1.0).abs() < 1e-4, "p(1) = {}", p[0]);
+        assert!((p[1] - 3.0).abs() < 1e-4, "p(2) = {}", p[1]);
+
+        // fminunc: BFGS on a separable quadratic.
+        s.run("q = fminunc(@(v) (v(1)-2).^2 + 3*(v(2)+1).^2, [0 0], optimoptions('fminunc','Display','off','MaxIterations',500));").unwrap();
+        let q = vec(&s, "q");
+        assert!((q[0] - 2.0).abs() < 1e-4, "q(1) = {}", q[0]);
+        assert!((q[1] + 1.0).abs() < 1e-4, "q(2) = {}", q[1]);
+
+        // fsolve: two nonlinear equations.
+        s.run("r = fsolve(@(v) [v(1).^2 + v(2).^2 - 4; v(1) - v(2)], [1; 1]);").unwrap();
+        let r = vec(&s, "r");
+        assert!((r[0] - 2f64.sqrt()).abs() < 1e-5, "r(1) = {}", r[0]);
+        assert!((r[1] - 2f64.sqrt()).abs() < 1e-5, "r(2) = {}", r[1]);
+
+        // lsqnonlin: linear residual, zero at [2; 1].
+        s.run("[xl, rn, rv] = lsqnonlin(@(v) [v(1)+v(2)-3; v(1)-v(2)-1], [0; 0]);").unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 2.0).abs() < 1e-6, "xl(1) = {}", xl[0]);
+        assert!((xl[1] - 1.0).abs() < 1e-6, "xl(2) = {}", xl[1]);
+        assert!(scalar(&s, "rn") < 1e-12);
+        assert_eq!(vec(&s, "rv").len(), 2);
+
+        // lsqcurvefit: exponential fit.
+        s.run("t = 0:0.25:2; y = 2.5*exp(-1.3*t); p = lsqcurvefit(@(p,t) p(1)*exp(-p(2)*t), [1 1], t, y);").unwrap();
+        let p = vec(&s, "p");
+        assert!((p[0] - 2.5).abs() < 1e-4, "amplitude = {}", p[0]);
+        assert!((p[1] - 1.3).abs() < 1e-4, "decay = {}", p[1]);
+    }
+
+    #[test]
+    fn optimization_lp_qp() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().as_scalar().unwrap()
+        };
+        let vec = |s: &Session, name: &str| -> Vec<f64> {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().data().to_vec()
+        };
+
+        // linprog: intersection of x1 + 2*x2 <= 4 and 4*x1 + 2*x2 <= 12.
+        s.run(
+            "[xl, fl, flagl, outl, laml] = linprog([-1;-1], [1 2; 4 2], [4;12], [], [], [0;0], []); \
+             oi = outl.iterations; li = laml.ineqlin; le = laml.eqlin; ll = laml.lower;",
+        )
+        .unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 8.0 / 3.0).abs() < 1e-5, "xl(1) = {}", xl[0]);
+        assert!((xl[1] - 2.0 / 3.0).abs() < 1e-5, "xl(2) = {}", xl[1]);
+        assert!((scalar(&s, "fl") + 10.0 / 3.0).abs() < 1e-6, "fl = {}", scalar(&s, "fl"));
+        assert_eq!(scalar(&s, "flagl"), 1.0);
+        assert!(scalar(&s, "oi") >= 1.0);
+        assert_eq!(vec(&s, "li").len(), 2);
+        assert_eq!(vec(&s, "le").len(), 0);
+        assert_eq!(vec(&s, "ll").len(), 2);
+
+        // The corpus `problem` struct form (Aineq/bineq/lb/ub).
+        s.run("p.f = [-1;-1]; p.Aineq = [1 2; 4 2]; p.bineq = [4;12]; p.lb = [0;0]; p.ub = []; [xp, fp, flagp] = linprog(p);").unwrap();
+        let xp = vec(&s, "xp");
+        assert!((xp[0] - 8.0 / 3.0).abs() < 1e-5);
+        assert!((xp[1] - 2.0 / 3.0).abs() < 1e-5);
+        assert_eq!(scalar(&s, "flagp"), 1.0);
+
+        // quadprog: separable QP with an upper bound on x2.
+        s.run("[xq, fq, flagq] = quadprog([2 0;0 2], [-2;-4], [], [], [], [], [0;0], [1;1]);").unwrap();
+        let xq = vec(&s, "xq");
+        assert!((xq[0] - 1.0).abs() < 1e-5, "xq(1) = {}", xq[0]);
+        assert!((xq[1] - 1.0).abs() < 1e-5, "xq(2) = {}", xq[1]);
+        assert!((scalar(&s, "fq") + 4.0).abs() < 1e-6, "fq = {}", scalar(&s, "fq"));
+        assert_eq!(scalar(&s, "flagq"), 1.0);
+
+        // Equality-constrained LP, options in the x0 slot (8-argument form).
+        s.run("[xe, fe, flage] = linprog([1;1], [], [], [1 1], 1, [0;0], [inf;inf], optimoptions('linprog','Display','off'));").unwrap();
+        let xe = vec(&s, "xe");
+        assert!((xe[0] + xe[1] - 1.0).abs() < 1e-6);
+        assert!((scalar(&s, "fe") - 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flage"), 1.0);
+
+        // quadprog problem struct with bounds only.
+        s.run("q.H = [2 0;0 2]; q.f = [-2;-4]; q.lb = [0;0]; q.ub = [1;1]; [xr, fr, flagr] = quadprog(q);").unwrap();
+        let xr = vec(&s, "xr");
+        assert!((xr[0] - 1.0).abs() < 1e-5);
+        assert!((xr[1] - 1.0).abs() < 1e-5);
+        assert!((scalar(&s, "fr") + 4.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagr"), 1.0);
+    }
+
+    #[test]
+    fn optimization_intlinprog_and_solver_options() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().as_scalar().unwrap()
+        };
+        let vec = |s: &Session, name: &str| -> Vec<f64> {
+            let v = s.get(name).cloned().unwrap_or_else(|| panic!("missing {name}"));
+            v.to_matrix().unwrap().data().to_vec()
+        };
+
+        // Binary knapsack: at most one item, both worth one.
+        s.run(
+            "[xi, fi, flagi, outi] = intlinprog([-1;-1], [1 2], [2 2], 3, [], [], [0;0], [1;1], optimoptions('intlinprog','Solver','internal','MipGap',0)); oi = outi.iterations;",
+        )
+        .unwrap();
+        let xi = vec(&s, "xi");
+        assert_eq!(xi.len(), 2);
+        assert!((xi[0] + xi[1] - 1.0).abs() < 1e-6, "xi = {xi:?}");
+        assert!((scalar(&s, "fi") + 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagi"), 1.0);
+        assert!(scalar(&s, "oi") >= 1.0);
+
+        // Continuous variables default to a zero lower bound, so this is
+        // infeasible rather than unbounded.
+        s.run("[xn, fn, flagn] = intlinprog([1;1], [1 2], [1 1], -1, [], [], [], []);").unwrap();
+        assert_eq!(scalar(&s, "flagn"), -2.0);
+
+        // Invalid solver names are rejected when a solver runs.
+        s.run("try, linprog([1;1], [],[], [],[], [0;0], [], optimoptions('linprog','Solver','bogus')); catch se, smsg = se.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("smsg") {
+            assert!(m.contains("unknown Solver"), "solver message = {m}");
+        } else {
+            panic!("unknown Solver did not error");
+        }
+
+        // Internal selection still drives the built-in QP path.
+        s.run("[xs, fs] = linprog([-1;-1], [1 2; 4 2], [4;12], [], [], [0;0], [], optimoptions('linprog','Solver','internal'));").unwrap();
+        let xs = vec(&s, "xs");
+        assert!((xs[0] - 8.0 / 3.0).abs() < 1e-5);
+        assert!((scalar(&s, "fs") + 10.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn optimization_fmincon() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Unconstrained quadratic.
+        s.run("[xu, fu, flagu] = fmincon(@(v) (v(1)-2).^2 + (v(2)+1).^2, [0 0]);").unwrap();
+        let xu = vec(&s, "xu");
+        assert!((xu[0] - 2.0).abs() < 1e-5 && (xu[1] + 1.0).abs() < 1e-5, "xu = {xu:?}");
+        assert!(scalar(&s, "fu") < 1e-8);
+        assert_eq!(scalar(&s, "flagu"), 1.0);
+
+        // Box bounds pull both coordinates to their limits.
+        s.run("[xb, fb, flagb] = fmincon(@(v) (v(1)-2).^2 + (v(2)+1).^2, [0;0], [],[],[],[], [0;0], [2;2]);").unwrap();
+        let xb = vec(&s, "xb");
+        assert!((xb[0] - 2.0).abs() < 1e-5 && xb[1].abs() < 1e-5, "xb = {xb:?}");
+        assert!((scalar(&s, "fb") - 1.0).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagb"), 1.0);
+
+        // Linear inequality: x1 + x2 >= 1.
+        s.run("[xl2, fl2, flagl2] = fmincon(@(v) v(1).^2+v(2).^2, [1;1], [-1 -1], -1, [],[], [0;0], []);").unwrap();
+        let xl2 = vec(&s, "xl2");
+        assert!((xl2[0] - 0.5).abs() < 1e-5 && (xl2[1] - 0.5).abs() < 1e-5, "xl2 = {xl2:?}");
+        assert!((scalar(&s, "fl2") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagl2"), 1.0);
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("[xn, fn, flagn] = fmincon(@(v) v(1).^2+v(2).^2, [1;1], [],[],[],[], [0;0], [], @(v) [1 - v(1) - v(2)]);").unwrap();
+        let xn = vec(&s, "xn");
+        assert!((xn[0] - 0.5).abs() < 1e-5 && (xn[1] - 0.5).abs() < 1e-5, "xn = {xn:?}");
+        assert!((scalar(&s, "fn") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagn"), 1.0);
+
+        // Nonlinear equality, starting infeasible: the SQP merit function
+        // must move onto the unit circle, not stop at the KKT point of the
+        // linearised model.
+        s.run(
+            "function [c, ceq] = nleq(v)\n\
+             c = [];\n\
+             ceq = v(1)^2 + v(2)^2 - 1;\n\
+             end\n\
+             [xe, fe, flage, oute, lame] = fmincon(@(v) (v(1)-2).^2 + (v(2)-2).^2, [1;1], [],[],[],[],[],[], @nleq);\n\
+             leq = lame.eqnonlin;\n\
+             oiter = oute.iterations;",
+        )
+        .unwrap();
+        let xe = vec(&s, "xe");
+        assert!((xe[0] - 2f64.sqrt() / 2.0).abs() < 1e-4, "xe(1) = {}", xe[0]);
+        assert!((xe[1] - 2f64.sqrt() / 2.0).abs() < 1e-4, "xe(2) = {}", xe[1]);
+        assert!((scalar(&s, "fe") - 3.343_145_898_691_581).abs() < 1e-3, "fe = {}", scalar(&s, "fe"));
+        assert_eq!(scalar(&s, "flage"), 1.0);
+        assert!(scalar(&s, "oiter") >= 2.0);
+        assert!((scalar(&s, "leq") - 1.828_427_124_746_899).abs() < 1e-2, "lambda = {}", scalar(&s, "leq"));
+
+        // Problem-struct interface.
+        s.run("p.objective = @(v) v(1).^2+v(2).^2; p.x0 = [1;1]; p.Aineq = [-1 -1]; p.bineq = -1; p.lb = [0;0]; [xp2, fp2, flagp2] = fmincon(p);")
+            .unwrap();
+        let xp2 = vec(&s, "xp2");
+        assert!((xp2[0] - 0.5).abs() < 1e-5 && (xp2[1] - 0.5).abs() < 1e-5, "xp2 = {xp2:?}");
+        assert!((scalar(&s, "fp2") - 0.5).abs() < 1e-6);
+        assert_eq!(scalar(&s, "flagp2"), 1.0);
+    }
+
+    #[test]
+    fn optimization_patternsearch() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Unconstrained quadratic with a non-grid optimum.
+        s.run("[xp, fp, flagp] = patternsearch(@(v) (v(1)-1.3).^2 + (v(2)+0.7).^2, [0 0]);").unwrap();
+        let xp = vec(&s, "xp");
+        assert!((xp[0] - 1.3).abs() < 1e-4, "xp(1) = {}", xp[0]);
+        assert!((xp[1] + 0.7).abs() < 1e-4, "xp(2) = {}", xp[1]);
+        assert!(scalar(&s, "fp") < 1e-7);
+        assert_eq!(scalar(&s, "flagp"), 1.0);
+
+        // Linear inequality x1 + x2 >= 1.
+        s.run("[xl, fl, flagl] = patternsearch(@(v) v(1).^2+v(2).^2, [1;1], [-1 -1], -1, [],[], [0;0], []);").unwrap();
+        let xl = vec(&s, "xl");
+        assert!((xl[0] - 0.5).abs() < 1e-4 && (xl[1] - 0.5).abs() < 1e-4, "xl = {xl:?}");
+        assert!((scalar(&s, "fl") - 0.5).abs() < 1e-4);
+        assert_eq!(scalar(&s, "flagl"), 1.0);
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("[xn, fn, flagn] = patternsearch(@(v) v(1).^2+v(2).^2, [1;1], [],[],[],[], [0;0], [], @(v) [1 - v(1) - v(2)]);").unwrap();
+        let xn = vec(&s, "xn");
+        assert!((xn[0] - 0.5).abs() < 1e-4 && (xn[1] - 0.5).abs() < 1e-4, "xn = {xn:?}");
+        assert!((scalar(&s, "fn") - 0.5).abs() < 1e-4);
+        assert_eq!(scalar(&s, "flagn"), 1.0);
+    }
+
+    #[test]
+    fn optimization_ga() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("rng(1); [x1, f1, flag1] = ga(@(v) (v-2).^2, 1, [],[],[],[], -5, 5);").unwrap();
+        assert!((scalar(&s, "x1") - 2.0).abs() < 0.05, "x1 = {}", scalar(&s, "x1"));
+        assert!(scalar(&s, "f1") < 0.01);
+        assert_eq!(scalar(&s, "flag1"), 1.0);
+
+        s.run("rng(2); opts = optimset('PopulationSize',60,'MaxGenerations',150); [x2, f2] = ga(@(v) (v(1)-2).^2+(v(2)+1).^2, 2, [],[],[],[], [-5;-5], [5;5], [], opts);")
+            .unwrap();
+        let x2 = vec(&s, "x2");
+        assert!((x2[0] - 2.0).abs() < 0.05 && (x2[1] + 1.0).abs() < 0.05, "x2 = {x2:?}");
+        assert!(scalar(&s, "f2") < 0.01);
+
+        // Linear inequality x1 + x2 >= 1 with box bounds.
+        s.run("rng(3); [x3, f3] = ga(@(v) v(1).^2+v(2).^2, 2, [-1 -1], -1, [],[], [0;0], [1;1]);").unwrap();
+        let x3 = vec(&s, "x3");
+        assert!((x3[0] + x3[1] - 1.0).abs() < 0.05, "x3 = {x3:?}");
+        assert!(scalar(&s, "f3") < 0.55, "f3 = {}", scalar(&s, "f3"));
+        assert!(x3.iter().all(|v| (0.0..=1.0).contains(v)));
+
+        // Nonlinear inequality c(x) <= 0.
+        s.run("rng(4); [x4, f4] = ga(@(v) v(1).^2+v(2).^2, 2, [],[],[],[], [0;0], [1;1], @(v) [1-v(1)-v(2)]);").unwrap();
+        let x4 = vec(&s, "x4");
+        assert!((x4[0] + x4[1] - 1.0).abs() < 0.05, "x4 = {x4:?}");
+        assert!(scalar(&s, "f4") < 0.55, "f4 = {}", scalar(&s, "f4"));
+
+        // Problem struct and multi-output form.
+        s.run("rng(5); p.fitnessfcn = @(v) (v(1)-2).^2+(v(2)+1).^2; p.nvars = 2; p.lb = [-5;-5]; p.ub = [5;5]; p.options = optimset('PopulationSize',60,'MaxGenerations',150); [x5, f5, flag5, out5, pop5, scores5] = ga(p); g5 = out5.generations;")
+            .unwrap();
+        assert_eq!(s.get("pop5").unwrap().dims(), (60, 2));
+        assert_eq!(s.get("scores5").unwrap().dims(), (60, 1));
+        assert!(scalar(&s, "g5") >= 1.0);
+        assert_eq!(scalar(&s, "flag5"), 1.0);
+
+        // Same seed, same run.
+        s.run(
+            "rng(7); a1 = ga(@(v) (v-3).^2, 1, [],[],[],[], -5, 5); rng(7); a2 = ga(@(v) (v-3).^2, 1, [],[],[],[], -5, 5); same = isequal(a1, a2);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "same"), 1.0);
+    }
+
+    #[test]
+    fn control_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Transfer-function construction and properties.
+        s.run("G = tf([1], [1 1]); [n, d] = tfdata(G); p = pole(G); g = dcgain(G);").unwrap();
+        assert_eq!(vec(&s, "n"), vec![1.0]);
+        assert_eq!(vec(&s, "d"), vec![1.0, 1.0]);
+        assert!((scalar(&s, "p") + 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "g") - 1.0).abs() < 1e-12);
+
+        // Native LTI algebra: s = tf('s') then 1/(s+1).
+        s.run("s = tf('s'); H = 1/(s + 1); [nh, dh] = tfdata(H);").unwrap();
+        assert_eq!(vec(&s, "nh"), vec![1.0]);
+        assert_eq!(vec(&s, "dh"), vec![1.0, 1.0]);
+
+        // Unity negative feedback: 1/(s+2).
+        s.run("F = feedback(G, 1); [nf, df] = tfdata(F);").unwrap();
+        assert_eq!(vec(&s, "nf"), vec![1.0]);
+        assert_eq!(vec(&s, "df"), vec![1.0, 2.0]);
+
+        // Step response of 1/(s+1) at t = 2 is 1 - exp(-2).
+        s.run("t = 0:0.1:2; [y, ty] = step(G, t);").unwrap();
+        assert_eq!(vec(&s, "ty").len(), 21);
+        let y = vec(&s, "y");
+        assert!((y.last().copied().unwrap() - (1.0 - (-2.0f64).exp())).abs() < 1e-3, "y(2) = {}", y.last().copied().unwrap());
+
+        // lsim with a constant input matches the step response.
+        s.run("u = ones(1, 21); yl = lsim(G, u, t);").unwrap();
+        let yl = vec(&s, "yl");
+        assert!((yl.last().copied().unwrap() - y.last().copied().unwrap()).abs() < 1e-10);
+
+        // Impulse response starts at C*B = 1 for this system.
+        s.run("[yi, ti] = impulse(G, 0:0.1:1);").unwrap();
+        assert!((vec(&s, "yi")[0] - 1.0).abs() < 1e-9);
+        assert_eq!(vec(&s, "ti").len(), 11);
+
+        // tf2ss / ss / ss2tf round-trip.
+        s.run("[A, B, C, D] = tf2ss([1], [1 1]); S = ss(A, B, C, D); [ns, ds] = tfdata(S);").unwrap();
+        assert_eq!(vec(&s, "ns"), vec![1.0]);
+        assert_eq!(vec(&s, "ds"), vec![1.0, 1.0]);
+
+        // Frequency response of 1/(s+1): 1/sqrt(2) at 1 rad/s.
+        s.run("Hf = freqresp(G, [0.1 1 10]); m = abs(Hf);").unwrap();
+        let m = vec(&s, "m");
+        assert!((m[0] - 0.995_037_462_608_352).abs() < 1e-6);
+        assert!((m[1] - 2f64.sqrt() / 2.0).abs() < 1e-6);
+        s.run("[mag, phase, w] = bode(G, [0.1 1 10]);").unwrap();
+        assert_eq!(vec(&s, "mag"), m);
+        assert_eq!(vec(&s, "phase").len(), 3);
+
+        // zpk -> tf.
+        s.run("Z = zpk([], [-1], 1); [nz, dz] = tfdata(Z);").unwrap();
+        assert_eq!(vec(&s, "nz"), vec![1.0]);
+        assert_eq!(vec(&s, "dz"), vec![1.0, 1.0]);
+
+        // Second-order complex poles are reported as a conjugate pair.
+        s.run("O = tf([1], [1 0 1]); po = pole(O); np = numel(po);").unwrap();
+        assert_eq!(scalar(&s, "np"), 2.0);
+    }
+
+    #[test]
+    fn control_complex_zpk() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "G = zpk([-1+2i -1-2i], [-3 -4], 2); [n, d] = tfdata(G); [z, p, k] = zpkdata(G); \
+             zs = real(sum(z)); zp = real(prod(z)); ps = real(sum(p)); pp = real(prod(p)); \
+             H = zpk(tf([1 2], [1 2 5])); ph = pole(H); phr = real(ph); phi = imag(ph);",
+        )
+        .unwrap();
+        assert_eq!(vec(&s, "n"), vec![2.0, 4.0, 10.0]);
+        assert_eq!(vec(&s, "d"), vec![1.0, 7.0, 12.0]);
+        assert!((scalar(&s, "zs") + 2.0).abs() < 1e-9);
+        assert!((scalar(&s, "zp") - 5.0).abs() < 1e-9);
+        assert!((scalar(&s, "ps") + 7.0).abs() < 1e-9);
+        assert!((scalar(&s, "pp") - 12.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "k"), 2.0);
+        let phr = vec(&s, "phr");
+        let phi = vec(&s, "phi");
+        assert!(phr.iter().all(|x| (x + 1.0).abs() < 1e-9), "pole real parts = {phr:?}");
+        assert_eq!(phi.iter().filter(|x| x.abs() > 1e-9).count(), 2, "complex pole pair = {phi:?}");
+
+        // Unpaired complex roots cannot produce a real tf numerator.
+        s.run("try, tf(zpk([-1+2i], [-3], 1)); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("conjugate pairs"), "complex zpk error = {m}");
+        } else {
+            panic!("unpaired complex zero did not error");
+        }
+    }
+
+    #[test]
+    fn control_pidtune() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // PI design at an explicit crossover: the open loop crosses 0 dB at
+        // wc with the 60 degree target phase margin.
+        s.run(
+            "G = tf(1, [1 1]); [C, info] = pidtune(G, 'PI', 2); [n, d] = tfdata(C); \
+             [m, p] = bode(series(G, C), 2); kp = info.Kp; ki = info.Ki; kd = info.Kd; \
+             pm = info.PhaseMargin; wc = info.wc; typ = info.Type; cclass = class(info.C);",
+        )
+        .unwrap();
+        let n = vec(&s, "n");
+        assert_eq!(n.len(), 2);
+        assert!((n[0] - 1.2320508075688772).abs() < 1e-12, "n = {n:?}");
+        assert!((n[1] - 3.732050807568877).abs() < 1e-12, "n = {n:?}");
+        assert_eq!(vec(&s, "d"), vec![1.0, 0.0]);
+        assert!((scalar(&s, "kp") - 1.2320508075688772).abs() < 1e-12);
+        assert!((scalar(&s, "ki") - 3.732050807568877).abs() < 1e-12);
+        assert_eq!(scalar(&s, "kd"), 0.0);
+        assert!((scalar(&s, "pm") - 60.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "wc"), 2.0);
+        assert_eq!(s.get("typ"), Some(&Value::Str("PI".into())));
+        assert_eq!(s.get("cclass"), Some(&Value::Str("tf".into())));
+        assert!((scalar(&s, "m") - 1.0).abs() < 1e-9, "open-loop magnitude = {}", scalar(&s, "m"));
+        assert!((scalar(&s, "p") + 120.0).abs() < 1e-9, "open-loop phase = {}", scalar(&s, "p"));
+
+        // Default crossover uses the plant pole and still hits 60 degrees.
+        s.run("G = tf(1, [1 1]); [C, info] = pidtune(G); wcd = info.wc; pmd = info.PhaseMargin; [m, p] = bode(series(G, C), wcd);").unwrap();
+        assert_eq!(scalar(&s, "wcd"), 1.0);
+        assert!((scalar(&s, "pmd") - 60.0).abs() < 1e-9);
+        assert!((scalar(&s, "m") - 1.0).abs() < 1e-9);
+        assert!((scalar(&s, "p") + 120.0).abs() < 1e-9);
+
+        // PIDF adds a derivative filter.
+        s.run("Gf = tf(1, [1 2 1]); [Cf, fi] = pidtune(Gf, 'PIDF', 3); tfv = fi.Tf; pmf = fi.PhaseMargin; [mf, pf] = bode(series(Gf, Cf), 3);")
+            .unwrap();
+        assert!(scalar(&s, "tfv") > 0.0);
+        assert!((scalar(&s, "pmf") - 60.0).abs() < 1e-6, "PIDF phase margin = {}", scalar(&s, "pmf"));
+        assert!((scalar(&s, "mf") - 1.0).abs() < 0.02, "PIDF open-loop magnitude = {}", scalar(&s, "mf"));
+        assert!((scalar(&s, "pf") + 120.0).abs() < 0.1, "PIDF open-loop phase = {}", scalar(&s, "pf"));
+
+        // PID on a plant with extra lag needs all three terms.
+        s.run(
+            "G2 = tf(1, [1 2 1]); [Cp, pi] = pidtune(G2, 'PID', 2); pkp = pi.Kp; pki = pi.Ki; pkd = pi.Kd; \
+             pmp = pi.PhaseMargin; [mp, pp] = bode(series(G2, Cp), 2);",
+        )
+        .unwrap();
+        assert!(scalar(&s, "pkp") > 0.0);
+        assert!(scalar(&s, "pki") > 0.0);
+        assert!(scalar(&s, "pkd") > 0.0);
+        assert!((scalar(&s, "pmp") - 60.0).abs() < 1e-6);
+        assert!((scalar(&s, "mp") - 1.0).abs() < 1e-6);
+        assert!((scalar(&s, "pp") + 120.0).abs() < 1e-6);
+
+        // P control has no integral or derivative action.
+        s.run(
+            "G = tf(1, [1 1]); [Cone, one] = pidtune(G, 'P', 2); okp = one.Kp; oki = one.Ki; okd = one.Kd; \
+             opm = one.PhaseMargin; [mo, po] = bode(series(G, Cone), 2);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "okp") - 2.23606797749979).abs() < 1e-9);
+        assert_eq!(scalar(&s, "oki"), 0.0);
+        assert_eq!(scalar(&s, "okd"), 0.0);
+        assert!((scalar(&s, "mo") - 1.0).abs() < 1e-9);
+        // P control cannot add phase, so the achieved margin is the plant's own.
+        assert!((scalar(&s, "po") + 63.43494882292201).abs() < 1e-9, "P open-loop phase = {}", scalar(&s, "po"));
+        assert!((scalar(&s, "opm") - 116.56505117707799).abs() < 1e-9, "P phase margin = {}", scalar(&s, "opm"));
+
+        // Unknown controller types are rejected.
+        s.run("try, pidtune(tf(1, [1 1]), 'bogus', 1); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unknown controller type"), "pidtune error = {m}");
+        } else {
+            panic!("unknown pidtune controller type did not error");
+        }
+    }
+
+    #[test]
+    fn control_depth() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // PID = Kp + Ki/s + Kd*s (Tf = 0).
+        s.run("C = pid(2, 1, 0.5); [nc, dc] = tfdata(C);").unwrap();
+        assert_eq!(vec(&s, "nc"), vec![0.5, 2.0, 1.0]);
+        assert_eq!(vec(&s, "dc"), vec![1.0, 0.0]);
+
+        // 2/(s+1): gain crossover sqrt(3), phase margin 120 deg.
+        s.run("G = tf([2], [1 1]); [Gm, Pm, Wcg, Wcp] = margin(G);").unwrap();
+        assert!(scalar(&s, "Gm").is_infinite());
+        assert!((scalar(&s, "Pm") - 120.0).abs() < 1e-3, "Pm = {}", scalar(&s, "Pm"));
+        assert!(scalar(&s, "Wcg").is_nan());
+        assert!((scalar(&s, "Wcp") - 3f64.sqrt()).abs() < 1e-3, "Wcp = {}", scalar(&s, "Wcp"));
+
+        // 1/(s+1)^3: phase crossover sqrt(3), gain margin 8.
+        s.run("G3 = tf([1], [1 3 3 1]); [Gm3, ~, Wcg3, ~] = margin(G3);").unwrap();
+        assert!((scalar(&s, "Gm3") - 8.0).abs() < 1e-3, "Gm = {}", scalar(&s, "Gm3"));
+        assert!((scalar(&s, "Wcg3") - 3f64.sqrt()).abs() < 1e-3, "Wcg = {}", scalar(&s, "Wcg3"));
+
+        s.run("a = isstable(tf([1], [1 1])); b = isstable(tf([1], [1 -1])); c = isstable(tf([1], [1 -0.5], 0.1));").unwrap();
+        assert_eq!(scalar(&s, "a"), 1.0);
+        assert_eq!(scalar(&s, "b"), 0.0);
+        assert_eq!(scalar(&s, "c"), 1.0);
+
+        s.run("[wn, zeta, p] = damp(tf([1], [1 2 1]));").unwrap();
+        assert!(vec(&s, "wn").iter().all(|v| (*v - 1.0).abs() < 1e-6));
+        assert!(vec(&s, "zeta").iter().all(|v| (*v - 1.0).abs() < 1e-6));
+
+        s.run("bw = bandwidth(tf([1], [1 1]));").unwrap();
+        assert!((scalar(&s, "bw") - 1.0).abs() < 1e-3, "bw = {}", scalar(&s, "bw"));
+
+        s.run("[re, im, w] = nyquist(tf([1], [1 1]), [0.1 1 10]);").unwrap();
+        assert_eq!(vec(&s, "re").len(), 3);
+        assert!((vec(&s, "re")[1] - 0.5).abs() < 1e-9);
+        assert!((vec(&s, "im")[1] + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn control_mimo_and_discrete() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+        let dims = |s: &Session, name: &str| -> Vec<usize> { s.get(name).unwrap().dims_vec() };
+
+        s.run(
+            "A = [-1 0; 0 -2]; B = eye(2); C = [1 1; 0 1]; D = zeros(2,2); sys = ss(A,B,C,D); \
+             t = 0:0.1:1; [ys, ts] = step(sys, t); [yi, ti] = impulse(sys, t); [yn, tn] = initial(sys, [1;1], t);",
+        )
+        .unwrap();
+        assert_eq!(dims(&s, "ys"), vec![11, 2, 2]);
+        assert_eq!(dims(&s, "yi"), vec![11, 2, 2]);
+        assert_eq!(dims(&s, "yn"), vec![11, 2]);
+        s.run("a = ys(end,1,1); b = ys(end,2,1); c = ys(end,1,2); d = ys(end,2,2); e = yn(1,1); f = yn(1,2);").unwrap();
+        assert!((scalar(&s, "a") - (1.0 - (-1f64).exp())).abs() < 1e-4);
+        assert!(scalar(&s, "b").abs() < 1e-4);
+        assert!((scalar(&s, "c") - 0.5 * (1.0 - (-2f64).exp())).abs() < 1e-4);
+        assert!((scalar(&s, "d") - 0.5 * (1.0 - (-2f64).exp())).abs() < 1e-4);
+        assert!((scalar(&s, "e") - 2.0).abs() < 1e-9);
+        assert!((scalar(&s, "f") - 1.0).abs() < 1e-9);
+
+        s.run("u = [ones(11,1) zeros(11,1)]; yl = lsim(sys, u, t);").unwrap();
+        assert_eq!(s.get("yl").unwrap().dims(), (11, 2));
+        s.run("v1 = yl(end,1); v2 = yl(end,2);").unwrap();
+        assert!((scalar(&s, "v1") - (1.0 - (-1f64).exp())).abs() < 1e-4);
+        assert!(scalar(&s, "v2").abs() < 1e-4);
+
+        // MIMO margins and Nyquist data are per-channel; `margin` reports the
+        // worst loop and `nyquist` returns p x m x N real/imag arrays.
+        s.run(
+            "A2 = [-1 1 0 0; 0 -1 1 0; 0 0 -1 0; 0 0 0 -1]; B2 = [0 0; 0 0; 1 0; 0 1]; \
+             C2 = [2 0 0 0; 0 0 0 2]; D2 = zeros(2,2); Gm = ss(A2,B2,C2,D2); \
+             [gm2, pm2, wcg2, wcp2] = margin(Gm); [re2, im2, w2] = nyquist(Gm, [1 2]); \
+             nr11 = re2(1,1,1); ni11 = im2(1,1,1); nr22 = re2(2,2,2); ni22 = im2(2,2,2); nc12 = re2(1,2,1);",
+        )
+        .unwrap();
+        assert_eq!(dims(&s, "re2"), vec![2, 2, 2]);
+        assert_eq!(dims(&s, "im2"), vec![2, 2, 2]);
+        assert!((scalar(&s, "gm2") - 4.0).abs() < 1e-3, "MIMO Gm = {}", scalar(&s, "gm2"));
+        assert!((scalar(&s, "wcg2") - 3f64.sqrt()).abs() < 1e-3);
+        let wcp_expected = (2f64.powf(2.0 / 3.0) - 1.0).sqrt();
+        let pm_expected = 180.0 - 3.0 * wcp_expected.atan().to_degrees();
+        assert!((scalar(&s, "pm2") - pm_expected).abs() < 1e-2, "MIMO Pm = {}", scalar(&s, "pm2"));
+        assert!((scalar(&s, "wcp2") - wcp_expected).abs() < 1e-3, "MIMO Wcp = {}", scalar(&s, "wcp2"));
+        assert!((scalar(&s, "nr11") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "ni11") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "nr22") - 0.4).abs() < 1e-9);
+        assert!((scalar(&s, "ni22") + 0.8).abs() < 1e-9);
+        assert_eq!(scalar(&s, "nc12"), 0.0);
+
+        // MIMO margin needs a square plant.
+        s.run("try, margin(ss([-1], 1, [1;1], [0;0])); catch me, mmsg = me.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("mmsg") {
+            assert!(m.contains("as many outputs as inputs"), "MIMO margin error = {m}");
+        } else {
+            panic!("non-square MIMO margin did not error");
+        }
+
+        // Discrete-time state-space: no matrix exponential, direct recurrence.
+        s.run("sd = ss([0.5 0; 0 0.25], [1;1], [1 0.5], 0, 0.1); [yd, td] = step(sd, 0:0.1:1);").unwrap();
+        assert_eq!(s.get("yd").unwrap().dims(), (11, 1));
+        s.run("y0 = yd(1); y1 = yd(2); yend = yd(end);").unwrap();
+        assert_eq!(scalar(&s, "y0"), 0.0);
+        assert!((scalar(&s, "y1") - 1.5).abs() < 1e-12);
+        let x1 = 2.0 * (1.0 - 0.5f64.powi(10));
+        let x2 = (1.0 - 0.25f64.powi(10)) / 0.75;
+        assert!((scalar(&s, "yend") - (x1 + 0.5 * x2)).abs() < 1e-9);
+
+        s.run("ud = ones(11,1); yd2 = lsim(sd, ud, 0:0.1:1); stable = isstable(sd);").unwrap();
+        assert_eq!(vec(&s, "yd2"), vec(&s, "yd"));
+        assert_eq!(scalar(&s, "stable"), 1.0);
+    }
+
+    #[test]
+    fn hdf5_superblock_version_option() {
+        let dir = m_dir("h5sb");
+        let v2 = dir.join("v2.h5");
+        let v3 = dir.join("v3.h5");
+        let a = v2.to_string_lossy().replace('\\', "/");
+        let b = v3.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "h5create('{a}', '/x', [2 2]); h5write('{a}', '/x', [1 2; 3 4]); x2 = h5read('{a}', '/x'); \
+             h5create('{b}', '/x', [2 2], 'SuperblockVersion', 3); h5write('{b}', '/x', [5 6; 7 8]); x3 = h5read('{b}', '/x');"
+        ))
+        .unwrap();
+        let b2 = std::fs::read(&v2).unwrap();
+        let b3 = std::fs::read(&v3).unwrap();
+        assert_eq!(b2.get(8), Some(&2));
+        assert_eq!(b3.get(8), Some(&3));
+        assert_eq!(s.get("x2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0, 2.0, 4.0]));
+        assert_eq!(s.get("x3").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![5.0, 7.0, 6.0, 8.0]));
+
+        s.run(&format!("try, h5create('{a}', '/bad', [1 1], 'SuperblockVersion', 4); catch e, sbmsg = e.message; end")).unwrap();
+        if let Some(Value::Str(m)) = s.get("sbmsg") {
+            assert!(m.contains("must be 2 or 3"), "superblock error = {m}");
+        } else {
+            panic!("invalid SuperblockVersion did not error");
+        }
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn netcdf4_hdf5_builtins() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/netcdf4_sample.nc");
+        let p = path.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "t = ncread('{p}', 'temp'); l = ncread('{p}', 'lat'); c = ncread('{p}', 'scale'); \
+             q = ncread('{p}', 'quality'); sub = ncread('{p}', 'temp', [2 2], [2 2], [1 1]); \
+             info = ncinfo('{p}'); dn1 = info.Dimensions(1).Name; dn2 = info.Dimensions(2).Name; nv = numel(info.Variables);"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.get("t").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((4, 3, vec![1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0]))
+        );
+        assert_eq!(s.get("l").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![10.0, 20.0, 30.0]));
+        assert_eq!(s.get("c"), Some(&Value::Num(2.5)));
+        assert_eq!(
+            s.get("q").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()),
+            Some(vec![0.0, 3.0, 6.0, 9.0, 1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0])
+        );
+        assert_eq!(
+            s.get("sub").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((2, 2, vec![5.0, 8.0, 6.0, 9.0]))
+        );
+        assert_eq!(s.get("dn1"), Some(&Value::Str("time".into())));
+        assert_eq!(s.get("dn2"), Some(&Value::Str("lat".into())));
+        assert_eq!(s.get("nv"), Some(&Value::Num(4.0)));
+    }
+
+    #[test]
+    fn netcdf4_write_roundtrip_as_classic() {
+        let dir = m_dir("nc4rt");
+        let path = dir.join("sample.nc");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/netcdf4_sample.nc");
+        std::fs::copy(&fixture, &path).unwrap();
+        let p = path.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(&format!(
+            "ncwrite('{p}', 'temp', [9 8 7; 6 5 4; 3 2 1; 0 -1 -2]); t = ncread('{p}', 'temp'); \
+             c = ncread('{p}', 'scale'); l = ncread('{p}', 'lat'); info = ncinfo('{p}'); nv = numel(info.Variables);"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.get("t").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())),
+            Some((4, 3, vec![9.0, 6.0, 3.0, 0.0, 8.0, 5.0, 2.0, -1.0, 7.0, 4.0, 1.0, -2.0]))
+        );
+        assert_eq!(s.get("c"), Some(&Value::Num(2.5)));
+        assert_eq!(s.get("l").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![10.0, 20.0, 30.0]));
+        assert_eq!(s.get("nv"), Some(&Value::Num(4.0)));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.get(0..4), Some(b"CDF\x01".as_slice()));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn dynamic_properties_add_access_save_load() {
+        let dir = m_dir("dynprop");
+        let file = dir.join("dyn.mat");
+        let path = file.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        s.run(
+            "classdef Dyn < handle\n\
+             properties\n a = 1\n end\n\
+             methods\n\
+               function v = readfoo(obj)\n v = obj.foo;\n end\n\
+             end\n\
+             end",
+        )
+        .unwrap();
+        s.run(
+            "o = Dyn(); p = addprop(o, 'foo'); o.foo = 5; v = o.foo; names = dynamicprops(o); \
+             p.GetAccess = 'private'; inside = o.readfoo();",
+        )
+        .unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Num(5.0)));
+        assert_eq!(s.get("inside"), Some(&Value::Num(5.0)));
+        if let Some(Value::Cell(n)) = s.get("names") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("dynamicprops did not return a cellstr");
+        }
+        s.run("try, outside = o.foo; catch ae, amsg = ae.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("private access"), "dynamic access error = {m}");
+        } else {
+            panic!("private dynamic property was readable outside the class");
+        }
+
+        // Access attributes survive save/load along with the value.
+        s.run(&format!("save('{path}', 'o'); clear o p; load('{path}'); saved = o.readfoo(); names2 = dynamicprops(o);")).unwrap();
+        assert_eq!(s.get("saved"), Some(&Value::Num(5.0)));
+        if let Some(Value::Cell(n)) = s.get("names2") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("loaded dynamicprops did not return a cellstr");
+        }
+        s.run("try, hidden = o.foo; catch le, lmsg = le.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("lmsg") {
+            assert!(m.contains("private access"), "loaded access error = {m}");
+        } else {
+            panic!("saved private access was not restored");
+        }
+        s.run("p = addprop(o, 'bar'); o.bar = 7; removeprop(o, p); names3 = dynamicprops(o);").unwrap();
+        if let Some(Value::Cell(n)) = s.get("names3") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("foo".into())));
+        } else {
+            panic!("dynamicprops after removal did not return a cellstr");
+        }
+
+        s.run("classdef ValueDyn\n end\nv = ValueDyn(); try, addprop(v, 'x'); catch ve, vmsg = ve.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("vmsg") {
+            assert!(m.contains("handle object"), "value-class addprop error = {m}");
+        } else {
+            panic!("addprop on a value class did not error");
+        }
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn builtin_bypasses_class_overloads() {
+        let mut s = Session::new();
+        s.run(
+            "classdef Shadow\n\
+             properties\n x = 7\n end\n\
+             methods\n\
+               function n = size(obj)\n n = 99;\n end\n\
+               function n = numel(obj)\n n = 98;\n end\n\
+             end\n\
+             end",
+        )
+        .unwrap();
+        s.run(
+            "o = Shadow(); normal_size = size(o); normal_numel = numel(o); \
+             bs = builtin('size', o); bn = builtin('numel', o); bc = builtin('class', o); \
+             bx = builtin('get', o, 'x'); bch = builtin('char', 65); [br, bcol] = builtin('size', o);",
+        )
+        .unwrap();
+        assert_eq!(s.get("normal_size"), Some(&Value::Num(99.0)));
+        assert_eq!(s.get("normal_numel"), Some(&Value::Num(98.0)));
+        assert_eq!(s.get("bs").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 1.0]));
+        assert_eq!(s.get("bn"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("bc"), Some(&Value::Str("Shadow".into())));
+        assert_eq!(s.get("bx"), Some(&Value::Num(7.0)));
+        assert_eq!(s.get("bch"), Some(&Value::Str("A".into())));
+        assert_eq!(s.get("br"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("bcol"), Some(&Value::Num(1.0)));
+        s.run("bop = builtin('plus', 1, 2); bdot = builtin('mtimes', [1 2], [3;4]);").unwrap();
+        assert_eq!(s.get("bop"), Some(&Value::Num(3.0)));
+        assert_eq!(s.get("bdot"), Some(&Value::Num(11.0)));
+
+        s.run("try, builtin('plus', o, o); catch oe, omsg = oe.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("omsg") {
+            assert!(m.contains("no built-in object implementation"), "operator error = {m}");
+        } else {
+            panic!("builtin operator on objects did not error");
+        }
+
+        s.run("try, builtin('no_such_builtin', 1); catch be, bmsg = be.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("bmsg") {
+            assert!(m.contains("not a built-in function"), "builtin error = {m}");
+        } else {
+            panic!("unknown builtin name did not error");
+        }
+    }
+
+    #[test]
+    fn table_subscripts_read_assign_delete() {
+        let mut s = Session::new();
+        s.run(
+            "T = table([1;2;3], [4;5;6], 'VariableNames', {'A','B'}); \
+             R = T([1 3],:); ra = R.A; rc = T{1,:}; rv = T{:,1}; rn = T(:, {'B'});",
+        )
+        .unwrap();
+        assert_eq!(s.get("ra").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        assert_eq!(s.get("rc").and_then(|v| v.to_matrix().ok()).map(|m| (m.rows(), m.cols(), m.data().to_vec())), Some((1, 2, vec![1.0, 4.0])));
+        assert_eq!(s.get("rv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(
+            s.get("rn").and_then(|v| match v {
+                Value::Object(o) => Some(o.prop_names()),
+                _ => None,
+            }),
+            Some(vec!["B".to_string(), "Properties".to_string()])
+        );
+
+        s.run("T(1,:) = [10 40]; T{2,:} = [20 30]; T(:,2) = [7;8;9];").unwrap();
+        assert_eq!(
+            s.get("T")
+                .and_then(|v| match v {
+                    Value::Object(o) => o.prop("A"),
+                    _ => None,
+                })
+                .and_then(|v| v.to_matrix().ok())
+                .map(|m| m.data().to_vec()),
+            Some(vec![10.0, 20.0, 3.0])
+        );
+        assert_eq!(
+            s.get("T")
+                .and_then(|v| match v {
+                    Value::Object(o) => o.prop("B"),
+                    _ => None,
+                })
+                .and_then(|v| v.to_matrix().ok())
+                .map(|m| m.data().to_vec()),
+            Some(vec![7.0, 8.0, 9.0])
+        );
+
+        // Logical row deletion uses the live table while resolving the mask.
+        s.run("T(T.A > 8, :) = []; h1 = height(T); a1 = T.A;").unwrap();
+        assert_eq!(s.get("h1"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("a1").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0]));
+
+        // Variable deletion by name, then add/remove through dot syntax.
+        s.run(
+            "T(:, {'B'}) = []; a_after = T.A; \
+             T2 = table([5;6], 'VariableNames', {'C'}); T2.D = [7;8]; T2.C = []; \
+             names = T2.Properties.VariableNames; h2 = height(T2); d2 = T2.D;",
+        )
+        .unwrap();
+        assert_eq!(s.get("a_after").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0]));
+        if let Some(Value::Cell(n)) = s.get("names") {
+            assert_eq!(n.numel(), 1);
+            assert_eq!(n.get_linear(0), Some(&Value::Str("D".into())));
+        } else {
+            panic!("VariableNames is not a cell");
+        }
+        assert_eq!(s.get("h2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("d2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![7.0, 8.0]));
+
+        s.run("T2(T2.D > 7, :) = []; h3 = height(T2); T2(1) = []; h4 = height(T2);").unwrap();
+        assert_eq!(s.get("h3"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("h4"), Some(&Value::Num(0.0)));
+        s.run("try, T2(5,:) = [1]; catch e, terr = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("terr") {
+            assert!(m.contains("row index out of bounds"), "table error = {m}");
+        } else {
+            panic!("out-of-range row assignment did not error");
+        }
+    }
+
+    #[test]
+    fn hdf5_netcdf_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let h5 = dir.join(format!("matcraft_h5_{}_{}.h5", std::process::id(), n));
+        let nc = dir.join(format!("matcraft_nc_{}_{}.nc", std::process::id(), n));
+        let h5s = h5.to_string_lossy().replace('\\', "/");
+        let ncs = nc.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+
+        s.run(&format!(
+            "h5write('{h5s}', '/a', [1 2 3; 4 5 6]); a = h5read('{h5s}', '/a'); \
+             h5write('{h5s}', '/b', [9;8;7]); b = h5read('{h5s}', '/b'); \
+             c = h5read('{h5s}', '/a', [2 2], [1 2], [1 1]); \
+             h5write('{h5s}', '/a', [99], [2 3], [1 1], [1 1]); d = h5read('{h5s}', '/a'); \
+             h5create('{h5s}', '/e', [2 2]); e = h5read('{h5s}', '/e');"
+        ))
+        .unwrap();
+        assert_eq!(s.get("a").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("b").unwrap().dims(), (3, 1));
+        assert_eq!(s.get("c"), Some(&Value::Mat(Matrix::from_row_major(1, 2, &[5.0, 6.0]).unwrap())));
+        assert_eq!(s.get("d").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 99.0]));
+        assert_eq!(s.get("e").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0; 4]));
+
+        s.run(&format!(
+            "ncwrite('{ncs}', 'temp', [1 2 3; 4 5 6]); nt = ncread('{ncs}', 'temp'); \
+             ns = ncread('{ncs}', 'temp', [2 2], [1 2], [1 1]); \
+             ncwrite('{ncs}', 'temp', [99], [2 3], [1 1], [1 1]); nt2 = ncread('{ncs}', 'temp'); \
+             info = ncinfo('{ncs}'); vname = info.Variables.Name; vsize = info.Variables.Size;"
+        ))
+        .unwrap();
+        assert_eq!(s.get("nt").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+        assert_eq!(s.get("ns"), Some(&Value::Mat(Matrix::from_row_major(1, 2, &[5.0, 6.0]).unwrap())));
+        assert_eq!(s.get("nt2").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 4.0, 2.0, 5.0, 3.0, 99.0]));
+        assert_eq!(s.get("vname"), Some(&Value::Str("temp".into())));
+        assert_eq!(s.get("vsize").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+
+        let _ = std::fs::remove_file(&h5);
+        let _ = std::fs::remove_file(&nc);
+    }
+
+    #[test]
+    fn statistics_weibull_lognormal() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run(
+            "wp = wblpdf(1.2, 2, 3); wc = wblcdf(1.2, 2, 3); wi = wblinv(wc, 2, 3); \
+             lp = lognpdf(1, 0, 1); lc = logncdf(1, 0, 1); li = logninv(0.5, 0, 1);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "wp") - 0.227_238_343_724_323_03).abs() < 1e-9, "wp = {}", scalar(&s, "wp"));
+        assert!((scalar(&s, "wc") - 0.147_856_211_033_788_63).abs() < 1e-9, "wc = {}", scalar(&s, "wc"));
+        assert!((scalar(&s, "wi") - 1.2).abs() < 1e-9);
+        assert!((scalar(&s, "lp") - 0.398_942_280_401_432_7).abs() < 1e-12);
+        assert!((scalar(&s, "lc") - 0.5).abs() < 1e-7);
+        assert!((scalar(&s, "li") - 1.0).abs() < 1e-12);
+
+        // MLE fit on quantiles of a known Weibull distribution.
+        s.run(
+            "rng(42); xw = wblrnd(2, 3, 1, 5000); wd = fitdist(xw, 'Weibull'); wa = wd.a; wb = wd.b; \
+             wname = wd.DistributionName; wm = mean(wd); wv = var(wd); wpdf = pdf(wd, 1.2); wcdf = cdf(wd, 1.2);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "wa") - 2.0).abs() < 0.05, "Weibull shape = {}", scalar(&s, "wa"));
+        assert!((scalar(&s, "wb") - 3.0).abs() < 0.05, "Weibull scale = {}", scalar(&s, "wb"));
+        assert_eq!(s.get("wname"), Some(&Value::Str("Weibull".into())));
+        assert!((scalar(&s, "wpdf") - matcore::stats::weibull_pdf(1.2, scalar(&s, "wa"), scalar(&s, "wb"))).abs() < 1e-12);
+        assert!((scalar(&s, "wcdf") - matcore::stats::weibull_cdf(1.2, scalar(&s, "wa"), scalar(&s, "wb"))).abs() < 1e-12);
+        let g1 = matcore::stats::gammaln(1.0 + 1.0 / scalar(&s, "wa")).exp();
+        assert!((scalar(&s, "wm") - scalar(&s, "wb") * g1).abs() < 1e-9);
+
+        // Lognormal fit recovers the exact log-space parameters.
+        s.run(
+            "ld = fitdist(exp(0.5*[-2 -1 0 1 2]), 'Lognormal'); lm = ld.mu; ls = ld.sigma; lname = ld.DistributionName; \
+             lmean = mean(ld); lvar = var(ld); lmed = median(ld); lpdf = pdf(ld, 1); lcdf = cdf(ld, 1);",
+        )
+        .unwrap();
+        assert!(scalar(&s, "lm").abs() < 1e-12);
+        assert!((scalar(&s, "ls") - 0.5f64.sqrt()).abs() < 1e-12);
+        assert_eq!(s.get("lname"), Some(&Value::Str("Lognormal".into())));
+        assert!((scalar(&s, "lmean") - 1.284_025_416_687_741_4).abs() < 1e-12);
+        assert!((scalar(&s, "lvar") - 1.069_560_557_758_917_1).abs() < 1e-10);
+        assert!((scalar(&s, "lmed") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "lpdf") - 0.564_189_583_547_756_3).abs() < 1e-12);
+        assert!((scalar(&s, "lcdf") - 0.5).abs() < 1e-7);
+
+        // Seeded random generators are reproducible, positive and right-sized.
+        s.run(
+            "rng(7); W1 = wblrnd(2, 3, 2, 3); rng(7); W2 = wblrnd(2, 3, 2, 3); weq = isequal(W1, W2); \
+             wsz = size(W1); wmin = min(W1(:)); rng(8); L1 = lognrnd(0, 0.5, 2, 2); lsz = size(L1); lmin = min(L1(:));",
+        )
+        .unwrap();
+        assert_eq!(s.get("weq"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("wsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+        assert!(scalar(&s, "wmin") > 0.0);
+        assert_eq!(s.get("lsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
+        assert!(scalar(&s, "lmin") > 0.0);
+    }
+
+    #[test]
+    fn statistics_tlocation_scale() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run(
+            "rng(11); u = rand(1, 5000); xt = 2 + 3*tinv(u, 7); td = fitdist(xt, 'tLocationScale'); \
+             tmu = td.mu; tsig = td.sigma; tnu = td.nu; tname = td.DistributionName; \
+             tpdf = pdf(td, 3); tcdf = cdf(td, 3); ticdf = icdf(td, 0.9); \
+             tm = mean(td); tv = var(td); tmed = median(td); rng(3); tr = random(td, 2, 3); tsz = size(tr);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "tmu") - 1.9415).abs() < 0.3, "tLocationScale mu = {}", scalar(&s, "tmu"));
+        assert!((scalar(&s, "tsig") - 3.0676).abs() < 0.4, "tLocationScale sigma = {}", scalar(&s, "tsig"));
+        assert!((scalar(&s, "tnu") - 8.2802).abs() < 3.0, "tLocationScale nu = {}", scalar(&s, "tnu"));
+        assert_eq!(s.get("tname"), Some(&Value::Str("tLocationScale".into())));
+        let z = (3.0 - scalar(&s, "tmu")) / scalar(&s, "tsig");
+        let nu = scalar(&s, "tnu");
+        let expected_pdf = matcore::stats::t_pdf(z, nu) / scalar(&s, "tsig");
+        assert!((scalar(&s, "tpdf") - expected_pdf).abs() < 1e-9);
+        assert!((scalar(&s, "tcdf") - matcore::stats::t_cdf(z, nu)).abs() < 1e-9);
+        let expected_inv = scalar(&s, "tmu") + scalar(&s, "tsig") * matcore::stats::t_inv(0.9, nu);
+        assert!((scalar(&s, "ticdf") - expected_inv).abs() < 1e-7);
+        assert!((scalar(&s, "tm") - scalar(&s, "tmu")).abs() < 1e-6);
+        assert!((scalar(&s, "tv") - scalar(&s, "tsig") * scalar(&s, "tsig") * nu / (nu - 2.0)).abs() < 1e-6);
+        assert!((scalar(&s, "tmed") - scalar(&s, "tmu")).abs() < 1e-6);
+        assert_eq!(s.get("tsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 3.0]));
+
+        s.run("try, fitdist([1 2], 'tLocationScale'); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("three observations"), "tLocationScale error = {m}");
+        } else {
+            panic!("short tLocationScale fit did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_chi2gof() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Exactly ten observations per bin: zero statistic, nine degrees of freedom.
+        s.run(
+            "x = linspace(0.01, 0.99, 100); [h, p, st] = chi2gof(x, 'CDF', @(z) unifcdf(z,0,1), 'Edges', 0:0.1:1, 'NParams', 0); \
+             stat = st.chi2stat; df = st.df; nb = numel(st.O); e1 = st.E(1);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "h"), 0.0);
+        assert!((scalar(&s, "p") - 1.0).abs() < 1e-9);
+        assert!(scalar(&s, "stat").abs() < 1e-9);
+        assert_eq!(scalar(&s, "df"), 9.0);
+        assert_eq!(scalar(&s, "nb"), 10.0);
+        assert!((scalar(&s, "e1") - 10.0).abs() < 1e-9);
+
+        // Default normal null with estimated parameters.
+        s.run("y = norminv(linspace(0.005, 0.995, 200), 0, 1); [h2, p2, s2] = chi2gof(y); df2 = s2.df; stat2 = s2.chi2stat;").unwrap();
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert!(scalar(&s, "p2") > 0.05);
+        assert_eq!(scalar(&s, "df2"), 7.0);
+        assert!(scalar(&s, "stat2") < 1.0, "normal chi2stat = {}", scalar(&s, "stat2"));
+
+        s.run("try, chi2gof(y, 'bogus', 1); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unknown option"), "chi2gof error = {m}");
+        } else {
+            panic!("unknown chi2gof option did not error");
+        }
+        s.run("try, chi2gof([1 2 3], 'Alpha', 2); catch e, amsg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("amsg") {
+            assert!(m.contains("Alpha"), "chi2gof Alpha error = {m}");
+        } else {
+            panic!("invalid chi2gof Alpha did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_tsne_embedding() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "rng(1); X = [randn(20,2)*0.3; randn(20,2)*0.3+5]; \
+             [Y, L] = tsne(X, 'Perplexity', 10, 'NumIterations', 300); \
+             a = mean(Y(1:20,:)); b = mean(Y(21:40,:)); sep = sqrt(sum((a-b).^2)); \
+             bad = sum(sum(isnan(Y))); rng(1); X = [randn(20,2)*0.3; randn(20,2)*0.3+5]; Y2 = tsne(X, 'Perplexity', 10, 'NumIterations', 300); same = isequal(Y, Y2); \
+             Z = tsne(X, 'NumDimensions', 3, 'NumIterations', 80, 'NumPCAComponents', 1); zsz = size(Z);",
+        )
+        .unwrap();
+        assert_eq!(s.get("Y").map(|v| v.dims()), Some((40, 2)));
+        assert_eq!(s.get("zsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![40.0, 3.0]));
+        assert!(scalar(&s, "sep") > 10.0, "cluster separation = {}", scalar(&s, "sep"));
+        assert_eq!(scalar(&s, "bad"), 0.0);
+        assert_eq!(s.get("same"), Some(&Value::Num(1.0)));
+        assert!(scalar(&s, "L") == scalar(&s, "L"), "loss is NaN");
+
+        s.run("try, tsne(X, 'Distance', 'cosine'); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("unsupported distance"), "tsne error = {m}");
+        } else {
+            panic!("unsupported tsne distance did not error");
+        }
+    }
+
+    #[test]
+    fn statistics_kernel_fit() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "kd = fitdist([1 2 3 4 5], 'Kernel'); kb = kd.Bandwidth; kname = kd.DistributionName; kn = kd.Kernel; \
+             kp = pdf(kd, 3); kc = cdf(kd, 3); kq = icdf(kd, 0.5); km = mean(kd); kv = var(kd); kmed = median(kd); \
+             rng(5); kr = random(kd, 2, 2); ksz = size(kr); kbad = sum(sum(isnan(kr)));",
+        )
+        .unwrap();
+        let bw = scalar(&s, "kb");
+        assert!(bw > 0.0);
+        assert_eq!(s.get("kname"), Some(&Value::Str("Kernel".into())));
+        assert_eq!(s.get("kn"), Some(&Value::Str("normal".into())));
+        let expected_pdf: f64 = (1..=5).map(|x| matcore::stats::norm_pdf((3.0 - x as f64) / bw, 0.0, 1.0)).sum::<f64>() / (5.0 * bw);
+        assert!((scalar(&s, "kp") - expected_pdf).abs() < 1e-12);
+        assert!((scalar(&s, "kc") - 0.5).abs() < 1e-7);
+        assert!((scalar(&s, "kq") - 3.0).abs() < 1e-9);
+        assert!((scalar(&s, "km") - 3.0).abs() < 1e-12);
+        assert!((scalar(&s, "kv") - (2.0 + bw * bw)).abs() < 1e-9);
+        assert!((scalar(&s, "kmed") - 3.0).abs() < 1e-9);
+        assert_eq!(s.get("ksz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![2.0, 2.0]));
+        assert_eq!(scalar(&s, "kbad"), 0.0);
+    }
+
+    #[test]
+    fn bio_formula_reaction_gpr_sequences() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "f = formulaatoms('C6H12O6'); fc = f.C; w = formulaweight('C6H12O6'); ok = formulacheck('C55H80CoN15O11'); \
+             r = parsereaction('2 H2O + ATP <=> ADP + Pi'); txt = formatreaction(r); rev = rxnequal(r, 'ADP + Pi <=> 2 H2O + ATP', 'Reverse', 1); \
+             bal = rxnbalance('2 H2 + O2 -> 2 H2O', {'H2','O2','H2O'}); balv = bal.Balanced; bad = rxnbalance('H2O -> H2 + O2', {'H2O','H2','O2'}); badv = bad.Balanced; \
+             g = gprparse('g1 & (g2 | g3)'); on = gpreval(g, {'g1','g3'}); off = gpreval(g, {'g1'}); gl = gprgenes(g); gm = gprmerge(g, 'g4'); \
+             inf = inferformula([-1 -1 1 1 1], {'C10H16N5O13P3','H2O','C10H16N5O10P2','','H+'}, 4);",
+        )
+        .unwrap();
+        assert_eq!(scalar(&s, "fc"), 6.0);
+        assert!((scalar(&s, "w") - 180.15588).abs() < 1e-4);
+        assert_eq!(scalar(&s, "ok"), 1.0);
+        assert_eq!(s.get("txt"), Some(&Value::Str("2 H2O + ATP <=> ADP + Pi".into())));
+        assert_eq!(scalar(&s, "rev"), 1.0);
+        assert_eq!(scalar(&s, "balv"), 1.0);
+        assert_eq!(scalar(&s, "badv"), 0.0);
+        assert_eq!(scalar(&s, "on"), 1.0);
+        assert_eq!(scalar(&s, "off"), 0.0);
+        assert_eq!(
+            s.get("gl").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(3)
+        );
+        assert!(matches!(s.get("gm"), Some(Value::Str(_))));
+        let inf = s.get("inf").and_then(|v| match v {
+            Value::Struct(st) => st.field_at(0, "Formula").cloned(),
+            _ => None,
+        });
+        assert_eq!(inf, Some(Value::Str("HO4P".into())));
+
+        let dir = m_dir("bioio");
+        let fa = dir.join("sample.fasta");
+        let gb = dir.join("sample.gbk");
+        std::fs::write(&fa, ">seq1 locus_tag=gene1\nMKV\n>seq2\nGG\n").unwrap();
+        std::fs::write(
+            &gb,
+            "LOCUS       TEST001     100 bp    DNA\nDEFINITION  test protein.\nFEATURES             Location/Qualifiers\n     CDS             1..9\n                     /locus_tag=\"gene1\"\n                     /protein_id=\"P1\"\n                     /product=\"enzyme\"\n                     /translation=\"MKV\"\n     CDS             10..15\n                     /locus_tag=\"gene2\"\n                     /protein_id=\"P2\"\n                     /product=\"second enzyme\"\n                     /translation=\"GG\"\nORIGIN\n        1 atggccgttgga\n//\n",
+        )
+        .unwrap();
+        let fp = fa.to_string_lossy().replace('\\', "/");
+        let gp = gb.to_string_lossy().replace('\\', "/");
+        s.run(&format!(
+            "[fh, fs] = fastaread('{fp}'); rec = fastaread('{fp}'); h1 = rec(1).Header; q1 = rec(1).Sequence; fastawrite('{fp}.out', fh, fs); \
+             gb = genbankread('{gp}'); g1 = gb(1); gl = g1.LocusTag; gid = g1.ProteinID; gtr = g1.Translation; gsq = g1.Sequence; g2 = gb(2); gl2 = g2.LocusTag; gid2 = g2.ProteinID; gtr2 = g2.Translation;"
+        ))
+        .unwrap();
+        assert_eq!(s.get("h1"), Some(&Value::Str("seq1 locus_tag=gene1".into())));
+        assert_eq!(s.get("q1"), Some(&Value::Str("MKV".into())));
+        assert_eq!(s.get("gl"), Some(&Value::Str("gene1".into())));
+        assert_eq!(s.get("gid"), Some(&Value::Str("P1".into())));
+        assert_eq!(s.get("gtr"), Some(&Value::Str("MKV".into())));
+        assert_eq!(s.get("gl2"), Some(&Value::Str("gene2".into())));
+        assert_eq!(s.get("gid2"), Some(&Value::Str("P2".into())));
+        assert_eq!(s.get("gtr2"), Some(&Value::Str("GG".into())));
+        assert_eq!(s.get("gsq"), Some(&Value::Str("atggccgttgga".into())));
+        let out = std::fs::read_to_string(dir.join("sample.fasta.out")).unwrap();
+        assert!(out.contains(">seq1") && out.contains("MKV"));
+        rm_dir(&dir);
+    }
+
+    #[test]
+    fn clustering_graphs_and_visual_metrics() {
+        use matplot::SeriesKind;
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "X = [0 0; 1 0; 0 2; 3 3]; Y = [0 1; 2 2]; D2 = pdist2(X, Y); dj = pdist([1 0;0 1;1 1], 'jaccard'); \
+             Z = linkage(pdist(X), 'average'); cl = cluster(Z, 'maxclust', 2); \
+             cp = cophenet(Z, pdist(X)); sil = silhouette(X, cl); silm = mean(silhouette([0 0;1 0;10 0;11 0], [1;1;2;2])); cm = confusionmat([1 1 2 2], [1 2 2 2]); \
+             score = clustermetrics([1 1 2 2], [1 1 2 2]); ari = score.ARI; nmi = score.NMI; jj = jaccard([1 0 1 1], [1 1 0 1]); sm = setmetrics([1 2 3], [2 3 4]); prec = sm.Precision;",
+        )
+        .unwrap();
+        assert_eq!(s.get("D2").map(|v| v.dims()), Some((4, 2)));
+        assert!((s.get("D2").and_then(|v| v.to_matrix().ok()).map(|m| m.get(0, 1).unwrap_or(0.0)).unwrap_or(0.0) - 8f64.sqrt()).abs() < 1e-12);
+        assert_eq!(vec(&s, "dj"), vec![1.0, 0.5, 0.5]);
+        assert_eq!(vec(&s, "cl").len(), 4);
+        assert!(vec(&s, "cl").iter().all(|v| *v <= 2.0));
+        assert!(scalar(&s, "cp").is_finite());
+        assert_eq!(vec(&s, "sil").len(), 4);
+        assert!((scalar(&s, "silm") - 0.8997).abs() < 1e-3);
+        assert_eq!(s.get("cm").map(|v| v.dims()), Some((2, 2)));
+        assert!((scalar(&s, "ari") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "nmi") - 1.0).abs() < 1e-12);
+        assert_eq!(scalar(&s, "jj"), 0.5);
+        assert!((scalar(&s, "prec") - 2.0 / 3.0).abs() < 1e-12);
+
+        s.run("clf; dendrogram(Z, 'Labels', {'a','b','c','d'}, 'ColorThreshold', 2);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Dendrogram);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; venn({'a','b','c'}, {'b','c','d'}, {'c','e'}); vc = venncounts({'a','b','c'}, {'b','c','d'}, {'c','e'});").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Venn);
+        assert_eq!(s.get("vc").map(|v| v.dims()), Some((8, 4)));
+        assert!(matplot::to_svg(&s.figs[0]).contains("<circle"));
+
+        s.run("clf; quiver(1:3, 1:3, ones(1,3), zeros(1,3));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Quiver);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; quiver3(1:2,1:2,1:2,ones(1,2),zeros(1,2),ones(1,2));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Quiver3);
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; volcano([-3 -1 0 1 3], [0.001 0.2 0.5 0.01 0.0001]);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Scatter);
+        assert_eq!(s.figs[0].series[0].colors.len(), 5);
+        assert_eq!(s.figs[0].title.as_deref(), Some("volcano"));
+        assert!(matplot::to_svg(&s.figs[0]).contains("stroke-dasharray"));
+
+        s.run("clf; heatmap(magic(5));").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Image);
+        assert!(s.figs[0].colorbar);
+        assert_eq!(s.figs[0].title.as_deref(), Some("heatmap"));
+        assert_eq!(s.figs.len(), 1);
+
+        s.run("clf; [mx, my] = meshgrid(-1:1); surfl(mx.^2 + my.^2);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Surf);
+        assert!(s.figs[0].lighting);
+
+        s.run("G = graph([0 1 1 0;1 0 1 0;1 1 0 1;0 0 1 0]); nn = numnodes(G); ne = numedges(G); dg = degree(G); cc = conncomp(G); [p, dist] = shortestpath(G, 1, 4); pstr = strjoin(p, ','); nb = neighbors(G, 1); clf; plot(G); G2 = graph([0 2 0;0 0 3;0 0 0], {'a','b','c'}); G3 = digraph([0 2 0;0 0 3;0 0 0]); dg3 = degree(G3); G4 = graph([1 0;0 1], 'omitselfloops'); ne4 = numedges(G4);").unwrap();
+        assert_eq!(scalar(&s, "nn"), 4.0);
+        assert_eq!(scalar(&s, "ne"), 4.0);
+        assert_eq!(vec(&s, "dg"), vec![2.0, 2.0, 3.0, 1.0]);
+        assert_eq!(vec(&s, "cc"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s.get("pstr"), Some(&Value::Str("1,3,4".into())));
+        assert_eq!(vec(&s, "dg3"), vec![1.0, 2.0, 1.0]);
+        assert_eq!(scalar(&s, "ne4"), 0.0);
+        assert_eq!(scalar(&s, "dist"), 2.0);
+        assert_eq!(
+            s.get("nb").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(2)
+        );
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Graph);
+        let svg = matplot::to_svg(&s.figs[0]);
+        assert!(svg.contains("<circle") && svg.contains("<line"));
+    }
+
+    #[test]
+    fn analysis_extensions_and_streamlines() {
+        use matplot::SeriesKind;
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run(
+            "ri = randindex([1 1 2 2], [1 1 2 3]); [mi, nmi] = mutualinfo([1 1 2 2], [1 1 2 3]); \
+             z = zscore([1 2; 3 4]); ev = evalclusters([0 0; 1 0; 10 0; 11 0], [1;1;2;2], 'silhouette'); evv = ev.CriterionValues; \
+             evd = evalclusters([0 0; 1 0; 10 0; 11 0], 2, 'DaviesBouldin'); evdv = evd.CriterionValues; \
+             evc = evalclusters([0 0; 1 0; 10 0; 11 0], [1;1;2;2], 'CalinskiHarabasz'); evcv = evc.CriterionValues; \
+             G = graph([0 1 1; 1 0 0; 1 0 0]); inc = incidence(G);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "ri") - 5.0 / 6.0).abs() < 1e-12);
+        assert!(scalar(&s, "mi") > 0.0 && (scalar(&s, "nmi") - 0.8165).abs() < 1e-4);
+        let z = vec(&s, "z");
+        assert!((z[0] + std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-4 && (z[3] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-4);
+        assert!((scalar(&s, "evv") - 0.8997).abs() < 1e-3 || scalar(&s, "evv") > 0.8);
+        assert!(scalar(&s, "evdv").is_finite());
+        assert!(scalar(&s, "evcv").is_finite());
+        assert_eq!(s.get("inc").map(|v| v.dims()), Some((3, 2)));
+
+        s.run("clf; clustergram([1 2 3; 4 5 6; 7 8 9; 10 11 12]);").unwrap();
+        assert_eq!(s.figs[0].series[0].kind, SeriesKind::Image);
+        assert_eq!(s.figs[0].title.as_deref(), Some("clustergram"));
+        assert!(matplot::to_svg(&s.figs[0]).contains("<rect"));
+
+        s.run("clf; [X,Y] = meshgrid(1:3,1:3); U = ones(3); V = zeros(3); streamline(X,Y,U,V,1,1);").unwrap();
+        assert!(!s.figs[0].series.is_empty());
+        assert!(matplot::to_svg(&s.figs[0]).contains("<path"));
+
+        s.run("clf; [X,Y] = meshgrid(1:3,1:3); streamslice(X,Y,ones(3),ones(3));").unwrap();
+        assert!(!s.figs[0].series.is_empty());
+    }
+
+    #[test]
+    fn statistics_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("a = normpdf(0); b = normcdf(0); c = normcdf(1.96); d = norminv(0.975);").unwrap();
+        assert!((scalar(&s, "a") - 0.398_942_280_401_432_7).abs() < 1e-12);
+        assert!((scalar(&s, "b") - 0.5).abs() < 1e-8);
+        assert!((scalar(&s, "c") - 0.975_002_104_851_780_1).abs() < 1e-6);
+        assert!((scalar(&s, "d") - 1.959_963_984_540_054).abs() < 1e-7);
+
+        s.run("e = exppdf(0, 1); f = expcdf(1, 1); g = unifcdf(0.5, 0, 1); h = expinv(1-exp(-1), 1);").unwrap();
+        assert!((scalar(&s, "e") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "f") - (1.0 - (-1f64).exp())).abs() < 1e-12);
+        assert!((scalar(&s, "g") - 0.5).abs() < 1e-12);
+        assert!((scalar(&s, "h") - 1.0).abs() < 1e-10);
+
+        s.run("p1 = poisspdf(3,2); p2 = poisscdf(3,2); p3 = binopdf(3,10,0.5); p4 = binocdf(3,10,0.5); p5 = poissinv(0.857123460498547,2); p6 = binoinv(0.171875,10,0.5);")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.180_447_044_315_483_6).abs() < 1e-12);
+        assert!((scalar(&s, "p2") - 0.857_123_460_498_547).abs() < 1e-12);
+        assert!((scalar(&s, "p3") - 0.117_187_5).abs() < 1e-12);
+        assert!((scalar(&s, "p4") - 0.171_875).abs() < 1e-12);
+        assert_eq!(scalar(&s, "p5"), 3.0);
+        assert_eq!(scalar(&s, "p6"), 3.0);
+
+        s.run("q = iqr([1 2 3 4]); qm = iqr([1 1; 2 2; 3 3; 4 4]);").unwrap();
+        assert!((scalar(&s, "q") - 1.5).abs() < 1e-12);
+        assert_eq!(vec(&s, "qm"), vec![1.5, 1.5]);
+
+        s.run("[R, P] = corrcoef([1;2;3], [2;4;6]); Rv = corrcoef([1 2 3]);").unwrap();
+        assert_eq!(vec(&s, "R"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(vec(&s, "P"), vec![0.0, 0.0, 0.0, 0.0]);
+        assert!((scalar(&s, "Rv") - 1.0).abs() < 1e-12);
+
+        s.run("[b, bint, r, rint, st] = regress([1;2;3], [ones(3,1) [1;2;3]]);").unwrap();
+        let b = vec(&s, "b");
+        assert!(b[0].abs() < 1e-9 && (b[1] - 1.0).abs() < 1e-9, "b = {b:?}");
+        let st = vec(&s, "st");
+        assert!((st[0] - 1.0).abs() < 1e-12);
+        assert!(st[1].is_infinite());
+        assert_eq!(st[2], 0.0);
+        assert_eq!(vec(&s, "bint").len(), 4);
+        assert_eq!(vec(&s, "rint").len(), 6);
+
+        s.run("rng(1); [idx, C, sumd, D] = kmeans([0 0; 0.1 0; 5 5; 5.1 5], 2, 'Replicates', 3, 'Distance', 'sqeuclidean', 'Start', 'plus', 'EmptyAction', 'singleton');")
+            .unwrap();
+        let idx = vec(&s, "idx");
+        assert_eq!(idx[0], idx[1]);
+        assert_eq!(idx[2], idx[3]);
+        assert_ne!(idx[0], idx[2]);
+        assert_eq!(vec(&s, "C").len(), 4);
+        assert_eq!(vec(&s, "sumd").len(), 2);
+        assert_eq!(vec(&s, "D").len(), 8);
+
+        s.run("rng(2); X = exprnd(1, 2, 3); Y = unifrnd(0, 1, 2, 2); Z = poissrnd(2, 1, 5); W = binornd(10, 0.5, 2, 2);").unwrap();
+        assert_eq!(s.get("X").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("Y").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("Z").unwrap().dims(), (1, 5));
+        assert_eq!(s.get("W").unwrap().dims(), (2, 2));
+        assert!(vec(&s, "X").iter().all(|v| *v >= 0.0));
+        assert!(vec(&s, "Y").iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(vec(&s, "Z").iter().all(|v| *v >= 0.0 && v.fract() == 0.0));
+        assert!(vec(&s, "W").iter().all(|v| (0.0..=10.0).contains(v) && v.fract() == 0.0));
+    }
+
+    #[test]
+    fn hypothesis_tests_and_pca() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // One-sample t: mean 3, sd 1, n 3 -> t = 5.196, df = 2, two-sided p ~ 0.0351.
+        s.run("[h1, p1, ci1, st1] = ttest([2 3 4], 0); t1 = st1.tstat; d1 = st1.df; s1 = st1.sd;").unwrap();
+        assert_eq!(scalar(&s, "h1"), 1.0);
+        assert!((scalar(&s, "p1") - 0.035_096_8).abs() < 1e-5, "p1 = {}", scalar(&s, "p1"));
+        assert!((scalar(&s, "t1") - 5.196_152).abs() < 1e-4);
+        assert_eq!(scalar(&s, "d1"), 2.0);
+        assert!((scalar(&s, "s1") - 1.0).abs() < 1e-12);
+        let ci1 = vec(&s, "ci1");
+        assert!(ci1[0] < 3.0 && ci1[1] > 3.0 && ci1.len() == 2);
+
+        // One-sided and alpha options.
+        s.run("[hr, pr] = ttest([2 3 4], 0, 'Tail', 'right'); [hl, pl] = ttest([2 3 4], 0, 'Tail', 'left'); [ha, pa] = ttest([2 3 4], 0, 0.10);")
+            .unwrap();
+        assert_eq!(scalar(&s, "hr"), 1.0);
+        assert!((scalar(&s, "pr") - 0.017_548_4).abs() < 1e-5);
+        assert_eq!(scalar(&s, "hl"), 0.0);
+        assert!((scalar(&s, "pl") - 0.982_451_6).abs() < 1e-5);
+        assert_eq!(scalar(&s, "ha"), 1.0);
+        assert!((scalar(&s, "pa") - 0.035_096_8).abs() < 1e-5);
+
+        // Two-sample Welch t: t = -1, df = 8, p = 0.3466.
+        s.run("[h2, p2, ci2, st2] = ttest2([1 2 3 4 5], [2 3 4 5 6]); t2 = st2.tstat; d2 = st2.df;").unwrap();
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert!((scalar(&s, "p2") - 0.346_593_8).abs() < 1e-5, "p2 = {}", scalar(&s, "p2"));
+        assert!((scalar(&s, "t2") + 1.0).abs() < 1e-9);
+        assert!((scalar(&s, "d2") - 8.0).abs() < 1e-9);
+        let ci2 = vec(&s, "ci2");
+        assert!(ci2[0] < -1.0 && ci2[1] > -1.0);
+
+        // Equal-variance form has df = n1 + n2 - 2.
+        s.run("[he, pe, cie, ste] = ttest2([1 2 3 4 5], [2 3 4 5 6], 'Vartype', 'equal'); de = ste.df;").unwrap();
+        assert_eq!(scalar(&s, "he"), 0.0);
+        assert_eq!(scalar(&s, "de"), 8.0);
+        assert!((scalar(&s, "pe") - 0.346_593_8).abs() < 1e-5);
+
+        // KS against the standard normal: D = 0.1747 for [-1 0 1].
+        s.run("[hk, pk, dk, cvk] = kstest([-1 0 1]);").unwrap();
+        assert_eq!(scalar(&s, "hk"), 0.0);
+        assert!((scalar(&s, "dk") - 0.174_672).abs() < 1e-5, "dk = {}", scalar(&s, "dk"));
+        assert!((scalar(&s, "pk") - 1.0).abs() < 1e-3);
+        assert!(scalar(&s, "cvk") > 0.0);
+
+        // Custom CDF (normal with mean 0, sd 10) makes the same data unremarkable too.
+        s.run("cdf = @(x) normcdf(x, 0, 10); [hc, pc, dc] = kstest([-1 0 1], cdf);").unwrap();
+        assert_eq!(scalar(&s, "hc"), 0.0);
+        assert!(scalar(&s, "dc") > 0.0);
+
+        // Anderson-Darling on roughly normal data: low statistic, high p.
+        s.run("[haa, paa, aa, caa] = adtest([-1.2 -0.8 -0.5 -0.2 0.1 0.3 0.6 0.9 1.4 1.8]);").unwrap();
+        assert_eq!(scalar(&s, "haa"), 0.0);
+        assert!(scalar(&s, "paa") > 0.5, "paa = {}", scalar(&s, "paa"));
+        assert!(scalar(&s, "aa") > 0.0);
+        assert!((scalar(&s, "caa") - 0.752).abs() < 1e-12);
+
+        // PCA of perfectly correlated data: one nonzero component, 100% explained.
+        s.run("X = [1 2; 2 4; 3 6]; [co, sc, la, ts, ex, mu] = pca(X);").unwrap();
+        assert_eq!(s.get("co").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("sc").unwrap().dims(), (3, 2));
+        let co = vec(&s, "co");
+        assert!((co[0] - 0.447_213_6).abs() < 1e-6 && (co[1] - 0.894_427_2).abs() < 1e-6, "co = {co:?}");
+        let la = vec(&s, "la");
+        assert!((la[0] - 5.0).abs() < 1e-9 && la[1].abs() < 1e-9, "la = {la:?}");
+        let ex = vec(&s, "ex");
+        assert!((ex[0] - 100.0).abs() < 1e-9 && ex[1].abs() < 1e-9);
+        assert_eq!(vec(&s, "mu"), vec![2.0, 4.0]);
+        let sc = vec(&s, "sc");
+        assert!((sc[0] + 5f64.sqrt()).abs() < 1e-9 && sc[3].abs() < 1e-9, "sc = {sc:?}");
+
+        // NumComponents truncates scores, coefficients and latent roots.
+        s.run("[co1, sc1, la1, ts1, ex1] = pca(X, 'NumComponents', 1);").unwrap();
+        assert_eq!(s.get("co1").unwrap().dims(), (2, 1));
+        assert_eq!(s.get("sc1").unwrap().dims(), (3, 1));
+        assert_eq!(vec(&s, "la1"), vec![5.0]);
+        assert_eq!(vec(&s, "ex1"), vec![100.0]);
+    }
+
+    #[test]
+    fn distribution_fit_and_objects() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("g1 = gampdf(2,3,2); g2 = gamcdf(2,3,2); g3 = gaminv(0.3,3,2); b1 = betapdf(0.5,2,3); b2 = betacdf(0.5,2,3); b3 = betainv(0.3,2,3);")
+            .unwrap();
+        assert!((scalar(&s, "g1") - 0.091_969_860_292_860_57).abs() < 1e-10);
+        assert!((scalar(&s, "g2") - 0.080_301_397_071_394_18).abs() < 1e-10);
+        assert!((scalar(&s, "g3") - 3.827_551_588_254_124).abs() < 1e-6);
+        assert!((scalar(&s, "b1") - 1.5).abs() < 1e-10);
+        assert!((scalar(&s, "b2") - 0.6875).abs() < 1e-10);
+        assert!((scalar(&s, "b3") - 0.272_383_942_075_105_36).abs() < 1e-6);
+
+        s.run("c1 = chi2pdf(2,2); c2 = chi2cdf(2,2); c3 = chi2inv(0.95,3); t1 = tpdf(0,10); t2 = tinv(0.975,10); f1 = fpdf(1,5,5); f2 = finv(0.95,5,5);")
+            .unwrap();
+        assert!((scalar(&s, "c1") - 0.183_939_720_585_721_14).abs() < 1e-10);
+        assert!((scalar(&s, "c2") - 0.632_120_558_828_557_7).abs() < 1e-10);
+        assert!((scalar(&s, "c3") - 7.814_727_903_251_179).abs() < 1e-5);
+        assert!((scalar(&s, "t1") - 0.389_108_383_966_031_04).abs() < 1e-10);
+        assert!((scalar(&s, "t2") - 2.228_138_851_964_938_5).abs() < 1e-6);
+        assert!((scalar(&s, "f1") - 0.424_413_181_578_386_87).abs() < 1e-10);
+        assert!((scalar(&s, "f2") - 5.050_329_057_632_646).abs() < 1e-5);
+
+        // fitdist Normal (MLE, n divisor) and the distribution-object interface.
+        s.run("pd = fitdist([1 2 3 4], 'Normal'); pm = pd.mu; ps = pd.sigma; p1 = pdf(pd,1); p2 = cdf(pd,2.5); p3 = icdf(pd,0.975); mm = mean(pd); ss = std(pd); vv = var(pd); md = median(pd);")
+            .unwrap();
+        assert!((scalar(&s, "pm") - 2.5).abs() < 1e-12);
+        assert!((scalar(&s, "ps") - 5f64.sqrt() / 2.0).abs() < 1e-12);
+        assert!((scalar(&s, "p1") - 0.145_074_146_967_845_87).abs() < 1e-9, "p1 = {}", scalar(&s, "p1"));
+        assert!((scalar(&s, "p2") - 0.5).abs() < 1e-8, "p2 = {}", scalar(&s, "p2"));
+        assert!((scalar(&s, "p3") - (2.5 + 1.959_963_984_540_054 * 1.118_033_988_749_895)).abs() < 1e-6);
+        assert!((scalar(&s, "mm") - 2.5).abs() < 1e-12);
+        assert!((scalar(&s, "ss") - 1.118_033_988_749_895).abs() < 1e-12);
+        assert!((scalar(&s, "vv") - 1.25).abs() < 1e-12);
+        assert!((scalar(&s, "md") - 2.5).abs() < 1e-12);
+
+        // Gamma and Beta MLEs match SciPy's fit with location fixed at 0/scale 1.
+        s.run("gd = fitdist([0.5 0.8 1.1 1.4 2.0 2.7 3.5 5.0], 'Gamma'); gdist = gd.DistributionName; ga = gd.a; gb = gd.b; gm = mean(gd); gs = std(gd);")
+            .unwrap();
+        assert_eq!(s.get("gdist"), Some(&Value::Str("Gamma".into())));
+        assert!((scalar(&s, "ga") - 2.186_602_114_063_721_3).abs() < 1e-4, "ga = {}", scalar(&s, "ga"));
+        assert!((scalar(&s, "gb") - 0.971_827_469_813_776_1).abs() < 1e-4);
+        assert!((scalar(&s, "gm") - 2.125).abs() < 1e-6);
+        assert!((scalar(&s, "gs") - 1.437_057_192_095_803).abs() < 1e-5);
+
+        s.run("bd = fitdist([0.1 0.15 0.2 0.3 0.35 0.5 0.6 0.75 0.85], 'Beta'); ba = bd.a; bb = bd.b; bm = mean(bd); bs = std(bd);").unwrap();
+        assert!((scalar(&s, "ba") - 1.431_303_561_354_704_7).abs() < 1e-4, "ba = {}", scalar(&s, "ba"));
+        assert!((scalar(&s, "bb") - 1.911_715_283_469_614).abs() < 1e-4);
+        assert!((scalar(&s, "bm") - 0.428_147_021_537_332_1).abs() < 1e-5);
+        assert!((scalar(&s, "bs") - 0.237_433_940_598_533_46).abs() < 1e-5);
+
+        // Seeded random draws are reproducible and keep the requested shape.
+        s.run("rng(3); X = random(pd, 2, 3); rng(3); Y = random(pd, 2, 3); same = isequal(X, Y);").unwrap();
+        assert_eq!(s.get("X").unwrap().dims(), (2, 3));
+        assert_eq!(scalar(&s, "same"), 1.0);
+
+        // Poisson is fitted by its mean and reuses the discrete kernels.
+        s.run("pp = fitdist([0 1 1 2 2 2 3], 'Poisson'); pl = pp.lambda; ppdf = pdf(pp,2); pcdf = cdf(pp,2); pinv = icdf(pp,0.5);").unwrap();
+        assert!((scalar(&s, "pl") - 11.0 / 7.0).abs() < 1e-12);
+        assert!((scalar(&s, "ppdf") - 0.256_505_414_738_527_6).abs() < 1e-9);
+        assert!((scalar(&s, "pcdf") - 0.790_715_038_822_072_6).abs() < 1e-9);
+        assert_eq!(scalar(&s, "pinv"), 1.0);
+    }
+
+    #[test]
+    fn multivariate_and_multiple_testing() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("p = [0.01 0.02 0.03 0.04]; bf = bonferroni(p); hm = holm(p); bh = benjamini_hochberg(p); sd = sidak(p); [q, h] = mafdr(p);").unwrap();
+        assert_eq!(vec(&s, "bf"), vec![0.04, 0.08, 0.12, 0.16]);
+        assert_eq!(vec(&s, "hm"), vec![0.04, 0.06, 0.06, 0.06]);
+        assert_eq!(vec(&s, "bh"), vec![0.04, 0.04, 0.04, 0.04]);
+        assert_eq!(vec(&s, "q"), vec![0.04, 0.04, 0.04, 0.04]);
+        assert_eq!(vec(&s, "h"), vec![1.0, 1.0, 1.0, 1.0]);
+        assert!((vec(&s, "sd")[0] - 0.039_403_99).abs() < 1e-6);
+        assert!(vec(&s, "sd").iter().zip(vec(&s, "bf").iter()).all(|(a, b)| a < b));
+
+        s.run("[p1, h1, st1] = signrank([1 2 3 4 10], 0); sr = st1.signedrank; [p2, h2, st2] = ranksum([1 2 3 4 5], [2 3 4 5 6]); rs = st2.ranksum;")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.0625).abs() < 1e-12);
+        assert_eq!(scalar(&s, "h1"), 0.0);
+        assert_eq!(scalar(&s, "sr"), 15.0);
+        assert!((scalar(&s, "p2") - 0.397_614_751_956_530_73).abs() < 1e-6);
+        assert_eq!(scalar(&s, "h2"), 0.0);
+        assert_eq!(scalar(&s, "rs"), 23.0);
+
+        s.run("X = [1 4 7; 2 5 8; 3 6 9]; [pk, stk] = kruskalwallis(X); kc = stk.chi2; kd = stk.df; kmr = stk.meanranks; [pg, stg] = kruskalwallis([1 2 3 4 5 6 7 8 9], [1 1 1 2 2 2 3 3 3]);")
+            .unwrap();
+        assert!((scalar(&s, "pk") - 0.027_323_722_447_292_52).abs() < 1e-9);
+        assert!((scalar(&s, "kc") - 7.2).abs() < 1e-9);
+        assert_eq!(scalar(&s, "kd"), 2.0);
+        assert_eq!(vec(&s, "kmr"), vec![2.0, 5.0, 8.0]);
+        assert!((scalar(&s, "pg") - scalar(&s, "pk")).abs() < 1e-12);
+
+        // PCoA recovers a one-dimensional line from its distance matrix.
+        s.run("D = [0 1 2; 1 0 1; 2 1 0]; [Y, e, ex] = pcoa(D); [Y2, e2] = cmdscale(D, 2);").unwrap();
+        assert_eq!(s.get("Y").unwrap().dims(), (3, 1));
+        let y = vec(&s, "Y");
+        assert!((y[0] - 1.0).abs() < 1e-9 && y[1].abs() < 1e-9 && (y[2] + 1.0).abs() < 1e-9, "Y = {y:?}");
+        assert_eq!(vec(&s, "e").len(), 3);
+        assert!((vec(&s, "e")[0] - 2.0).abs() < 1e-12);
+        assert!(vec(&s, "e")[1].abs() < 1e-9 && vec(&s, "e")[2].abs() < 1e-9);
+        assert!((vec(&s, "ex")[0] - 100.0).abs() < 1e-9);
+        assert_eq!(s.get("Y2").unwrap().dims(), (3, 2));
+        assert_eq!(vec(&s, "e2").len(), 3);
+    }
+
+    #[test]
+    fn umap_embedding() {
+        let mut s = Session::new();
+        s.run("rng(4); X = [0 0; 0.1 0; 0 0.1; 0.1 0.1; 5 5; 5.1 5; 5 5.1; 5.1 5.1]; Y = umap(X, 'NumNeighbors', 3, 'NumEpochs', 300);").unwrap();
+        assert_eq!(s.get("Y").unwrap().dims(), (8, 2));
+        let y = s.get("Y").unwrap().to_matrix().unwrap();
+        let mut c = [[0.0f64; 2]; 2];
+        for i in 0..8 {
+            let g = i / 4;
+            for (d, slot) in c[g].iter_mut().enumerate() {
+                *slot += y.get(i, d).unwrap_or(0.0) / 4.0;
+            }
+        }
+        let mut within = 0.0f64;
+        for i in 0..8 {
+            let g = i / 4;
+            let mut r = 0.0;
+            for (d, cv) in c[g].iter().enumerate() {
+                r += (y.get(i, d).unwrap_or(0.0) - cv).powi(2);
+            }
+            within = within.max(r.sqrt());
+        }
+        let between = ((c[0][0] - c[1][0]).powi(2) + (c[0][1] - c[1][1]).powi(2)).sqrt();
+        assert!(between > within, "between {between} within {within}");
+
+        // The nearest neighbour of every point stays in its own cluster.
+        for i in 0..8 {
+            let mut best = f64::INFINITY;
+            let mut label = i / 4;
+            for j in 0..8 {
+                if i == j {
+                    continue;
+                }
+                let mut r = 0.0;
+                for d in 0..2 {
+                    r += (y.get(i, d).unwrap_or(0.0) - y.get(j, d).unwrap_or(0.0)).powi(2);
+                }
+                if r < best {
+                    best = r;
+                    label = j / 4;
+                }
+            }
+            assert_eq!(label, i / 4, "point {i} crosses clusters");
+        }
+
+        s.run("rng(7); A = umap(X, 'NumNeighbors', 3); rng(7); B = umap(X, 'NumNeighbors', 3); same = isequal(A, B);").unwrap();
+        assert_eq!(s.get("same"), Some(&Value::Num(1.0)));
+        s.run("Z = umap(X, 'NumNeighbors', 3, 'NumComponents', 3, 'NumEpochs', 40);").unwrap();
+        assert_eq!(s.get("Z").unwrap().dims(), (8, 3));
+    }
+
+    #[test]
+    fn corpus_string_and_table_helpers() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("c = {'alpha','beta','gamma'}; ca = contains(c,'et'); cs = startsWith(c,'a'); ce = endsWith(c,'a'); joined = strjoin(c,'-'); parts = strsplit('a,b,c',','); lens = strlength(c);")
+            .unwrap();
+        assert_eq!(vec(&s, "ca"), vec![0.0, 1.0, 0.0]);
+        assert_eq!(vec(&s, "cs"), vec![1.0, 0.0, 0.0]);
+        assert_eq!(vec(&s, "ce"), vec![1.0, 1.0, 1.0]);
+        assert_eq!(s.get("joined"), Some(&Value::Str("alpha-beta-gamma".into())));
+        assert_eq!(s.get("parts").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 3)), Some(true));
+        assert_eq!(vec(&s, "lens"), vec![5.0, 4.0, 5.0]);
+
+        s.run(
+            "T = array2table([1 2; 3 4], 'VariableNames', {'x','y'}); names = T.Properties.VariableNames; colx = T.x; nr = rows(T); nh = height(T);",
+        )
+        .unwrap();
+        assert_eq!(s.get("names").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 2)), Some(true));
+        assert_eq!(vec(&s, "colx"), vec![1.0, 3.0]);
+        assert_eq!(scalar(&s, "nr"), 2.0);
+        assert_eq!(scalar(&s, "nh"), 2.0);
+
+        s.run("miss = ismissing([1 NaN; 3 4]);").unwrap();
+        assert_eq!(vec(&s, "miss"), vec![0.0, 0.0, 1.0, 0.0]);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("matcraft_fileread_{}.txt", std::process::id()));
+        std::fs::write(&path, "hello\nworld").unwrap();
+        let p = path.to_string_lossy().replace('\\', "/");
+        s.run(&format!("txt = fileread('{p}'); here = isfolder('{}'); nope = isfolder('{p}');", dir.to_string_lossy().replace('\\', "/"))).unwrap();
+        assert_eq!(s.get("txt"), Some(&Value::Str("hello\nworld".into())));
+        assert_eq!(scalar(&s, "here"), 1.0);
+        assert_eq!(scalar(&s, "nope"), 0.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ode23_and_ode23s() {
+        let mut s = Session::new();
+        s.run(
+            "f = @(t,y) -y; [t3,y3] = ode23(f, [0 1], 1); e3 = abs(y3(end) - exp(-1)); \
+             g = @(t,y) -100*y; [ts,ys] = ode23s(g, [0 1], 1); es = abs(ys(end));",
+        )
+        .unwrap();
+        let e3 = s.get("e3").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY);
+        assert!(e3 < 1e-3, "ode23 error = {e3}");
+        let es = s.get("es").and_then(|v| v.scalar().ok()).unwrap_or(f64::INFINITY);
+        assert!(es < 1e-6, "ode23s stiff residual = {es}");
+        assert!(s.get("t3").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
+        assert!(s.get("ts").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) > 2);
+    }
+
+    #[test]
+    fn dde23_delay_history_and_outputs() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        s.run(
+            "f = @(t,y,Z) -Z(:,1); [t,y] = dde23(f, 1, 1, [0 2], odeset('RelTol',1e-6,'AbsTol',1e-9)); err = abs(y(end) + 0.5); \
+             sol = dde23(f, 1, @(t) 1, [0 1 2]); sy = sol.y(1,end); sx = numel(sol.x); slv = sol.solver;",
+        )
+        .unwrap();
+        assert!(scalar(&s, "err") < 1e-5, "DDE error = {}", scalar(&s, "err"));
+        assert!((scalar(&s, "sy") + 0.5).abs() < 1e-5, "functional history y(2) = {}", scalar(&s, "sy"));
+        assert!(scalar(&s, "sx") >= 3.0);
+        assert_eq!(s.get("slv"), Some(&Value::Str("dde23".into())));
+
+        // Two lags: y' = -0.5*y(t-0.5) - 0.5*y(t-1), history 1.
+        s.run("g = @(t,y,Z) -0.5*Z(:,1) - 0.5*Z(:,2); [t2,y2] = dde23(g, [0.5 1], 1, [0 1 2]);").unwrap();
+        assert!(s.get("t2").and_then(|v| v.to_matrix().ok()).map(|m| m.numel()).unwrap_or(0) >= 3);
+
+        s.run("try, dde23(f, 0, 1, [0 1]); catch e, msg = e.message; end").unwrap();
+        if let Some(Value::Str(m)) = s.get("msg") {
+            assert!(m.contains("positive"), "lag error = {m}");
+        } else {
+            panic!("non-positive dde23 lag did not error");
+        }
+    }
+
+    #[test]
+    fn ode_integration() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        // Non-stiff scalar decay: y' = -2y, exact y(2) = exp(-4).
+        s.run("[t1, y1] = ode45(@(t,y) -2*y, [0 2], 1, odeset('RelTol',1e-8,'AbsTol',1e-10)); a1 = y1(end);").unwrap();
+        assert!((scalar(&s, "a1") - (-4f64).exp()).abs() < 1e-6, "a1 = {}", scalar(&s, "a1"));
+        assert!(vec(&s, "t1").windows(2).all(|w| w[1] > w[0]));
+
+        // Harmonic oscillator keeps unit amplitude and returns to [1, 0].
+        s.run("[t2, Y2] = ode45(@(t,y) [y(2); -y(1)], [0 2*pi], [1; 0]); e2 = Y2(end,1); f2 = Y2(end,2);").unwrap();
+        assert!((scalar(&s, "e2") - 1.0).abs() < 1e-3, "e2 = {}", scalar(&s, "e2"));
+        assert!(scalar(&s, "f2").abs() < 1e-3);
+
+        // Requested output grid is honoured exactly.
+        s.run("tout = 0:0.1:1; [t3, y3] = ode45(@(t,y) -2*y, tout, 1); n3 = numel(t3); a3 = y3(end); tend = t3(end);").unwrap();
+        assert_eq!(scalar(&s, "n3"), 11.0);
+        assert!((scalar(&s, "tend") - 1.0).abs() < 1e-12);
+        assert!((scalar(&s, "a3") - (-2f64).exp()).abs() < 1e-6);
+
+        // Stiff linear problem: y' = -1000(y - cos t) - sin t, exact y = cos t.
+        s.run("[t4, y4] = ode15s(@(t,y) -1000*(y-cos(t))-sin(t), [0 1], 1, odeset('RelTol',1e-6,'AbsTol',1e-9)); a4 = y4(end); n4 = numel(t4);")
+            .unwrap();
+        assert!((scalar(&s, "a4") - 1f64.cos()).abs() < 1e-5, "a4 = {}", scalar(&s, "a4"));
+        assert!(scalar(&s, "n4") > 2.0);
+
+        // Robertson kinetics exercise the nonlinear Newton path.
+        s.run("rob = @(t,y) [-0.04*y(1)+1e4*y(2)*y(3); 0.04*y(1)-1e4*y(2)*y(3)-3e7*y(2)^2; 3e7*y(2)^2]; [t5, Y5] = ode15s(rob, [0 10], [1;0;0], odeset('RelTol',1e-4,'AbsTol',1e-6)); r1 = Y5(end,1); r3 = Y5(end,3);")
+            .unwrap();
+        assert!((scalar(&s, "r1") - 0.841_369_924).abs() < 1e-3, "r1 = {}", scalar(&s, "r1"));
+        assert!((scalar(&s, "r3") - 0.158_613_842).abs() < 1e-3);
+
+        // odeset/odeget round-trip and MaxStep is respected.
+        s.run("o = odeset('RelTol', 1e-7, 'MaxStep', 0.05); rt = odeget(o,'RelTol'); ms = odeget(o,'MaxStep'); default_rt = odeget(o,'NoSuchOption',1e-3); [t6, y6] = ode45(@(t,y) -y, [0 1], 1, o); hm = max(diff(t6)); a6 = y6(end);")
+            .unwrap();
+        assert_eq!(scalar(&s, "rt"), 1e-7);
+        assert_eq!(scalar(&s, "ms"), 0.05);
+        assert_eq!(scalar(&s, "default_rt"), 1e-3);
+        assert!(scalar(&s, "hm") <= 0.050_001, "max step = {}", scalar(&s, "hm"));
+        assert!((scalar(&s, "a6") - (-1f64).exp()).abs() < 1e-5);
+
+        // NonNegative clamps a crossing trajectory at zero.
+        s.run("[t7, y7] = ode45(@(t,y) -y, [0 1], -1, odeset('NonNegative', 1)); a7 = y7(end);").unwrap();
+        assert_eq!(scalar(&s, "a7"), 0.0);
+    }
+
+    #[test]
+    fn anova_and_multiple_comparisons() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("[p1, tbl1, st1] = anova1([1 4 7; 2 5 8; 3 6 9]); m1 = st1.means; n1 = st1.n; s1 = st1.s; d1 = st1.df; g1 = tbl1{2,1}; ssb = tbl1{2,2}; ssw = tbl1{3,2}; sst = tbl1{4,2};")
+            .unwrap();
+        assert!((scalar(&s, "p1") - 0.001).abs() < 1e-9);
+        assert_eq!(vec(&s, "m1"), vec![2.0, 5.0, 8.0]);
+        assert_eq!(vec(&s, "n1"), vec![3.0, 3.0, 3.0]);
+        assert_eq!(scalar(&s, "s1"), 1.0);
+        assert_eq!(scalar(&s, "d1"), 6.0);
+        assert_eq!(s.get("g1"), Some(&Value::Str("Groups".into())));
+        assert_eq!(scalar(&s, "ssb"), 54.0);
+        assert_eq!(scalar(&s, "ssw"), 6.0);
+        assert_eq!(scalar(&s, "sst"), 60.0);
+
+        s.run("[p2, tbl2, st2] = anova2([1 2 4; 2 4 5; 3 5 7]); c2 = tbl2{2,1}; r2 = tbl2{3,1}; f2 = tbl2{2,5}; s2 = st2.s; d2 = st2.df;").unwrap();
+        assert!((scalar(&s, "p2") - 0.001_479_289_940_828_354_4).abs() < 1e-9);
+        assert_eq!(s.get("c2"), Some(&Value::Str("Columns".into())));
+        assert_eq!(s.get("r2"), Some(&Value::Str("Rows".into())));
+        assert!((scalar(&s, "f2") - 50.0).abs() < 1e-9);
+        assert!((scalar(&s, "s2") - 0.408_248_290_463_863_4).abs() < 1e-9);
+        assert_eq!(scalar(&s, "d2"), 4.0);
+
+        s.run("[p3, tbl3, st3] = anova2([1 2 3; 2 3 4; 4 5 6; 5 6 7], 2); i3 = tbl3{4,1}; s3 = st3.s; d3 = st3.df;").unwrap();
+        assert!((scalar(&s, "p3") - 0.020_285_499_624_342_562).abs() < 1e-9);
+        assert_eq!(s.get("i3"), Some(&Value::Str("Interaction".into())));
+        assert!((scalar(&s, "s3") - 1.0 / 2f64.sqrt()).abs() < 1e-9);
+        assert_eq!(scalar(&s, "d3"), 6.0);
+
+        // Bonferroni and LSD pairwise comparisons.
+        s.run("[p1, tbl1, st1] = anova1([1 4 7; 2 5 8; 3 6 9]); cb = multcompare(st1, 'CType', 'bonferroni'); cl = multcompare(st1, 'CType', 'lsd'); ct = multcompare(st1);")
+            .unwrap();
+        assert!((s.get("cb").unwrap().to_matrix().unwrap().get(0, 5).unwrap_or(0.0) - 0.031_205_162_806_392_295).abs() < 1e-9);
+        assert!((s.get("cb").unwrap().to_matrix().unwrap().get(1, 5).unwrap_or(0.0) - 0.000_974_924_037_813_185_2).abs() < 1e-9);
+        assert!((s.get("cl").unwrap().to_matrix().unwrap().get(0, 5).unwrap_or(0.0) - 0.010_401_720_935_464_098).abs() < 1e-9);
+        assert!((s.get("cl").unwrap().to_matrix().unwrap().get(0, 2).unwrap_or(0.0) + 4.997_9).abs() < 1e-3);
+        let tukey = s.get("ct").unwrap().to_matrix().unwrap();
+        let tukey_p = tukey.get(0, 5).unwrap_or(0.0);
+        assert!(tukey_p > 0.01 && tukey_p < 0.05, "tukey p = {tukey_p}");
+        assert!(tukey.get(0, 2).unwrap_or(0.0) < -3.0 && tukey.get(0, 4).unwrap_or(0.0) < 0.0);
+
+        // Friedman rank test: three identical row rankings.
+        s.run("[pf, tblf, stf] = friedman([1 2 3; 1 2 3; 1 2 3]); cf = stf.chi2; df = stf.df; mr = stf.meanranks;").unwrap();
+        assert!((scalar(&s, "pf") - 0.049_787_068_367_863_95).abs() < 1e-9);
+        assert!((scalar(&s, "cf") - 6.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "df"), 2.0);
+        assert_eq!(vec(&s, "mr"), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn control_mimo_frequency_response() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Diagonal 2x2 system: H11 = 1/(s+1), H22 = 1/(s+2).
+        s.run("sys = ss([-1 0; 0 -2], eye(2), eye(2), zeros(2,2)); [mag, ph, w] = bode(sys, [0 1]); H = freqresp(sys, [0 1]); m11 = mag(1,1,1); m22 = mag(2,2,1); m11b = mag(1,1,2); m22b = mag(2,2,2); p11b = ph(1,1,2); p22b = ph(2,2,2);")
+            .unwrap();
+        assert_eq!(s.get("mag").unwrap().dims_vec(), vec![2, 2, 2]);
+        assert_eq!(s.get("ph").unwrap().dims_vec(), vec![2, 2, 2]);
+        assert_eq!(s.get("H").unwrap().dims_vec(), vec![4, 2]);
+        assert_eq!(scalar(&s, "m11"), 1.0);
+        assert_eq!(scalar(&s, "m22"), 0.5);
+        assert!((scalar(&s, "m11b") - 0.5f64.sqrt()).abs() < 1e-9);
+        assert!((scalar(&s, "m22b") - 0.2f64.sqrt()).abs() < 1e-9);
+        assert!((scalar(&s, "p11b") + 45.0).abs() < 1e-9);
+        assert!((scalar(&s, "p22b") + 26.565_051_177_457_8).abs() < 1e-6);
+        s.run("h11r = real(H(1,1)); h11i = imag(H(1,1)); h12r = real(H(1,2)); h12i = imag(H(1,2)); h41 = real(H(4,1)); h42r = real(H(4,2)); h42i = imag(H(4,2));")
+            .unwrap();
+        assert_eq!(scalar(&s, "h11r"), 1.0);
+        assert_eq!(scalar(&s, "h11i"), 0.0);
+        assert!((scalar(&s, "h12r") - 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "h12i") + 0.5).abs() < 1e-9);
+        assert_eq!(scalar(&s, "h41"), 0.5);
+        assert!((scalar(&s, "h42r") - 0.4).abs() < 1e-9);
+        assert!((scalar(&s, "h42i") + 0.2).abs() < 1e-9);
+
+        // One input, two outputs, nonzero D: H1 = 1 + 1/(s+1), H2 = 2 + 2/(s+2).
+        s.run("sys2 = ss([-1 0; 0 -2], [1; 2], [1 0; 0 1], [1; 2]); [mag2, ph2] = bode(sys2, [0 1]); H2 = freqresp(sys2, 1); a = mag2(1,1,1); b = mag2(2,1,1); hr1 = real(H2(1,1)); hi1 = imag(H2(1,1)); hr2 = real(H2(2,1)); hi2 = imag(H2(2,1));")
+            .unwrap();
+        assert_eq!(s.get("mag2").unwrap().dims_vec(), vec![2, 1, 2]);
+        assert_eq!(s.get("H2").unwrap().dims_vec(), vec![2, 1]);
+        assert_eq!(scalar(&s, "a"), 2.0);
+        assert_eq!(scalar(&s, "b"), 3.0);
+        assert!((scalar(&s, "hr1") - 1.5).abs() < 1e-9);
+        assert!((scalar(&s, "hi1") + 0.5).abs() < 1e-9);
+        assert!((scalar(&s, "hr2") - 2.8).abs() < 1e-9);
+        assert!((scalar(&s, "hi2") + 0.4).abs() < 1e-9);
+
+        // SISO output shapes are unchanged.
+        s.run("[ms, ps] = bode(tf([1], [1 1]), [0.1 1 10]); Hs = freqresp(tf([1], [1 1]), [0.1 1 10]);").unwrap();
+        assert_eq!(s.get("ms").unwrap().dims_vec(), vec![1, 3]);
+        assert_eq!(s.get("Hs").unwrap().dims_vec(), vec![1, 3]);
+    }
+
+    #[test]
+    fn filesystem_path_shell_and_globals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_fs_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("p0 = path;").unwrap();
+        s.run(&format!("addpath('{ds}', '-end'); p1 = path; has1 = contains(p1, '{ds}'); rmpath('{ds}'); p2 = path; has2 = contains(p2, '{ds}');"))
+            .unwrap();
+        assert_eq!(scalar(&s, "has1"), 1.0);
+        assert_eq!(scalar(&s, "has2"), 0.0);
+
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        s.run(&format!("gp = genpath('{ds}'); gsub = contains(gp, 'sub');")).unwrap();
+        assert_eq!(scalar(&s, "gsub"), 1.0);
+
+        let made = dir.join("made");
+        let made_s = made.to_string_lossy().replace('\\', "/");
+        s.run(&format!("md = mkdir('{made_s}'); mf = isfolder('{made_s}'); rd = rmdir('{made_s}');")).unwrap();
+        assert_eq!(scalar(&s, "md"), 1.0);
+        assert_eq!(scalar(&s, "mf"), 1.0);
+        assert_eq!(scalar(&s, "rd"), 1.0);
+
+        s.run("[st, out] = system('echo matcraft_shell_ok'); [sd, od] = dos('echo dos_ok'); [su, ou] = unix('echo unix_ok');").unwrap();
+        assert_eq!(scalar(&s, "st"), 0.0);
+        assert_eq!(scalar(&s, "sd"), 0.0);
+        assert_eq!(scalar(&s, "su"), 0.0);
+        for (name, needle) in [("out", "matcraft_shell_ok"), ("od", "dos_ok"), ("ou", "unix_ok")] {
+            match s.get(name) {
+                Some(Value::Str(text)) => assert!(text.contains(needle), "{name} = {text:?}"),
+                other => panic!("{name} was not a string: {other:?}"),
+            }
+        }
+
+        let path_file = dir.join("path.txt");
+        let pf = path_file.to_string_lossy().replace('\\', "/");
+        s.run(&format!("sp = savepath('{pf}');")).unwrap();
+        assert_eq!(scalar(&s, "sp"), 0.0);
+        let loaded = load_paths_from(&path_file);
+        let cwd = std::env::current_dir().unwrap();
+        assert!(loaded.contains(&cwd), "saved path did not contain cwd: {loaded:?}");
+
+        std::fs::write(dir.join("setg.m"), "function setg(v)\nglobal gv\ngv = v;\nend\n").unwrap();
+        std::fs::write(dir.join("getg.m"), "function y = getg()\nglobal gv\ny = gv;\nend\n").unwrap();
+        s.run(&format!("addpath('{ds}'); setg(42); gval = getg(); rmpath('{ds}');")).unwrap();
+        assert_eq!(scalar(&s, "gval"), 42.0);
+
+        s.run("path(p0);").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_class_helpers() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("p = inputParser; addRequired(p, 'x', @isnumeric); addOptional(p, 'y', 10); addParameter(p, 'Method', 'fast', @ischar); parse(p, 3, 'method', 'slow'); x = p.Results.x; y = p.Results.y; method = p.Results.Method;")
+            .unwrap();
+        assert_eq!(scalar(&s, "x"), 3.0);
+        assert_eq!(scalar(&s, "y"), 10.0);
+        assert_eq!(s.get("method"), Some(&Value::Str("slow".into())));
+
+        s.run("q = inputParser; q.KeepUnmatched = true; addParameter(q, 'Alpha', 0.05); addParamValue(q, 'Beta', 2); parse(q, 'Alph', 0.1, 'Gamma', 7); qa = q.Results.Alpha; qb = q.Results.Beta; qu = numel(q.Unmatched);")
+            .unwrap();
+        assert_eq!(scalar(&s, "qa"), 0.1);
+        assert_eq!(scalar(&s, "qb"), 2.0);
+        assert_eq!(scalar(&s, "qu"), 2.0);
+
+        s.run("r = inputParser; addRequired(r, 'x'); parse(r, 1); rx = r.Results.x;").unwrap();
+        assert_eq!(scalar(&s, "rx"), 1.0);
+
+        assert!(s.run("bad = inputParser; addRequired(bad, 'x'); parse(bad);").is_err());
+        assert!(s.run("bad2 = inputParser; addRequired(bad2, 'x', @ischar); parse(bad2, 3);").is_err());
+
+        s.run("a = [1;2;3]; b = [4;5;6]; T = table(a, b); names = T.Properties.VariableNames; ta = T.a; ht = height(T); wt = width(T);").unwrap();
+        assert_eq!(s.get("names").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 2)), Some(true));
+        assert_eq!(s.get("ta").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(scalar(&s, "ht"), 3.0);
+        assert_eq!(scalar(&s, "wt"), 2.0);
+
+        s.run("T2 = table([1;2], [3;4], 'VariableNames', {'x','y'}); t2x = T2.x; arr = table2array(T2);").unwrap();
+        assert_eq!(s.get("t2x").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert_eq!(s.get("arr").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0, 4.0]));
+
+        s.run("ss = string('abc'); sc = strings(2,3); is1 = isstring(ss); is2 = isstring(sc); sl = strlength(ss); sn = string(5);").unwrap();
+        assert_eq!(scalar(&s, "is1"), 1.0);
+        assert_eq!(scalar(&s, "is2"), 1.0);
+        assert_eq!(scalar(&s, "sl"), 3.0);
+        assert_eq!(s.get("sn"), Some(&Value::Str("5".into())));
+        assert_eq!(s.get("sc").unwrap().dims(), (2, 3));
+    }
+
+    #[test]
+    fn corpus_compatibility_fixes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_corpus_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Empty-cell growth and varargin forwarding.
+        s.run("v = {}; nv = numel(v); c = {}; c{end+1,1} = 'a'; c{end+1,1} = 'b';").unwrap();
+        assert_eq!(scalar(&s, "nv"), 0.0);
+        assert_eq!(s.get("c").unwrap().dims(), (2, 1));
+        std::fs::write(dir.join("fwd.m"), "function y = fwd(varargin)\ny = numel(varargin);\nend\n").unwrap();
+        s.run(&format!("addpath('{ds}'); y0 = fwd(); y2 = fwd(1,2);")).unwrap();
+        assert_eq!(scalar(&s, "y0"), 0.0);
+        assert_eq!(scalar(&s, "y2"), 2.0);
+
+        // String repmat and parenthesised string assignment into cellstr.
+        s.run("r = repmat(' ', 3, 1); r(2) = string('x'); rv = r{2}; rsz = size(r);").unwrap();
+        assert_eq!(s.get("rv"), Some(&Value::Str("x".into())));
+        assert_eq!(s.get("rsz").unwrap().dims(), (1, 2));
+
+        // Cellstr logic and char-to-number conversion.
+        s.run("e = erase('gnl-CMER-X', 'gnl-CMER-'); rp = replace('a-b','-','+'); cm = strcmp({'a','b'}, 'a'); sd = str2double({'1','2.5','x'});")
+            .unwrap();
+        assert_eq!(s.get("e"), Some(&Value::Str("X".into())));
+        assert_eq!(s.get("rp"), Some(&Value::Str("a+b".into())));
+        assert_eq!(s.get("cm").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0]));
+        let sd = s.get("sd").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        assert_eq!(sd.get(..2), Some(&[1.0, 2.5][..]));
+        assert!(sd.get(2).map(|x| x.is_nan()).unwrap_or(false));
+
+        // Implicit expansion through the interpreter.
+        s.run("X = ones(3,2) - [10 20]; xd = X(3,2);").unwrap();
+        assert_eq!(scalar(&s, "xd"), -19.0);
+
+        // Table dot-assignment, subsetting, sorting and emptiness.
+        s.run("T = table(); T.name = {'b';'a';'c'}; T.v = [2;1;3]; th = height(T); tw = width(T); U = T([1 3], :); uh = height(U); S = sortrows(T,'v','ascend'); sv = S.v; sn = S.name; em = isempty(T([],:));")
+            .unwrap();
+        assert_eq!(scalar(&s, "th"), 3.0);
+        assert_eq!(scalar(&s, "tw"), 2.0);
+        assert_eq!(scalar(&s, "uh"), 2.0);
+        assert_eq!(s.get("sv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(s.get("sn").map(|v| matches!(v, Value::Cell(c) if c.items.len() == 3 && c.items[0] == Value::Str("a".into()))), Some(true));
+        assert_eq!(scalar(&s, "em"), 1.0);
+
+        // Colormap/colour helpers and graphics property pairs.
+        s.run("lc = lines(8); lsz = size(lc); vc = validatecolor([1 0 0]); f = figure('Position',[0 0 10 10],'Color','w'); rectangle('Position',[0 0 1 1],'Curvature',1,'FaceColor',[1 0 0]); patch([0 1 1],[0 0 1],'b'); daspect([1 1 1]); h = f.findobj('Type','text'); set(h,'FontSize',11);")
+            .unwrap();
+        assert_eq!(s.get("lsz").unwrap().dims(), (1, 2));
+        assert_eq!(s.get("lsz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![8.0, 3.0]));
+        assert_eq!(s.get("vc").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 0.0]));
+
+        // Text table read/write: quoted fields, tab delimiter and preserved names.
+        std::fs::write(dir.join("t.tsv"), "sample name\tvalue\tnote\na\t1.5\t\"x\ty\"\nb\t2\tz\n").unwrap();
+        s.run(&format!("Tt = readtable('{ds}/t.tsv','FileType','text','Delimiter','\\t','VariableNamingRule','preserve'); th2 = height(Tt); tw2 = width(Tt); nm = Tt.('sample name'); vv = Tt.value;"))
+            .unwrap();
+        assert_eq!(scalar(&s, "th2"), 2.0);
+        assert_eq!(scalar(&s, "tw2"), 3.0);
+        assert_eq!(s.get("nm").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2 && c.items[0] == Value::Str("a".into()))), Some(true));
+        assert_eq!(s.get("vv").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.5, 2.0]));
+        s.run(&format!("writetable(Tt,'{ds}/out.csv'); Tb = readtable('{ds}/out.csv'); bh = height(Tb); bw = width(Tb);")).unwrap();
+        assert_eq!(scalar(&s, "bh"), 2.0);
+        assert_eq!(scalar(&s, "bw"), 3.0);
+
+        // mfilename('fullpath') inside a function.
+        std::fs::write(dir.join("mfp.m"), "function p = mfp()\np = mfilename('fullpath');\nend\n").unwrap();
+        s.run("mp = mfp();").unwrap();
+        assert!(matches!(s.get("mp"), Some(Value::Str(p)) if p.ends_with("mfp.m")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maps_graphics_tables_text_json_and_math() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_extra_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // containers.Map
+        s.run("m = containers.Map('KeyType','char','ValueType','double'); m('a')=1; m('b')=2; mc=m.Count; mk=m.isKey('a'); m.k=1; keys1=m.keys(); vals1=m.values(); m.remove('b'); mc2=m.Count;")
+            .unwrap();
+        assert_eq!(scalar(&s, "mc"), 2.0);
+        assert_eq!(scalar(&s, "mk"), 1.0);
+        assert_eq!(scalar(&s, "mc2"), 1.0);
+        assert_eq!(s.get("keys1").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2)), Some(true));
+
+        // diary
+        let diary = dir.join("diary.txt");
+        let dpath = diary.to_string_lossy().replace('\\', "/");
+        s.run(&format!("diary('{dpath}'); disp('diary payload'); diary off;")).unwrap();
+        let logged = std::fs::read_to_string(&diary).unwrap_or_default();
+        assert!(logged.contains("diary payload"), "diary content: {logged:?}");
+
+        // graphics: random data, ticks/labels, tiles, barh, yline, handles, appdata
+        let svg = dir.join("gfx.svg");
+        let spath = svg.to_string_lossy().replace('\\', "/");
+        s.run(&format!(
+            "figure; t=tiledlayout(2,2); nexttile; plot(1:8, rand(1,8)); xticks(1:4); xticklabels({{'A','B','C','D'}}); xtickangle(30); yline(0.5); nexttile; barh([3 1 2]); nexttile; bar(rand(4,1)); nexttile; scatter(rand(10,1),rand(10,1)); sgtitle('compat title'); h=gobjects(2,1); ip=isprop(h(1),'Position'); ig=isgraphics(h(1)); setappdata(1,'k',42); av=getappdata(1,'k'); saveas('{spath}');"
+        ))
+        .unwrap();
+        assert_eq!(scalar(&s, "ip"), 1.0);
+        assert_eq!(scalar(&s, "ig"), 1.0);
+        assert_eq!(scalar(&s, "av"), 42.0);
+        let svg_text = std::fs::read_to_string(&svg).unwrap_or_default();
+        assert!(svg_text.contains("compat title"));
+        assert!(svg_text.contains(">A<"));
+        assert!(svg_text.matches("stroke-width=\"1.2\"").count() >= 2);
+        assert!(svg_text.contains("fill-opacity=\"0.75\""));
+
+        // table conversions and editing
+        s.run("T=table([1;2;3],{'a';'b';'c'},'VariableNames',{'x','name'}); C=table2cell(T); T2=cell2table(C,'VariableNames',{'x','name'}); S=struct('x',[1;2],'name',{'a';'b'}); T3=struct2table(S); C2=struct2cell(S); D=cell2struct({'a',1;'b',2},{'name','v'},2); T4=addvars(T,[4;5;6],'NewVariableNames',{'z'}); T5=setvartype(T,{'x'},'char'); h2=height(T2); h3=height(T3); w4=width(T4);")
+            .unwrap();
+        assert_eq!(scalar(&s, "h2"), 3.0);
+        assert_eq!(scalar(&s, "h3"), 2.0);
+        assert_eq!(scalar(&s, "w4"), 3.0);
+        assert_eq!(s.get("C2").unwrap().dims(), (2, 1));
+        assert_eq!(s.get("D").map(|v| matches!(v, Value::Struct(st) if st.rows() == 2)), Some(true));
+        assert!(matches!(s.get("T5"), Some(Value::Object(o)) if o.prop("x").map(|v| matches!(v, Value::Cell(_))).unwrap_or(false)));
+
+        // text helpers
+        s.run("f=findstr('ababa','aba'); eb=extractBefore('hello.world','.'); ea=extractAfter('hello.world','.'); ib=insertBefore('abc','b','X'); il=isletter('a1B'); ip=isstrprop('a1 ','alpha'); sl=splitlines(sprintf('one\\ntwo\\n')); co=compose('%d',5);")
+            .unwrap();
+        assert_eq!(s.get("f").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 3.0]));
+        assert_eq!(s.get("eb"), Some(&Value::Str("hello".into())));
+        assert_eq!(s.get("ea"), Some(&Value::Str("world".into())));
+        assert_eq!(s.get("ib"), Some(&Value::Str("aXbc".into())));
+        assert_eq!(s.get("il").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 1.0]));
+        assert_eq!(s.get("ip").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 0.0]));
+        assert_eq!(s.get("sl").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2)), Some(true));
+        assert_eq!(s.get("co"), Some(&Value::Str("5".into())));
+
+        // JSON
+        s.run("j=jsonencode(struct('a',1,'b',{{'x','y'}})); d=jsondecode(j); da=d.a; db=d.b{1}; jn=jsondecode('[1,2,3]');").unwrap();
+        assert_eq!(scalar(&s, "da"), 1.0);
+        assert_eq!(s.get("db"), Some(&Value::Str("x".into())));
+        assert_eq!(s.get("jn").unwrap().dims(), (3, 1));
+
+        // math helpers
+        s.run("nk=nchoosek(5,2); nv=nchoosek([1 2 3],2); gl=gammaln(5); hc=hygecdf(2,50,5,10); tb=tabulate([1 1 2]); cr=corr([1 2 3;2 4 6;3 6 9]); pd=pdist([0 0;3 4;6 8]); sq=squareform(pd); vn=vecnorm([3 4;6 8]); bd=blkdiag([1 2;3 4],5); mc=mat2cell(ones(2,3),[1 1],[1 2]); gr=gradient([1 4 9]); ex=expm([0 1;0 0]);")
+            .unwrap();
+        assert_eq!(scalar(&s, "nk"), 10.0);
+        assert_eq!(s.get("nv").unwrap().dims(), (3, 2));
+        assert!((scalar(&s, "gl") - 24f64.ln()).abs() < 1e-9);
+        assert!((scalar(&s, "hc") - 0.951_739_696_8).abs() < 1e-6);
+        assert_eq!(s.get("tb").unwrap().dims(), (2, 3));
+        assert_eq!(s.get("cr").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("sq").unwrap().dims(), (3, 3));
+        let vn = s.get("vn").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        assert!((vn[0] - 6.708_203_932_5).abs() < 1e-9 && (vn[1] - 8.944_271_91).abs() < 1e-9);
+        assert_eq!(s.get("bd").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("mc").unwrap().dims(), (2, 2));
+        assert_eq!(s.get("gr").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![3.0, 4.0, 5.0]));
+        assert_eq!(s.get("ex").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 0.0, 1.0, 1.0]));
+
+        s.run("ib=isbetween([1 5 10],2,8); io=isoutlier([1 2 3 100]); lk=linkage(pdist([0 0;1 0;0 1;5 5])); pc=partialcorr([1 2 4;2 5 3;3 1 6;4 7 2;5 4 8]);")
+            .unwrap();
+        assert_eq!(s.get("ib").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0, 1.0, 0.0]));
+        assert_eq!(s.get("io").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(s.get("lk").unwrap().dims(), (3, 3));
+        assert_eq!(s.get("pc").unwrap().dims(), (3, 3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grouping_objects_ode_and_image_extras() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("matcraft_final_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        s.run("T1=table({'a';'b';'c'},[1;2;3],'VariableNames',{'k','x'}); T2=table({'a';'b';'d'},[10;20;40],'VariableNames',{'k','y'}); J=join(T1,T2,'Keys',{'k'}); jh=height(J); G=groupsummary(T1,'k','mean'); gh=height(G); F=table([1;NaN;3],'VariableNames',{'z'}); F2=fillmissing(F,'previous'); fz=F2.z; R=rmmissing(F); rh=height(R); [g,id]=findgroups(T1.k); gn=numel(id);")
+            .unwrap();
+        assert_eq!(scalar(&s, "jh"), 2.0);
+        assert_eq!(scalar(&s, "gh"), 3.0);
+        assert_eq!(s.get("fz").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 1.0, 3.0]));
+        assert_eq!(scalar(&s, "rh"), 2.0);
+        assert_eq!(scalar(&s, "gn"), 3.0);
+
+        s.run("c=categorical({'b','a','b'}); cats=categories(c); cc=countcats(c); d=datetime('now','Format','yyyy-MM-dd'); ds=char(d);").unwrap();
+        assert_eq!(s.get("cats").map(|v| matches!(v, Value::Cell(c) if c.numel() == 2)), Some(true));
+        assert_eq!(s.get("cc").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+        assert!(matches!(s.get("ds"), Some(Value::Str(x)) if !x.is_empty()));
+
+        s.run("x=(1:10)'; y=2*x+1; m=fitlm(x,y); b=m.Coefficients.Estimate; r2=m.Rsquared.Ordinary;").unwrap();
+        let b = s.get("b").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        assert!((b[0] - 1.0).abs() < 1e-9 && (b[1] - 2.0).abs() < 1e-9);
+        assert!((scalar(&s, "r2") - 1.0).abs() < 1e-9);
+
+        let svg = dir.join("box.svg");
+        let spath = svg.to_string_lossy().replace('\\', "/");
+        s.run(&format!("figure; boxplot(randn(20,2)); saveas('{spath}');")).unwrap();
+        assert!(std::fs::read_to_string(&svg).map(|x| x.contains("stroke")).unwrap_or(false));
+
+        s.run("p=parpool(2); fut=parfeval(@(x)x*2,1,21); pv=fetchOutputs(fut); oc=onCleanup(@() 1); delete(oc); delete(p);").unwrap();
+        assert_eq!(scalar(&s, "pv"), 42.0);
+
+        s.run("A=reshape(1:100,10,10); B=imresize(A,0.5,'lanczos3'); bs=size(B); I=zeros(9,9); I(3:7,3:7)=1; S=regionprops(I,'Perimeter','MajorAxisLength','Solidity'); per=S.Perimeter; sol=S.Solidity;")
+            .unwrap();
+        assert_eq!(s.get("bs").unwrap().dims(), (1, 2));
+        assert_eq!(scalar(&s, "per"), 16.0);
+        assert!((scalar(&s, "sol") - 1.0).abs() < 1e-9);
+
+        s.run("o=odeset('Mass',2); [tm,ym]=ode45(@(t,y)-y,[0 1],1,o); mend=ym(end); sol=ode45(@(t,y)-y,[0 2],1); yq=deval(sol,1);").unwrap();
+        assert!((scalar(&s, "mend") - (-0.5f64).exp()).abs() < 1e-6);
+        assert!((scalar(&s, "yq") - (-1f64).exp()).abs() < 1e-4);
+
+        std::fs::write(dir.join("evfun.m"), "function [v,isterminal,dir] = evfun(t,y)\nv = y - 3;\nisterminal = 1;\ndir = 0;\nend\n").unwrap();
+        s.run(&format!("addpath('{ds}'); oo=odeset('Events',@evfun); [te,ye,ie,tev,ye2]=ode45(@(t,y) 1,[0 10],0,oo); tend=te(end); yend=ye(end); ie1=ie(1); tev1=tev(1); ye21=ye2(1);")).unwrap();
+        assert!((scalar(&s, "tend") - 3.0).abs() < 1e-9);
+        assert!((scalar(&s, "yend") - 3.0).abs() < 1e-9);
+        assert_eq!(scalar(&s, "ie1"), 1.0);
+        assert!((scalar(&s, "tev1") - 3.0).abs() < 1e-9);
+        assert!((scalar(&s, "ye21") - 3.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_array_matmul_roundtrip() {
+        if !gpu::available() {
+            return;
+        }
+        let mut s = Session::new();
+        s.run("A=gpuArray([1 2;3 4]); B=gpuArray([5 6;7 8]); C=gather(A*B);").unwrap();
+        let c = s.get("C").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()).unwrap_or_default();
+        let expected = [19.0, 43.0, 22.0, 50.0];
+        assert_eq!(c.len(), expected.len());
+        for (a, b) in c.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-4, "gpu result {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn nested_calls_with_generous_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut s = Session::new();
+                s.run("a = sin(cos(0.5)); b = fileparts(fileparts('C:/a/b/c')); c = upper(lower('AbC'));").unwrap();
+                (
+                    s.get("a").and_then(|v| v.to_matrix().ok()).and_then(|m| m.as_scalar()),
+                    s.get("b").and_then(|v| match v {
+                        Value::Str(x) => Some(x.clone()),
+                        _ => None,
+                    }),
+                    s.get("c").and_then(|v| match v {
+                        Value::Str(x) => Some(x.clone()),
+                        _ => None,
+                    }),
+                )
+            })
+            .unwrap();
+        let (a, b, c) = handle.join().unwrap();
+        assert!((a.unwrap() - 0.769_196_354_841).abs() < 1e-9);
+        assert_eq!(b.as_deref(), Some("C:/a"));
+        assert_eq!(c.as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn xlsx_table_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let p1 = dir.join(format!("matcraft_xlsx_{}_{}.xlsx", std::process::id(), n));
+        let p2 = dir.join(format!("matcraft_xlsx_{}_{}_out.xlsx", std::process::id(), n));
+        let f1 = p1.to_string_lossy().replace('\\', "/");
+        let f2 = p2.to_string_lossy().replace('\\', "/");
+        let mut s = Session::new();
+
+        s.run(&format!("xlswrite('{f1}', [1 2; 3 4]); [num,txt,raw] = xlsread('{f1}');")).unwrap();
+        assert_eq!(s.get("num"), Some(&Value::Mat(Matrix::from_row_major(2, 2, &[1.0, 2.0, 3.0, 4.0]).unwrap())));
+        assert_eq!(
+            s.get("txt").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(4)
+        );
+        assert_eq!(
+            s.get("raw").and_then(|v| match v {
+                Value::Cell(c) => Some(c.numel()),
+                _ => None,
+            }),
+            Some(4)
+        );
+
+        s.run(&format!("writecell({{1,'two'; 3,'four'}}, '{f1}'); C = readcell('{f1}'); v = C{{1,2}};")).unwrap();
+        assert_eq!(s.get("v"), Some(&Value::Str("two".into())));
+
+        s.run(&format!(
+            "writecell({{'name','value'; 'A',1; 'B',2}}, '{f1}'); T = readtable('{f1}'); \
+             n1 = height(T); n2 = width(T); vn = T.Properties.VariableNames{{1}}; \
+             writetable(T, '{f2}'); T2 = readtable('{f2}');"
+        ))
+        .unwrap();
+        assert_eq!(s.get("n1"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("n2"), Some(&Value::Num(2.0)));
+        assert_eq!(s.get("vn"), Some(&Value::Str("name".into())));
+        let t2value = match s.get("T2") {
+            Some(Value::Object(o)) => o.prop("value").and_then(|v| v.to_matrix().ok()),
+            _ => None,
+        };
+        assert_eq!(t2value.map(|m| m.data().to_vec()), Some(vec![1.0, 2.0]));
+
+        // Range writes and a second sheet, preserving the first.
+        s.run(&format!("xlswrite('{f1}', [9 8], 'Sheet1', 'B2'); xlswrite('{f1}', 5, 'Data');")).unwrap();
+        s.run(&format!("r = xlsread('{f1}', 'Sheet1', 'B2:C2'); d = xlsread('{f1}', 'Data'); s1 = xlsread('{f1}', 'Sheet1');")).unwrap();
+        assert_eq!(s.get("r").and_then(|v| v.to_matrix().ok()).map(|m| m.data().to_vec()), Some(vec![9.0, 8.0]));
+        assert_eq!(s.get("d"), Some(&Value::Num(5.0)));
+        let s1 = s.get("s1").and_then(|v| v.to_matrix().ok()).expect("Sheet1 numeric matrix");
+        assert_eq!(s1.shape(), (3, 3));
+        assert_eq!(s1.get(1, 1), Some(9.0));
+        assert_eq!(s1.get(1, 2), Some(8.0));
+        assert!(s1.get(0, 0).map(|v| v.is_nan()).unwrap_or(false));
+
+        // readtable option form.
+        s.run(&format!("T3 = readtable('{f1}', 'Sheet', 'Sheet1', 'ReadVariableNames', false); n3 = height(T3);")).unwrap();
+        assert_eq!(s.get("n3"), Some(&Value::Num(3.0)));
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn image_processing_toolbox() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+        let vec = |s: &Session, name: &str| -> Vec<f64> { s.get(name).cloned().unwrap().to_matrix().unwrap().data().to_vec() };
+
+        s.run("A = zeros(1,1,3); A(1,1,1) = 1; g = rgb2gray(A);").unwrap();
+        assert!((scalar(&s, "g") - 0.298_936).abs() < 1e-6);
+
+        s.run("R = imresize([1 2; 3 4], [4 4], 'nearest');").unwrap();
+        assert_eq!(s.get("R").unwrap().dims(), (4, 4));
+        let r = vec(&s, "R");
+        assert_eq!(r[0], 1.0);
+        assert_eq!(r[15], 4.0);
+
+        s.run("H = fspecial('average', 3); F = imfilter(ones(3), H, 'replicate');").unwrap();
+        assert!(vec(&s, "F").iter().all(|v| (v - 1.0).abs() < 1e-12));
+
+        s.run("M = medfilt2([0 0 0; 0 9 0; 0 0 0]);").unwrap();
+        assert!(vec(&s, "M").iter().all(|v| *v == 0.0));
+
+        s.run("E = edge([0 0 1 1; 0 0 1 1; 0 0 1 1], 'sobel');").unwrap();
+        assert!(vec(&s, "E").contains(&1.0));
+        s.run("E0 = edge(ones(3), 'sobel');").unwrap();
+        assert!(vec(&s, "E0").iter().all(|v| *v == 0.0));
+
+        s.run("BW = [1 0; 0 1]; [L4, n4] = bwlabel(BW, 4); [L8, n8] = bwlabel(BW, 8);").unwrap();
+        assert_eq!(scalar(&s, "n4"), 2.0);
+        assert_eq!(scalar(&s, "n8"), 1.0);
+
+        s.run("L = bwlabel([1 1 0; 1 1 0; 0 0 1], 4); S = regionprops(L, {'Area','Centroid','BoundingBox'}); a1 = S(1).Area; c1 = S(1).Centroid; b2 = S(2).BoundingBox; a2 = S(2).Area;")
+            .unwrap();
+        assert_eq!(scalar(&s, "a1"), 4.0);
+        assert_eq!(vec(&s, "c1"), vec![1.5, 1.5]);
+        assert_eq!(vec(&s, "b2"), vec![2.5, 2.5, 1.0, 1.0]);
+        assert_eq!(scalar(&s, "a2"), 1.0);
+
+        s.run("t = graythresh([0 0 1 1]); B = imbinarize([0 0 1 1]);").unwrap();
+        assert!(scalar(&s, "t") > 0.0 && scalar(&s, "t") < 1.0);
+        assert_eq!(vec(&s, "B"), vec![0.0, 0.0, 1.0, 1.0]);
+
+        // Morphology: 3x3 square grows a single pixel, erodes a solid block.
+        s.run("P = zeros(5,5); P(3,3) = 1; D = imdilate(P, strel('square',3));").unwrap();
+        assert_eq!(s.get("D").unwrap().dims(), (5, 5));
+        assert_eq!(vec(&s, "D").iter().filter(|v| **v == 1.0).count(), 9);
+        assert_eq!(s.get("D").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+        s.run("Q = zeros(5,5); Q(2:4,2:4) = 1; E = imerode(Q, strel('square',3));").unwrap();
+        assert_eq!(vec(&s, "E").iter().filter(|v| **v == 1.0).count(), 1);
+        assert_eq!(s.get("E").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+
+        // Opening removes an isolated speck; closing fills a single-pixel hole.
+        s.run("Q(1,5) = 1; O = imopen(Q, strel('square',3));").unwrap();
+        assert_eq!(vec(&s, "O")[4], 0.0);
+        s.run("H = ones(5,5); H(3,3) = 0; Cc = imclose(H, strel('square',3));").unwrap();
+        assert_eq!(s.get("Cc").and_then(|v| v.to_matrix().ok()).and_then(|m| m.get(2, 2)), Some(1.0));
+        s.run("Sd = strel('disk',1);").unwrap();
+        assert_eq!(s.get("Sd").unwrap().dims(), (3, 3));
+        assert_eq!(vec(&s, "Sd").iter().filter(|v| **v == 1.0).count(), 5);
+
+        // 90-degree rotation matches rot90, and crop uses 1-based pixel coordinates.
+        s.run("R = imrotate([1 2 3; 4 5 6], 90, 'nearest', 'loose'); Cr = imcrop([1 2 3 4; 5 6 7 8; 9 10 11 12; 13 14 15 16], [2 2 2 2]);").unwrap();
+        assert_eq!(s.get("R").unwrap().dims(), (3, 2));
+        assert_eq!(vec(&s, "R"), vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]);
+        assert_eq!(vec(&s, "Cr"), vec![6.0, 10.0, 7.0, 11.0]);
+
+        // Colour morphology keeps the third dimension.
+        s.run("A = zeros(3,3,3); A(:,:,1) = 1; A(:,:,2) = 0.5; Dr = imdilate(A, strel('square',3)); Rt = imrotate(A, 45, 'nearest');").unwrap();
+        assert_eq!(s.get("Dr").unwrap().dims_vec(), vec![3, 3, 3]);
+        assert_eq!(s.get("Rt").unwrap().dims_vec(), vec![4, 4, 3]);
+
+        // Bicubic resize (Keys a=-0.5) cross-checked against a SciPy-built
+        // reference implementation of the same cubic convolution.
+        s.run(
+            "A = [1 2 4; 8 16 32; 64 128 256]; B = imresize(A, 2, 'bicubic'); b11 = B(1,1); b22 = B(2,2); b33 = B(3,3); b16 = B(1,6); b66 = B(6,6);",
+        )
+        .unwrap();
+        assert!((scalar(&s, "b11") - 0.472_107).abs() < 1e-5, "b11 = {}", scalar(&s, "b11"));
+        assert!((scalar(&s, "b22") - 1.282_715).abs() < 1e-5);
+        assert!((scalar(&s, "b33") - 4.373_535).abs() < 1e-5);
+        assert!((scalar(&s, "b16") - 2.102_661).abs() < 1e-5);
+        assert!((scalar(&s, "b66") - 281.303_711).abs() < 1e-4);
+
+        // Canny on a vertical step: a single one-pixel edge column.
+        s.run("I = zeros(10,10); I(:,6:10) = 1; E = edge(I, 'canny', [0.1 0.3], 1); ne = sum(E(:)); ec = sum(E(:,5));").unwrap();
+        assert!(scalar(&s, "ne") >= 8.0, "edge pixels = {}", scalar(&s, "ne"));
+        assert_eq!(scalar(&s, "ec"), scalar(&s, "ne"));
     }
 }

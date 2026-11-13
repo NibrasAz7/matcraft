@@ -11,10 +11,13 @@ use std::fmt;
 
 mod complex;
 pub mod dsp;
+mod expm;
 mod linalg;
 mod sparse;
+pub mod stats;
 
 pub use complex::{CMatrix, CNum};
+pub use expm::expm;
 pub use linalg::Svd;
 pub use linalg::{chol, cond, eig_symmetric, eigvals, eigvals_c, lu, pinv, qr, rank, rref, singular_values, svd, trace};
 pub use sparse::SparseMat;
@@ -310,7 +313,9 @@ impl Matrix {
         Ok(Matrix { dims, data })
     }
 
-    /// Broadcast `other` if it is a scalar, else require equal shapes.
+    /// Elementwise operation with MATLAB implicit expansion: equal shapes,
+    /// scalar operands, or singleton rows/columns (`3x20 - 1x20`,
+    /// `2x1 .* 1x3`).
     pub fn broadcast(&self, other: &Matrix, f: impl Fn(f64, f64) -> f64) -> Result<Self, MatError> {
         if let Some(s) = other.as_scalar() {
             return Ok(self.map(|a| f(a, s)));
@@ -318,7 +323,32 @@ impl Matrix {
         if let Some(s) = self.as_scalar() {
             return Ok(other.map(|b| f(s, b)));
         }
-        self.elemwise(other, f)
+        if Self::same_shape(&self.dims, &other.dims) {
+            return self.elemwise(other, f);
+        }
+        if !self.is_matrix() || !other.is_matrix() {
+            return Err(MatError::DimsMismatch { a: self.dims.clone(), b: other.dims.clone() });
+        }
+        let rows = self.rows().max(other.rows());
+        let cols = self.cols().max(other.cols());
+        if (self.rows() != rows && self.rows() != 1)
+            || (self.cols() != cols && self.cols() != 1)
+            || (other.rows() != rows && other.rows() != 1)
+            || (other.cols() != cols && other.cols() != 1)
+        {
+            return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
+        }
+        let mut out = Matrix::zeros(rows, cols);
+        for c in 0..cols {
+            for r in 0..rows {
+                let a = self.get(if self.rows() == 1 { 0 } else { r }, if self.cols() == 1 { 0 } else { c }).unwrap_or(0.0);
+                let b = other.get(if other.rows() == 1 { 0 } else { r }, if other.cols() == 1 { 0 } else { c }).unwrap_or(0.0);
+                if let Some(slot) = out.data.get_mut(c * rows + r) {
+                    *slot = f(a, b);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Matrix multiply: (m x k) * (k x n).
@@ -339,6 +369,22 @@ impl Matrix {
         }
         let (m, k, n) = (self.rows(), self.cols(), other.cols());
         let mut out = Matrix::zeros(m, n);
+        #[cfg(not(target_arch = "wasm32"))]
+        if m.saturating_mul(k).saturating_mul(n) > 50_000 {
+            use rayon::prelude::*;
+            out.data.par_chunks_mut(m).enumerate().for_each(|(c, col)| {
+                for i in 0..k {
+                    let b = other.get(i, c).unwrap_or(0.0);
+                    if b == 0.0 {
+                        continue;
+                    }
+                    for (r, slot) in col.iter_mut().enumerate() {
+                        *slot += self.get(r, i).unwrap_or(0.0) * b;
+                    }
+                }
+            });
+            return Ok(out);
+        }
         for c in 0..n {
             for i in 0..k {
                 let b = other.get(i, c).unwrap_or(0.0);
@@ -631,6 +677,40 @@ impl Matrix {
     }
 }
 
+/// Configure the process-wide parallel worker pool. Returns false when the
+/// pool was already initialized (the first setting wins).
+#[cfg(not(target_arch = "wasm32"))]
+static CONFIGURED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_num_threads(n: usize) -> bool {
+    let n = n.max(1);
+    CONFIGURED_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+    rayon::ThreadPoolBuilder::new().num_threads(n).build_global().is_ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_num_threads(_n: usize) -> bool {
+    false
+}
+
+/// Number of workers currently available to parallel matrix kernels.
+pub fn num_threads() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let configured = CONFIGURED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        if configured > 0 {
+            configured
+        } else {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +843,40 @@ mod tests {
         // …but a trailing-singleton 3-D view still counts as a matrix.
         assert!(page.is_matrix());
         assert!(page.det().is_ok());
+    }
+
+    #[test]
+    fn parallel_matmul_large_identity() {
+        let n = 200;
+        let mut a = Matrix::zeros(n, n);
+        for c in 0..n {
+            for r in 0..n {
+                let _ = a.set(r, c, ((r * 31 + c * 17) % 97) as f64);
+            }
+        }
+        let out = a.matmul(&Matrix::eye(n, n)).unwrap();
+        assert_eq!(out.dims(), a.dims());
+        for i in 0..n {
+            assert_eq!(out.get(i, i), a.get(i, i));
+        }
+    }
+
+    #[test]
+    fn broadcast_implicit_expansion() {
+        // Row vector over a matrix (3x20 - 1x20 in corpus code).
+        let grid = Matrix::ones(3, 2);
+        let row = Matrix::row_vector(vec![10.0, 20.0]);
+        let out = grid.broadcast(&row, |a, b| a + b).unwrap();
+        assert_eq!(out.shape(), (3, 2));
+        assert_eq!(out.get(0, 1), Some(21.0));
+        assert_eq!(out.get(2, 1), Some(21.0));
+        // Column vector against a row vector (outer product via .*).
+        let col = Matrix::col_vector(vec![1.0, 2.0, 3.0]);
+        let out = col.broadcast(&row, |a, b| a * b).unwrap();
+        assert_eq!(out.shape(), (3, 2));
+        assert_eq!(out.get(2, 0), Some(30.0));
+        // Non-singleton mismatches stay errors.
+        assert!(Matrix::ones(2, 2).broadcast(&Matrix::ones(3, 2), |a, b| a + b).is_err());
     }
 
     #[test]

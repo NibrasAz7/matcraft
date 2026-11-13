@@ -34,7 +34,7 @@ pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
 /// functions` so both print the same catalogue. A test in this module keeps
 /// it in lock-step with `matlang::BUILTIN_NAMES`.
 pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
-    ("construction", "zeros ones eye magic peaks rand randn randi randperm linspace logspace inf Inf nan NaN eps"),
+    ("construction", "zeros ones true false eye magic peaks rand randn randi randperm linspace logspace inf Inf nan NaN eps blkdiag vecnorm expm mat2cell gradient"),
     ("size/shape", "size numel length ndims reshape squeeze transpose ctranspose repmat flip permute ipermute shiftdim repelem ndgrid"),
     ("matrix ops", "diag triu tril flipud fliplr kron cat horzcat vertcat circshift rot90 meshgrid"),
     ("indexing", "ind2sub sub2ind accumarray bsxfun"),
@@ -52,20 +52,61 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("complex", "complex real imag conj angle"),
     ("poly/signal", "polyval polyfit roots poly conv deconv interp1 trapz histcounts"),
     ("dsp", "fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap hamming hann blackman bartlett rectwin triang kaiser gausswin sinc rectpuls tripuls fir1"),
-    ("solvers", "fzero fminsearch integral quad optimset optimget"),
-    ("function handles", "feval func2str str2func functions arrayfun cellfun inline"),
-    ("objects", "isobject methods properties"),
+    (
+        "solvers",
+        "fzero fminbnd fminsearch fminunc fsolve lsqnonlin lsqcurvefit linprog quadprog intlinprog fmincon patternsearch ga integral quad optimset optimoptions optimget",
+    ),
+    (
+        "control",
+        "tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid pidtune margin nyquist isstable damp bandwidth",
+    ),
+    (
+        "graph objects",
+        "graph digraph gplot numnodes numedges degree conncomp neighbors shortestpath distances bfsearch dfsearch adjacency incidence isgraph",
+    ),
+    (
+        "distances and clustering",
+        "pdist pdist2 squareform jaccard jaccarddistance setmetrics confusionmat clustermetrics cluster clusterdata cophenet silhouette randindex mutualinfo evalclusters linkage optimalleaforder",
+    ),
+    (
+        "chemistry and sequences",
+        "formulaatoms formulaweight formulacheck inferformula parsereaction formatreaction canonicalreaction rxnequal rxnbalance gprparse gpreval gprgenes gprmerge fastaread fastawrite genbankread",
+    ),
+    (
+        "statistics",
+        "normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv wblpdf wblcdf wblinv lognpdf logncdf logninv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv exprnd unifrnd poissrnd binornd wblrnd lognrnd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest chi2gof pca cmdscale pcoa bonferroni holm sidak benjamini_hochberg mafdr signrank ranksum kruskalwallis umap tsne corr tabulate gammaln hygecdf nchoosek partialcorr isoutlier isbetween zscore fitlm",
+    ),
+    ("ode", "ode45 ode15s ode23 ode23s dde23 odeset odeget deval"),
+    (
+        "corpus classes",
+        "inputParser addRequired addOptional addParameter addParamValue addparameter parse string strings isstring table table2array isKey keys values remove count parpool maxNumCompThreads gpuArray gather canUseGPU existsOnGPU gpuDevice parfeval fetchOutputs onCleanup categorical reordercats categories countcats addcats removecats mergecats renamecats isundefined isdatetime isduration istimetable datetime duration seconds",
+    ),
+    ("anova", "anova1 anova2 multcompare friedman"),
+    (
+        "xlsx/table",
+        "xlsread xlswrite readcell writecell readtable writetable height width istable rows array2table ismissing table2cell cell2table struct2table struct2cell cell2struct addvars setvartype convertvars removevars renamevars summary findgroups splitapply varfun rowfun join innerjoin outerjoin groupsummary stack unstack fillmissing rmmissing standardizeMissing fileread isfolder contains startswith endswith startsWith endsWith strsplit strjoin strlength erase replace findstr jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines rethrow verLessThan inputname validateattributes validatestring mustBeNumeric mustBeNonempty mustBePositive mustBeInteger mustBeMember mustBeText mustBeA mustBeScalarOrEmpty mustBeFinite mustBeReal",
+    ),
+    ("hdf5/netcdf", "h5read h5write h5create h5disp ncread ncwrite ncinfo ncdisp"),
+    (
+        "image processing",
+        "rgb2gray imresize imfilter medfilt2 edge bwlabel regionprops graythresh imbinarize imdilate imerode imopen imclose imrotate imcrop strel",
+    ),
+    ("function handles", "feval builtin func2str str2func functions arrayfun cellfun inline"),
+    ("objects", "isobject methods properties events metaclass ismethod isprop addlistener notify addprop dynamicprops removeprop"),
     ("debugging", "dbstop dbclear dbcont dbstatus dbstep dbquit run"),
     ("strings", "num2str int2str mat2str str2double str2num str2mat strcmp strcmpi strncmp strncmpi strmatch strcat upper lower strtrim strrep strfind strtok blanks deblank double logical char regexp regexpi regexprep"),
     ("text scan", "fscanf sscanf textscan strread dlmread dlmwrite csvwrite readmatrix writematrix"),
     ("file io", "fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets delete copyfile movefile rmdir"),
     ("dates", "now clock datenum datestr etime"),
-    ("system", "version computer ispc isunix ismac getenv setenv system ver license beep"),
+    ("system", "version computer ispc isunix ismac getenv setenv system dos unix ver license diary beep"),
     ("graphics objects", "get set drawnow waitbar gca ishandle findobj findall ishold"),
     ("image io", "imread imwrite im2double fspecial"),
     ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc global persistent import argv"),
-    ("files/path", "save load type addpath rmpath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir"),
-    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar caxis clim axis box imagesc image imshow text pie contour plot3 surf mesh vline saveas exportgraphics print"),
+    (
+        "files/path",
+        "save load type addpath rmpath savepath path pwd cd dir ls genpath fullfile fileparts filesep isdir isfile tempdir tempname csvread mkdir",
+    ),
+    ("plotting", "figure gcf clf close subplot plot scatter stem bar histogram area stairs errorbar contourf contour3 semilogx semilogy loglog hold grid title xlabel ylabel zlabel legend xlim ylim zlim xscale yscale view colormap colorbar lighting light lines volcano dendrogram clustergram venn venncounts quiver quiver3 streamline streamslice heatmap validatecolor caxis clim axis box daspect imagesc image imshow text rectangle patch axes boxplot xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile yline barh annotation gobjects isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool pie contour plot3 surf surfl surfc mesh vline xline saveas exportgraphics print"),
 ];
 
 /// Every builtin name listed in [`FUNCTION_GROUPS`] — used by tests.
@@ -87,6 +128,17 @@ mod group_tests {
         let mut builtin = matlang::BUILTIN_NAMES.to_vec();
         builtin.sort_unstable();
         assert_eq!(grouped, builtin);
+    }
+
+    /// The published dictionary must contain exactly one row per builtin.
+    #[test]
+    fn function_dictionary_covers_builtins() {
+        let docs = include_str!("../../../docs/functions.md");
+        for name in matlang::BUILTIN_NAMES {
+            let needle = format!("**`{name}`**");
+            let count = docs.matches(&needle).count();
+            assert_eq!(count, 1, "docs/functions.md must document `{name}` exactly once");
+        }
     }
 }
 

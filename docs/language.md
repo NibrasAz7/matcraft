@@ -55,9 +55,8 @@ by observing MathWorks software.
   uses them re-declares `global` and then reads/writes the shared store.
   `persistent a b` inside a `function` keeps its value between calls
   (per file+function); at script scope `persistent` errors like M-code.
-- `import pkg.*` / `import pkg.Name` records the spec (bare `import`
-  echoes the list) — there is no package namespace to resolve, so this is
-  bookkeeping only.
+- `import pkg.*` / `import pkg.Name` resolves members from a `+pkg`
+  package directory on the search path; bare `import` echoes the list.
 - Command syntax: `name arg arg` = `name('arg','arg')` — `format long`,
   `clear x`, `disp hello`, `save f.txt -ascii` all work. Each whitespace-
   separated *word* is one arg, so `f.txt` and `-ascii` are literal strings,
@@ -87,6 +86,9 @@ by observing MathWorks software.
   zeros, and extends the dims vector — `x(1,1,1) = 5` on a 2-D matrix
   makes it 2×2×1. `x(i) = v` writes flat column-major; a linear index
   past `numel` still only grows vectors.
+- Elementwise operators (`+ - .* ./ .^` and comparisons) apply MATLAB
+  implicit expansion: equal shapes, scalars, or singleton rows/columns
+  (`A - mean(A,2)`, `(1:3)'.*(1:4)`).
 - Cell literal `{a b; c d}` mirrors matrix literals; braces index **content**
   (`x = c{i}`, `c{i} = v`) while parens index **cells** (`c(i)` is a sub-cell,
   `c(i) = v` writes a cell, `c(i) = []`/`c(:,j)=[]`/`c(i,:)=[]` delete).
@@ -166,12 +168,13 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   own, duplicates overwritten), then the `methods`-block function named
   `Name` runs as the constructor with the object pre-bound to its first
   output. A class with no constructor method just gets defaults.
-- Section/class attribute lists — `classdef (Sealed, …)`,
+- Section/class attribute lists — `classdef (Sealed, Abstract)`,
   `properties (Access = private)`, `properties (SetAccess = protected,
-  GetAccess = public, Dependent)`, `methods (Static = false)` — parse in
-  every form (`name`, `name = value`, comma or space separated). They are
-  accepted for compatibility, not enforced, **except** `methods (Static)`
-  which drops the implicit object argument.
+  GetAccess = public, Dependent)`, `methods (Static = false, Abstract)`
+  — parse in every form (`name`, `name = value`, comma or space
+  separated). `Access`/`GetAccess`/`SetAccess`, `Constant`, `Dependent`,
+  `Abstract` and `Sealed` are enforced at member access, construction and
+  subclassing time; `Static` drops the implicit object argument.
 - Properties: `obj.prop` reads, `obj.prop = v` writes (also through
   chains like `obj.a.b(2)`). Writing an undeclared property creates it —
   MATLAB errors there; the deviation keeps ad-hoc tagging working.
@@ -200,23 +203,76 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   same-named global for non-object calls. Method lookup order: the
   classdef `methods` block, then `@dir` files, then the superclass chain.
 - Introspection: `class(obj)` → class name; `isa`, `isobject`,
-  `methods(obj|'C')`, `properties(obj|'C')` (inherited included),
-  `fieldnames`, `get(obj,'p')`/`get(obj)`, `set(obj,'p',v,…)` (returns
-  the updated object), `disp`/`display` honor a class `display` method.
+  `methods(obj|'C')`, `properties(obj|'C')`, `events(obj|'C')` (inherited
+  included), `metaclass(obj|'C')` (Name/Properties/Methods/Events/
+  Superclasses struct), `ismethod`, `isprop`, `fieldnames`,
+  `get(obj,'p')`/`get(obj)`, `set(obj,'p',v,…)` (returns the updated
+  object), `disp`/`display` honor a class `display` method.
+- Handle events: `addlistener(obj,'Event',@callback)` registers a
+  listener (returns a `listener` object whose `delete` unregisters it) and
+  `notify(obj,'Event')` calls every enabled callback with
+  `(source, eventData)`; the event data struct carries `Source`,
+  `EventName` and optional `Data`. Listener registration is limited to
+  handle classes.
+- Object arrays: `a(2) = Pt(...)`, `a(3).x = v`, `a(i).p` reads,
+  `a(i) = []` deletes, `size`/`numel` report the array shape, and
+  `[a b]`/`[a; b]` concatenate objects of the same class. Element methods
+  and event stores live on each scalar element.
+- `subsref`/`subsasgn`: a class that defines `subsref(obj,s)` handles
+  `()`, `{}` and `.` reads; `subsasgn(obj,s,v)` handles `()`, `{}` and `.`
+  writes. The `s` struct has `type` (`'()'`, `'{}'` or `'.'`) and a cell
+  `subs` of index values (`':'` is passed as a char). Property/method
+  access inside the handler bypasses the override, so implementations can
+  read their own fields without recursion.
+- Packages: directories named `+pkg` under the search path provide
+  `pkg.Name`, `pkg.inner.Name` and `pkg.fn(…)`; `import pkg.*` and
+  `import pkg.Name` make members available unqualified. Package classes
+  keep their qualified class name, resolve same-package superclasses, and
+  work with methods, events, object arrays and enumeration members.
+- Enumeration members are class instances: `Color.red` runs the class
+  constructor with the declared backing value, so `color.value` and
+  `class(color)` behave like normal objects.
 - Operator overloads: `+ - * .* / ./ \ ^ .^` map to
   `plus minus mtimes times mrdivide rdivide mldivide mpower power`,
   comparisons to `eq ne lt le gt ge`, `& |` to `and or`, `-x +x ~x` to
   `uminus uplus not`, `'`/`.'` to `ctranspose`/`transpose`, and
   `[a b]`/`[a; b]` object literals to `horzcat`/`vertcat` — when the
   class defines the method, else a clear "not defined for class" error.
-- `Class.member` evaluates an `enumeration` member's backing value.
-  Not in (parse harmlessly or error clearly): object arrays, `events`
-  listeners, `Constant`/`Dependent`/`Abstract`/`Sealed`/`Hidden`
-  enforcement, `Access` visibility, `metaclass`/`superclasses`, packages,
-  `handle.notify`, `.mat` save/load of objects (errors), `subsref`/
-  `subsasgn`, `builtin('method', obj, …)` dispatch, dynamic props.
+- `Class.member` evaluates an `enumeration` member's backing value, now
+  returning a class instance.
+  Dynamic properties: `addprop(obj, name)` adds a property to a handle
+  object and returns a `dynamicprops` metadata handle; `dynamicprops(obj)`
+  lists the names and `removeprop(obj, name|handle)` removes one. Dynamic
+  properties support `GetAccess`/`SetAccess`/`Constant`/`Dependent`/`Hidden`
+  (set through the returned handle) and are serialized with the object, so
+  access metadata and values survive `save`/`load`.
+  MAT v5 opaque/mcOS variables are resolved through the file's MCOS subsystem
+  (`FileWrapper__` metadata, class/property tables and saved field values), so
+  MATLAB object files load as class-tagged objects. `save(...,'-mcos')` writes
+  scalar objects and object arrays as opaque records plus a subsystem, and
+  encodes nested object-valued properties recursively; default `save` keeps
+  the field-based `mxOBJECT` encoding. Cyclic handle-object graphs are
+  preserved through shared handle shells, so `a.next.next` reads back as `a`
+  instead of erroring.
+- `builtin('name', …)` calls a raw built-in implementation, bypassing
+  user functions and class overloads. It supports multi-output builtins
+  (`[r,c] = builtin('size', x)`) and numeric operator aliases such as
+  `plus`, `mtimes`, `eq` and `and`; operators on class instances report
+  that no built-in object implementation exists.
+- Windows COM automation: `actxserver('ProgID')` starts a long-lived
+  PowerShell bridge process that owns the COM object and speaks
+  JSON-lines over stdin/stdout, so the Rust core stays free of `unsafe`.
+  `obj.Property` reads/writes, `obj.Method(args)` invokes, `get`/`set`
+  work, `class(obj)` is `'COM'`, `get(obj,'ProgID')` reports the
+  requested ProgID, and `delete(obj)` releases the COM object. Scalar
+  numeric/string/boolean results and numeric arrays are converted;
+  COM-object results report a clear error. The bridge is Windows-only
+  (other platforms report that COM needs Windows).
 
 ## Builtin library
+
+Every builtin in this table has a full entry (signature, description,
+runnable example, expected output) in [`functions.md`](functions.md).
 
 | Group | Functions |
 | --- | --- |
@@ -236,21 +292,32 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Casts | `single int8 int16 int32 int64 uint16 uint32 uint64` — saturate-and-round to the target range (storage stays `f64`, so `class` still reports `double`) |
 | Poly / interp | `polyval polyfit roots poly conv deconv interp1 trapz` (`roots` returns complex pairs) |
 | DSP | `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz unwrap fir1` + windows `hamming hann blackman bartlett rectwin triang kaiser gausswin` (column-wise over matrices; `filter`/`xcorr`/`freqz` have multi-output forms `[y,zf]`, `[r,lags]`, `[h,w]`; `fir1(n,wn[,type][,win])` is a windowed-sinc FIR designer) |
-| Solvers | `fzero fminsearch integral quad` — first arg is a function handle or a name string (`fzero('cos', 1)`, `integral(@(x) x.^2, 0, 1)`) |
+| Solvers | `fzero integral quad` — first arg is a function handle or a name string (`fzero('cos', 1)`, `integral(@(x) x.^2, 0, 1)`) |
+| Optimization | `fminbnd fminsearch fminunc fsolve lsqnonlin lsqcurvefit linprog quadprog intlinprog fmincon patternsearch ga optimset optimoptions optimget` — `[x,fval] = fminbnd(fun,x1,x2,opts)` (Brent), N-parameter `fminsearch(fun,x0,opts)` (Nelder–Mead), `fminunc` (BFGS, `[x,fval,exitflag,output,grad,hessian]`), `fsolve`/`lsqnonlin`/`lsqcurvefit` (Levenberg–Marquardt, bounds + `[x,resnorm,residual,exitflag,output,lambda,jacobian]`); `linprog`/`quadprog` (primal-dual interior point + active-set polish, positional or `problem` struct, `lambda.ineqlin/eqlin/lower/upper`); `intlinprog` (branch-and-bound over LP relaxations, `intcon`, binary/integer bounds, `MipGap`); `Solver` options select external command-line backends (`glpk`, `highs`, `gurobi`, `cplex`, `auto`) that consume a CPLEX-LP model and return a parsed solution, with the internal solvers as the default; `fmincon` (SQP with finite-difference derivatives and `nonlcon` returning `[c,ceq]`) and `patternsearch` (derivative-free ±coordinate + diagonal polling, `nonlcon`); `ga` (seeded real-valued GA: bounds, linear/nonlinear constraints, `problem` struct, `PopulationSize`/`MaxGenerations`/`MaxStallGenerations`/`CrossoverFraction`/`EliteCount`/`InitialPopulation`); options read `MaxIterations`/`MaxIter`, `MaxFunctionEvaluations`/`MaxFunEvals`, `StepTolerance`/`TolX`, `FunctionTolerance`/`TolFun`, `OptimalityTolerance`, `ConstraintTolerance`, `FiniteDifferenceStepSize`, `Display`; external backends are found on `PATH` or via `MATCRAFT_GLPK`/`MATCRAFT_HIGHS`/`MATCRAFT_GUROBI`/`MATCRAFT_CPLEX`, use `TimeLimit` and `MipGap`, and fall back to the internal solver for `Solver = 'auto'` when none is installed |
+| ANOVA | `anova1 anova2 multcompare friedman` — one-way ANOVA over matrix columns, cell groups or vector + labels; two-way ANOVA with or without replication; `multcompare(stats,'Alpha',a,'CType',m)` with `lsd`, `bonferroni`, `sidak`, `holm` and finite-df Tukey–Kramer studentized-range comparisons; `friedman` two-way rank test (with replication) |
+| ODE solvers | `ode45 ode15s ode23 ode23s dde23 odeset odeget deval` - adaptive Dormand-Prince 5(4) for non-stiff problems, Bogacki-Shampine 3(2) for `ode23`, and stiffly stable TR-BDF2 with step-doubling plus finite-difference Newton Jacobians for `ode15s`/`ode23s`; scalar/vector `RelTol`/`AbsTol`, `MaxStep`, `InitialStep`, `MaxIterations`, `NonNegative`, `Mass` (matrix, scalar or function) and `Events` (`[value,isterminal,direction]`); a two-element `tspan` returns accepted steps, a longer time vector returns cubic-Hermite interpolated values at those times; one-output `ode45`/`ode15s` returns a solution struct for `deval`, and event outputs `ie,te,ye` are available; `dde23(ddefun,lags,history,tspan,options)` handles constant delay lags with a constant-vector or functional history, Hermite interpolation of delayed states, adaptive Bogacki-Shampine 3(2) stepping, `[t,y]` or a solution struct with `x/y/f/solver`, and `RelTol`/`AbsTol`/`MaxStep`/`InitialStep` |
+| Control | `tf ss zpk tfdata ssdata zpkdata pole zero dcgain series parallel feedback tf2ss ss2tf step impulse initial lsim bode freqresp pid pidtune margin nyquist isstable damp bandwidth` — SISO LTI objects (`tf` stores `Num`/`Den`/`Variable`/`Ts`, `ss` stores `A`/`B`/`C`/`D`, `zpk` real or complex-conjugate zero/pole pairs stored as `Cplx`), `s = tf('s')` arithmetic (`+ - * / ^`), continuous-time responses via zero-order-hold state space + `expm`, `bode` returns magnitude/phase in degrees, `freqresp` evaluates `Num(jw)/Den(jw)`, `pid(Kp,Ki,Kd[,Tf])`, `[C,info] = pidtune(sys,type,wc)` designs P/PI/PD/PID/PIDF controllers to a 60 degree phase margin at `wc` (default from the slowest plant pole) and reports `Kp/Ki/Kd/Tf/wc/PhaseMargin/Type/C`, `margin` returns `[Gm,Pm,Wcg,Wcp]` (for square MIMO systems, the worst loop), `nyquist` returns `[re,im,w]` (MIMO systems return `p x m x N` real/imag arrays), `isstable`/`damp`/`bandwidth`; MIMO `ss` responses (`step`/`impulse` return N×p×m arrays, `lsim` takes N×m input, `initial` returns N×p) and discrete-time recursion when `Ts > 0`; MIMO `bode` returns real `p x m x N` magnitude/phase arrays, MIMO `nyquist` returns `p x m x N` real/imag arrays and MIMO `freqresp` returns a plain complex `(p*m) x N` matrix (row `out*m+inp`, column = frequency); MIMO `margin` reports the worst loop margin |
+| Statistics | `normpdf normcdf norminv exppdf expcdf expinv unifpdf unifcdf unifinv poisspdf poisscdf poissinv binopdf binocdf binoinv gampdf gamcdf gaminv betapdf betacdf betainv chi2pdf chi2cdf chi2inv tpdf tcdf tinv fpdf fcdf finv wblpdf wblcdf wblinv lognpdf logncdf logninv exprnd unifrnd poissrnd binornd wblrnd lognrnd fitdist pdf cdf icdf random iqr corrcoef regress kmeans ttest ttest2 kstest adtest chi2gof pca tsne corr tabulate gammaln hygecdf nchoosek pdist squareform linkage partialcorr isoutlier isbetween` - element-wise PDFs/CDFs/inverses with scalar expansion (gamma shape/scale, beta shapes, chi-square/t/F degrees of freedom); random generators follow `rng`; `[R,P] = corrcoef(...)`; `[b,bint,r,rint,stats] = regress(y,X)`; `[idx,C,sumd,D] = kmeans(X,k,...)` with `sqeuclidean`/`euclidean`/`cityblock`/`cosine`, `Replicates`, `Start` (`plus`/`sample`/matrix), `MaxIter`, `EmptyAction`; `[h,p,ci,stats] = ttest(x[,m,alpha,tail])` and `ttest2(x,y,...,vartype)` (Welch or pooled); `[h,p,ks,cv] = kstest(x[,'CDF',fun])`; `[h,p,ad,cv] = adtest(x)`; `[coeff,score,latent,tsquared,explained,mu] = pca(X[,'NumComponents',k])`; `fitdist(x,'Normal'|'Exponential'|'Gamma'|'Beta'|'Poisson'|'Weibull'|'Lognormal'|'Kernel'|'tLocationScale')` returns a `prob.*Distribution` object with fitted parameters, usable with `pdf`/`cdf`/`icdf`/`random`/`mean`/`std`/`var`/`median`; `[Y,e] = cmdscale(D)` / `pcoa(D)` classical multidimensional scaling (PCoA) with eigenvalues and explained variance; `bonferroni`/`holm`/`sidak`/`benjamini_hochberg`/`mafdr` p-value corrections (BH is the `mafdr` default); `signrank` (exact for small untied samples), `ranksum` (Mann–Whitney) and `kruskalwallis` (matrix columns, cell groups, or data + group labels); `umap(X,'NumNeighbors',k,'MinDist',d,'NumComponents',n,'NumEpochs',e)` builds a fuzzy k-NN graph and optimises a low-dimensional embedding with seeded cross-entropy SGD; `zscore` standardisation, `corr`/`partialcorr` correlation matrices, `tabulate` frequency tables, `gammaln`, `hygecdf`, `nchoosek`, `pdist`/`squareform`, agglomerative `linkage`, `randindex`, `mutualinfo`, `evalclusters`, `isoutlier` and `isbetween`; Weibull (`wblpdf`/`wblcdf`/`wblinv`/`wblrnd`) and lognormal (`lognpdf`/`logncdf`/`logninv`/`lognrnd`) distributions with MLE `fitdist` fits; `fitlm(X,y)` returns a `LinearModel` object with `Coefficients`/`Rsquared`/`Fitted`/`Residuals`; `boxplot` draws boxes, whiskers and outliers; `optimalleaforder` returns a leaf ordering; `[h,p,stats] = chi2gof(x,'CDF',fun,'NBins',k,'Edges',e,'NParams',n)` runs a Pearson goodness-of-fit test with expected-count merging; `tsne(X,'Perplexity',p,'NumDimensions',d,'NumIterations',n,'NumPCAComponents',k,'InitialY',Y)` returns a seeded t-SNE embedding and KL loss; kernel `fitdist` uses a Gaussian KDE with Silverman bandwidth |
+| XLSX / tables | `xlsread xlswrite readcell writecell readtable writetable height width istable table2cell cell2table struct2table struct2cell cell2struct addvars setvartype` - pure-Rust `.xlsx` ZIP/OpenXML reader/writer (stored or deflated entries, shared + inline strings, numbers, booleans), A1 ranges, multi-sheet workbooks, `[num,txt,raw] = xlsread(...)`, `readtable` returns a class-tagged `table` object with `Properties.VariableNames` and per-variable fields, `writetable` accepts table or struct, `readmatrix`/`writematrix` dispatch to xlsx by extension; `readtable`/`writetable` also handle delimited text (`.csv`/`.tsv`/`.txt`, `FileType`/`Delimiter`, quoted fields, `'\t'`, `VariableNamingRule','preserve'`), tables support `T(rows,cols)` and single-subscript row selection, `T{rows,cols}` numeric contents, row/variable assignment and deletion (`T(rows,:)=[]`, `T(:,vars)=[]`, `T.Var=[]`), dot-assignment that keeps `Properties` in sync, `sortrows(T,var,dir)`, and `isempty/height/width`; table conversion/editing covers `table2cell`, `cell2table`, `struct2table`, `struct2cell`, `cell2struct`, `addvars`, `setvartype`, `convertvars`, `removevars`, `renamevars`, `summary`; grouping/joining covers `findgroups`, `splitapply`, `varfun`, `rowfun`, `join`/`innerjoin`/`outerjoin`, `groupsummary`, `fillmissing`, `rmmissing` and `standardizeMissing` |
+| HDF5 / NetCDF | `h5read h5write h5create h5disp ncread ncwrite ncinfo ncdisp` - pure-Rust HDF5 writer (superblock v2 by default or v3 via `h5create(...,'SuperblockVersion',3)`, v2 object headers, chunked little-endian f64, gzip-compressed chunks, up to 64 root datasets and 65536 chunk entries) and reader for superblocks v0/v2/v3, object headers v1/v2, symbol tables and link messages, compact/contiguous/chunked datasets, fixed-array, extensible-array and B-tree v1/v2 chunk indexes, virtual datasets (same-file or external sources, hyperslab/all/point selections), and shuffle/deflate/fletcher32 filters; NetCDF classic CDF-1/CDF-2 reader and CDF-1 writer plus NetCDF-4/HDF5 container reading through dimension scales and `_Netcdf4Coordinates` (numeric variables, dimensions, attributes skipped, big-endian), start/count/stride selection, `ncinfo` metadata; `ncwrite` always emits classic CDF-1 |
+| Corpus classes | `inputParser addRequired addOptional addParameter addParamValue parse string strings isstring table table2array containers.Map isKey keys values remove count` - handle-based `inputParser` (required/optional/named parameters, validators, case-insensitive and unique-prefix matching, `KeepUnmatched`, `Results`); `string`/`strings` use `Value::Str` and cellstr fallbacks (no separate string-array type), `isstring` recognises both; `table` builds a `table` object from variables with `Properties.VariableNames`/`NumRows`, and `table2array` concatenates numeric variables; `containers.Map` is a handle-style sorted map supporting `m(key)`, `m(key)=v`, `isKey`, `keys`, `values`, `remove`, `Count` and `length`; categorical helpers (`categorical`, `reordercats`, `categories`, `countcats`, `addcats`/`removecats`/`mergecats`/`renamecats`, `isundefined`) and basic `datetime`/`duration`/`seconds` are provided |
+| Strings / tables | `contains startsWith endsWith strsplit strjoin strlength fileread isfolder rows array2table ismissing` — `contains`/`startsWith`/`endsWith` work on strings or cellstr arrays (case-sensitive), `strsplit` collapses empty fields, `strjoin` joins cellstr, `strlength` counts characters, `fileread` reads UTF-8 text (lossy on invalid bytes), `rows` reports table/cell/matrix rows, `array2table` builds a `table` object with `Properties.VariableNames`, and `ismissing` flags NaNs/empty string cells |
+| Image processing | `rgb2gray imresize imfilter medfilt2 edge bwlabel regionprops graythresh imbinarize imdilate imerode imopen imclose imrotate imcrop strel` - grayscale/RGB N-D images; `imresize` nearest/bilinear/bicubic (Keys a=-0.5) with scale or `[m n]`; `imfilter` correlation/convolution, `same`/`full`, zero/replicate/symmetric/circular boundaries; `edge` Sobel/Prewitt/Roberts/Canny (Gaussian smoothing, Sobel gradients, subpixel non-maximum suppression, double-threshold hysteresis); `bwlabel` 4/8-connectivity; `regionprops` `Area`/`Centroid`/`BoundingBox`/`PixelIdxList`/`PixelList`/`Extent`/`EquivDiameter`/`Perimeter`/`MajorAxisLength`/`MinorAxisLength`/`Orientation`/`ConvexArea`/`Solidity`/`EulerNumber`/`FilledArea`; `imresize` also supports Lanczos and anti-aliased downscaling; Otsu `graythresh`/`imbinarize`; morphology `imdilate`/`imerode`/`imopen`/`imclose` with numeric or `strel('square'/'rectangle'/'disk'/'diamond'/'line'/'arbitrary', ...)` elements; `imrotate` nearest/bilinear with loose/crop bounding box; `imcrop` `[xmin ymin width height]` |
 | Predicates | `isnan isinf isfinite isempty isscalar isvector isrow iscolumn ismatrix isnumeric ischar islogical isa isequal isequaln isobject` — `isa(obj,'C')` covers ancestors and `'handle'` |
-| Strings | `num2str int2str mat2str str2double str2num strcmp strcmpi strncmp strncmpi strcat upper lower strtrim strrep strfind strtok strmatch cellstr blanks deblank str2mat double logical char` + regex `regexp regexpi regexprep` (Rust regex syntax; outputs `'start' 'end' 'matchextents' 'match' 'tokens' 'split'`, options `'once' 'ignorecase' 'matchcase'`, `regexprep` honours `$1` group refs; look-around/backrefs are unsupported) |
+| Strings | `num2str int2str mat2str str2double str2num strcmp strcmpi strncmp strncmpi strcat upper lower strtrim strrep erase replace findstr extractBefore extractAfter insertBefore isstrprop isletter compose splitlines readlines strfind strtok strmatch cellstr blanks deblank str2mat double logical char` + regex `regexp regexpi regexprep` - `str2double` maps cellstr/string arrays elementwise, `strcmp`/`strcmpi` return logical arrays for cellstr inputs, `erase`/`replace` work on strings or cellstr, and the extract/insert/predicate helpers plus `splitlines`/`readlines` cover line-oriented text (Rust regex syntax; outputs `'start' 'end' 'matchextents' 'match' 'tokens' 'split'`, options `'once' 'ignorecase' 'matchcase'`, `regexprep` honours `$1` group refs; look-around/backrefs are unsupported) |
 | Cells | `cell iscell iscellstr cell2mat num2cell celldisp` (`num2cell(A,dim)`, `num2cell` on char) |
-| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` — `fieldnames`/`isfield`/`get`/`set` also take objects; `methods`/`properties` list a class's members |
+| Structs | `struct isstruct fieldnames isfield rmfield getfield setfield orderfields deal` - `fieldnames`/`isfield`/`get`/`set` also take objects; `methods`/`properties`/`events`/`metaclass`/`ismethod`/`isprop` list class members; `addlistener`/`notify` dispatch handle events |
 | Complex | `i j complex real imag conj abs angle isreal ctranspose` — `'` conjugates, `.'` does not |
 | Sparse | `sparse full nnz nzmax nonzeros speye spalloc spones issparse` |
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
 | Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`;
   the legacy `rand('seed',v)`/`rand('state',v)`/`rand('twister',v)` forms set and `rand('state')` reads it; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
-| Environment | `addpath rmpath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*` is bookkeeping only;
+| Environment | `addpath rmpath savepath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `p = path` returns the joined path and `path(p)` sets it; `addpath(...,'-begin')` prepends (default) and `'-end'` appends; `savepath` persists the path (`MATCRAFT_PATH_FILE` overrides the platform location); `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*`/`import pkg.Name` resolve `+pkg` package members;
   `d = dir(pat)` returns a name/folder/date/bytes/isdir/datenum struct array
   (sorted, `.`/`..` first, 0x1 when nothing matches; `ls` prints the listing);
   `p = which('n')` returns the located path/description char or `''`) |
-| System | `version ver computer ispc isunix ismac getenv setenv system fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license optimset optimget` — `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0 |
+| Parallel / GPU | `maxNumCompThreads parpool parfeval fetchOutputs onCleanup gpuArray gather canUseGPU existsOnGPU gpuDevice` - Rayon-backed parallel matrix kernels are enabled by `maxNumCompThreads(n)`/`parpool(n)`; `gpuArray`/`gather` use a wgpu compute matmul (`f32` precision — see `gpuArray` in functions.md) when built with `--features gpu`, otherwise they transparently fall back to CPU | 
+| System | `version ver computer ispc isunix ismac getenv setenv system dos unix fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license diary jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver rethrow verLessThan validateattributes validatestring inputname optimset optimget` - `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `dos`/`unix` are aliases, and statement-leading `!cmd` is the same shell escape; `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0; `mfilename('fullpath')` returns the running file's path; `diary` appends console output to a file, JSON/import helpers cover configuration and numeric text, and `rethrow`/`verLessThan`/`validateattributes`/`validatestring`/`inputname` cover common error and validation paths; `actxserver` starts a Windows PowerShell COM bridge (properties, methods, `get`/`set`, `delete`) |
 | UI | `input waitbar drawnow beep ishandle findobj findall ishold gca get set argv` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number; `get(0,'ScreenSize')`/`'ScreenDepth'`/`'Children'` report a fixed virtual screen, `get(fig,'prop')`/`get(fig)` reads figure limits/labels/grid; `set(0,'Default*',v)` stores root defaults `get` reads back, `set(fig,'prop',v,…)` writes the same props; `argv()` returns an empty cellstr (scripts take no args) |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`fprintf(fid,fmt,…)` writes to an `fopen` file id, 1/2 = stdout/stderr;
@@ -263,7 +330,7 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Dates | `datenum now clock etime datestr` — serial day numbers with epoch 0000-01-01; `datenum(y,m,d[,h,mi,s])`, a date-string, or an N×3/N×6 datevec matrix; `datestr(x[,fmt])` for fmt 0/1/2/13/14/15/16/21/23/26/31 |
 | Figures | `figure gcf clf close subplot` (`close`, `close n`, `close all`; `subplot(m,n,p)`, `subplot(m,n,[p…])` spans cells, `subplot(mnp)` packed; `ax = subplot(…)`
   returns the figure number as the axes handle, like `gca`) |
-| Plotting | `plot scatter stem bar area stairs errorbar histogram vline` — `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column; `vline(x[,spec])` appends vertical lines spanning the current y limits;
+| Plotting | `plot scatter stem bar barh boxplot area stairs errorbar histogram vline xline yline axes xticks yticks xticklabels yticklabels xtickangle ytickangle sgtitle tiledlayout nexttile gobjects isprop isgraphics allchild ancestor getappdata setappdata gcp cla colororder getpixelposition savefig hsv parula cool` - `(y)`, `(x,y)`, `(x,y,'spec')`, multi-triplets; matrix `y` → one series per column; `vline(x[,spec])` / `xline` append vertical lines spanning the current y limits; `yline` draws horizontal lines; explicit tick/label/angle settings, `sgtitle`, `tiledlayout`/`nexttile`, `barh`, graphics-handle preallocation/query helpers and `savefig` are supported;
   `('Name',value)` pairs after each series carry line properties —
   `color`/`linestyle`/`marker`/`fontsize` map onto the spec, sizing/annotation props
   (`linewidth` `markersize` `marker*color` `displayname` …) are accepted
@@ -274,8 +341,14 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
 | Axes | `hold on/off`, `grid on/off`, `box on/off`, `title xlabel ylabel zlabel legend`, `xlim/ylim/zlim` (get & set), `axis` (`axis([x0 x1 y0 y1])`/`v = axis`/`axis ij`/`axis xy`/`axis tight`; `equal`/`off`/`on`/… accepted, no visual effect), `xscale/yscale 'log'`/`'linear'`, `view` (`view(2)`/`view(3)`/`view(az,el)`/`view([az el])`) |
 | Colour | `colormap parula/jet/hot/gray`, `colorbar`, `caxis`/`clim [lo hi]` — colour-mapped kinds: `imagesc`, `contour`, `surf`, `mesh` |
 | Images/contours | `imagesc(C)`/`imagesc(x,y,C)` (y axis reversed, `axis ij`-style; `image` is an alias), `pie(x[,labels])`, `contour(Z[,n|v])`/`contour(X,Y,Z[,…])` |
-| Image I/O | `imread imwrite im2double imshow fspecial` — PNG only, 8-bit gray or RGB; `imread` returns doubles 0–255 (M×N gray, M×N×3 RGB), `imwrite` writes values ≤ 1 as the [0,1] range and larger values as 0–255; `im2double` scales integral 0..255/0..65535 data to [0,1]; `fspecial('average'|'gaussian'|'disk'|'laplacian'|'log'|'motion'|'prewitt'|'sobel'|'unsharp',…)` builds filter kernels; `imshow(A)` displays an M×N gray or M×N×3 matrix as a true-colour raster (y axis reversed like `imagesc`, same [0,1]-vs-0–255 convention as `imwrite`; `imshow(A,[])` scales to the data range, `imshow(A,[lo hi])` clips), `imshow('file.png')` = `imread` + display |
-| 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `mesh(Z)`/`mesh(X,Y,Z)` — orthographic projection under `view` |
+| Image I/O | `imread imwrite im2double imshow fspecial` — PNG and JPEG (8-bit gray or RGB; `imwrite(...,'Quality',q)`); `imread` returns doubles 0–255 (M×N gray, M×N×3 RGB), `imwrite` writes values ≤ 1 as the [0,1] range and larger values as 0–255; `im2double` scales integral 0..255/0..65535 data to [0,1]; `fspecial('average'|'gaussian'|'disk'|'laplacian'|'log'|'motion'|'prewitt'|'sobel'|'unsharp',…)` builds filter kernels; `imshow(A)` displays an M×N gray or M×N×3 matrix as a true-colour raster (y axis reversed like `imagesc`, same [0,1]-vs-0–255 convention as `imwrite`; `imshow(A,[])` scales to the data range, `imshow(A,[lo hi])` clips), `imshow('file.png')` = `imread` + display |
+| 3-D | `plot3(x,y,z[,spec])` multi-triplets, `surf(Z)`/`surf(X,Y,Z)`, `surfl(...)` (surf + lighting), `mesh(Z)`/`mesh(X,Y,Z)`, `surfc(...)` with base contours, `quiver3(X,Y,Z,U,V,W)` 3-D arrows, and `lighting flat|gouraud|none`/`light` Lambert shading — orthographic projection under `view` |
+| Vector fields | `quiver(U,V)`, `quiver(X,Y,U,V)` and `quiver3(X,Y,Z,U,V,W)` — arrows anchored at each point with proportional shafts and filled arrow heads; `streamline(X,Y,U,V,SX,SY)` integrates field lines from seed points and `streamslice(X,Y,U,V)` lays streamlines over a grid of seeds |
+| Clustering plots | `dendrogram(Z[, 'Labels', names][, 'ColorThreshold', h])` — draws a linkage tree; merges are coloured by the clusters produced at the threshold and leaf labels default to `1..n`; `clustergram(X)` reorders rows and columns by average-linkage trees and draws the clustered heatmap |
+| Set diagrams | `venn(A,B[,C,D][, 'Labels', names])` draws a 2-4 set overlap diagram with per-region counts; `venncounts(A,B,...)` returns the full `2^n x (n+1)` mask/count table for 2-10 sets |
+| Networks | `graph digraph gplot numnodes numedges degree conncomp neighbors shortestpath distances bfsearch dfsearch adjacency incidence isgraph` — adjacency-matrix or edge-list constructors (`graph(A)`, `graph(s,t[,w])`, with node names/`'omitselfloops'`), directed `digraph`, circular `plot(G)` layout, weighted Dijkstra `shortestpath`/`distances`, weak components and BFS/DFS orders |
+| Distances and clustering | `pdist pdist2 squareform jaccard jaccarddistance setmetrics confusionmat clustermetrics cluster clusterdata cophenet silhouette randindex mutualinfo evalclusters linkage optimalleaforder` — Euclidean/squared-Euclidean/cityblock/Chebyshev/Minkowski/cosine/correlation/Spearman/Hamming/Jaccard/Dice/matching/Canberra/Bray-Curtis/standardised-Euclidean/Mahalanobis distances; `pdist2` builds the cross-distance matrix; `jaccard`/`jaccarddistance` accept binary vectors or sets; `setmetrics` reports TP/FP/FN/precision/recall/F1/Jaccard/coverage/novelty; `confusionmat` returns the matrix plus class labels; `cluster`/`clusterdata` cut a tree by `'maxclust'` or `'cutoff'`; `cophenet` returns cophenetic distances or their correlation with the original distances; `silhouette` returns per-point scores plus the mean; `clustermetrics` reports adjusted Rand index, normalised mutual information and purity against ground-truth labels; `linkage` supports `single`/`complete`/`average`/`weighted`/`centroid`/`median`/`ward` |
+| Chemistry and sequences | `formulaatoms formulaweight formulacheck inferformula parsereaction formatreaction canonicalreaction rxnequal rxnbalance gprparse gpreval gprgenes gprmerge fastaread fastawrite genbankread` — elemental formulas (dot-separated adducts, fractional counts, ion charges), reaction equations (`->`, `=>`, `<=>`, `<->`, coefficient parsing, canonical form, reversible/proton-insensitive equality, atom balance), gene-protein-reaction Boolean rules (`&`, `|`, `and`, `or`, parentheses; evaluation and gene sets), FASTA read/write (80-column wrapping; struct array or header/sequence cell outputs) and GenBank flat-file parsing into one row per coding feature (`LocusTag`, `Gene`, `ProteinID`, `Product`, `ECNumber`, `Translation`, genome `Sequence`, `Location`) |
 | Log plots | `semilogx semilogy loglog` — nonpositive points are dropped |
 | Grids | `meshgrid` (`[X,Y] = meshgrid(x,y)`), `histcounts` (`[n,e] = histcounts(v,k)`) |
 | Export | `saveas`, `exportgraphics`, `print` — `.svg`/`.png`/`.pdf` by extension or `-dsvg`/`-dpng`/`-dpdf` flag (PNG/PDF rasterised via resvg; headless) |
@@ -313,12 +386,12 @@ Notes:
   `end`-terminated body is hoisted with a fresh scope (true M-code nested
   functions would share the parent workspace — they do not here), and a
   `function` following an unterminated body is a file-local sibling. `.mat` v5 binary `save`/`load`
-  covers double, complex (FLAG_COMPLEX pr/pi), char and sparse (mxSPARSE
-  `ir`/`jc`/`pr`) arrays — saving a cell or struct errors
-  (mxCELL/mxSTRUCT writing is deferred). `load` validates the v5
-  header (a non-MAT `.mat` errors; so does a file with no numeric data),
-  `S = load('f')` returns the file's vars as a struct, and `save` errors
-  on undefined variables.
+  covers double, complex (FLAG_COMPLEX pr/pi), char, sparse (mxSPARSE
+  `ir`/`jc`/`pr`), cell (mxCELL), struct (mxSTRUCT), object and object-array
+  (mxOBJECT with class name + property fields) values; loaded handle-class
+  objects reattach their shared store and listener table. `load` validates
+  the v5 header (a non-MAT `.mat` errors), `S = load('f')` returns the
+  file's vars as a struct, and `save` errors on undefined variables.
 - All allocations driven by input are capped (`zeros(1e9)` errors with
   `allocation exceeds limit` rather than aborting) — matrices ~1e8
   elements, cells ~1e7, figures 1000.
@@ -336,17 +409,16 @@ Notes:
   `isreal(complex(3,0))` is `1` (MATLAB keeps the class). Relational
   ops on complex compare real parts.
 - Plotting is headless: SVG/PNG/PDF export but no interactive figure
-  window yet; no `contourf`/`contour3`; `get` covers only root
-  (`ScreenSize`/`ScreenDepth`/`Children`) and basic figure properties —
-  `set` covers only root `Default*` storage and the figure props `get`
-  reports — no `camlight`/`lighting`.
+  window yet; `get` covers only root (`ScreenSize`/`ScreenDepth`/`Children`)
+  and basic figure properties - `set` covers only root `Default*` storage
+  and the figure props `get` reports - no `camlight`/`material`.
 - Functions get a fresh scope but not yet `nargin`-style default *outputs*
   (unassigned output args error). Function handles exist (`@name`,
   `@(a,b) expr`, `inline`, `str2func`/`func2str`/`functions`,
   `feval`/`arrayfun`/`cellfun`); closures capture the workspace by value,
   so a handle can't mutate outer variables.
-- `imread`/`imwrite` are PNG-only and `regexp` uses the Rust regex dialect
-  (no look-around or backreferences). `system` is native-only.
+- `regexp` uses the Rust regex dialect (no look-around or backreferences).
+  `system` is native-only.
 - Char arrays are row-only — `char` on a multi-element cellstr needs a
   2-D char matrix, which the `Str` value can't represent yet.
 - The debugger stops at top-level statement granularity: `dbstop in f at N`

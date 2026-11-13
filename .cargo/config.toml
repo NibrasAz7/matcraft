@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# The tree-walk interpreter uses large match frames; give test threads the
+# same headroom the CLI gives its worker so recursion-limit tests reach the
+# guard instead of the host stack.
+RUST_MIN_STACK = "8388608"
