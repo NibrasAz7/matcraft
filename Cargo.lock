@@ -2495,6 +2495,7 @@ dependencies = [
  "craft-atomic",
  "matcore",
  "matlang",
+ "matplot",
  "serde",
  "serde_json",
  "simcraft_engine",

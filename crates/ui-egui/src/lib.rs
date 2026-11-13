@@ -121,6 +121,7 @@ enum Doc {
 struct XyView {
     xlog: bool,
     ylog: bool,
+    xrev: bool,
     yrev: bool,
     lim: (f64, f64, f64, f64),
 }
@@ -758,7 +759,7 @@ impl MatApp {
         let (id, size) = (tex.id(), tex.size_vec2());
         let view = self.session.lang().figures().get(idx).and_then(|f| {
             if matplot::is_xy_view(f) {
-                Some(XyView { xlog: f.xlog, ylog: f.ylog, yrev: f.yrev, lim: matplot::view_limits(f) })
+                Some(XyView { xlog: f.xlog, ylog: f.ylog, xrev: f.xrev, yrev: f.yrev, lim: matplot::view_limits(f) })
             } else {
                 None
             }
@@ -838,7 +839,7 @@ impl MatApp {
     /// limits go back through `xlim`/`ylim` so the change is real session
     /// state — `gcf`, `saveas`, scripts and the control channel all see it.
     fn figure_xy(&mut self, ui: &mut egui::Ui, idx: usize, id: egui::TextureId, view: XyView, zoom_k: f64, reset: bool) {
-        let XyView { xlog, ylog, yrev, lim } = view;
+        let XyView { xlog, ylog, xrev, yrev, lim } = view;
         let (sw, sh) = matplot::svg_size();
         let (sw, sh) = (sw as f32, sh.max(1.0) as f32);
         let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
@@ -861,7 +862,10 @@ impl MatApp {
         let to_px = |xv: f64, yv: f64| {
             let fx = ((xv - x0) / span_x) as f32;
             let fy = ((yv - y0) / span_y) as f32;
-            egui::pos2(axr.left() + fx * axr.width(), if yrev { axr.top() + fy * axr.height() } else { axr.bottom() - fy * axr.height() })
+            egui::pos2(
+                if xrev { axr.right() - fx * axr.width() } else { axr.left() + fx * axr.width() },
+                if yrev { axr.top() + fy * axr.height() } else { axr.bottom() - fy * axr.height() },
+            )
         };
         let to_data = |t: f64, log: bool| if log { 10f64.powf(t) } else { t };
 
@@ -885,7 +889,7 @@ impl MatApp {
                 if let Some(hp) = resp.hover_pos() {
                     let fx = f64::from(hp.x - axr.left()) / f64::from(axr.width());
                     let fy = f64::from(hp.y - axr.top()) / f64::from(axr.height());
-                    let xv = x0 + fx * span_x;
+                    let xv = if xrev { x1 - fx * span_x } else { x0 + fx * span_x };
                     let yv = if yrev { y0 + fy * span_y } else { y1 - fy * span_y };
                     new_lim = Some((xv - (xv - x0) * k, xv + (x1 - xv) * k, yv - (yv - y0) * k, yv + (y1 - yv) * k));
                 }
@@ -900,8 +904,9 @@ impl MatApp {
             if d.x != 0.0 || d.y != 0.0 {
                 let dx = f64::from(d.x) / f64::from(axr.width()) * span_x;
                 let dy = f64::from(d.y) / f64::from(axr.height()) * span_y;
+                let nx = if xrev { dx } else { -dx };
                 let ny = if yrev { -dy } else { dy };
-                new_lim = Some((x0 - dx, x1 - dx, y0 + ny, y1 + ny));
+                new_lim = Some((x0 + nx, x1 + nx, y0 + ny, y1 + ny));
             }
         } else if box_drag {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
@@ -917,7 +922,11 @@ impl MatApp {
                 if r.width() > 6.0 && r.height() > 6.0 {
                     let fx = |p: f32| f64::from(p - axr.left()) / f64::from(axr.width());
                     let fy = |p: f32| f64::from(p - axr.top()) / f64::from(axr.height());
-                    let (xa, xb) = (x0 + fx(r.left()) * span_x, x0 + fx(r.right()) * span_x);
+                    let (xa, xb) = if xrev {
+                        (x1 - fx(r.left()) * span_x, x1 - fx(r.right()) * span_x)
+                    } else {
+                        (x0 + fx(r.left()) * span_x, x0 + fx(r.right()) * span_x)
+                    };
                     let (ya, yb) = if yrev {
                         (y0 + fy(r.top()) * span_y, y0 + fy(r.bottom()) * span_y)
                     } else {
@@ -939,7 +948,7 @@ impl MatApp {
             clip.vline(hp.x, axr.y_range(), spike);
             let fx = f64::from(hp.x - axr.left()) / f64::from(axr.width());
             let fy = f64::from(hp.y - axr.top()) / f64::from(axr.height());
-            let xd = to_data(x0 + fx * span_x, xlog);
+            let xd = to_data(if xrev { x1 - fx * span_x } else { x0 + fx * span_x }, xlog);
             let yd = to_data(if yrev { y0 + fy * span_y } else { y1 - fy * span_y }, ylog);
             let mut text = format!("x: {}\ny: {}", matlang::fmt_num(xd, false), matlang::fmt_num(yd, false));
             let mut marker: Option<egui::Pos2> = None;
@@ -997,8 +1006,17 @@ impl MatApp {
             let _ = self.exec_command("eval.line", json!({"code": "axis auto"}));
         } else if let Some((a, b, c, d)) = new_lim {
             if [a, b, c, d].iter().all(|v| v.is_finite()) {
-                let code =
-                    format!("xlim([{:.6e} {:.6e}]); ylim([{:.6e} {:.6e}])", to_data(a, xlog), to_data(b, xlog), to_data(c, ylog), to_data(d, ylog));
+                // Emit reversed pairs when the axis direction is flipped —
+                // `xlim([hi lo])` is how the interp stores XDir='reverse'.
+                let (la, lb) = if xrev { (b, a) } else { (a, b) };
+                let (lc, ld) = if yrev { (d, c) } else { (c, d) };
+                let code = format!(
+                    "xlim([{:.6e} {:.6e}]); ylim([{:.6e} {:.6e}])",
+                    to_data(la, xlog),
+                    to_data(lb, xlog),
+                    to_data(lc, ylog),
+                    to_data(ld, ylog)
+                );
                 let _ = self.exec_command("eval.line", json!({"code": code}));
             }
         }

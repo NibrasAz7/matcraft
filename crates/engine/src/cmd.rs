@@ -315,12 +315,23 @@ fn path_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
 fn figure_list(s: &mut Session, _p: &Json) -> Result<Json, EngineError> {
     // Per-figure series kinds so control-channel/MCP clients can see what
     // each figure holds (kind names are the `SeriesKind` variant names).
+    // Subplot tiles stash their series in `fig.sub.tiles`, so a tiled
+    // figure reports the current tile's series plus each stashed tile's.
+    let kinds = |series: &[matplot::Series]| series.iter().map(|s| json!({"kind": format!("{:?}", s.kind)})).collect::<Vec<_>>();
     let figs: Vec<Json> = s
         .lang()
         .figures()
         .iter()
         .enumerate()
-        .map(|(i, f)| json!({"n": i + 1, "series": f.series.iter().map(|s| json!({"kind": format!("{:?}", s.kind)})).collect::<Vec<_>>()}))
+        .map(|(i, f)| {
+            let mut series = kinds(&f.series);
+            if let Some(sub) = &f.sub {
+                for t in &sub.tiles {
+                    series.extend(kinds(&t.axes.series));
+                }
+            }
+            json!({"n": i + 1, "series": series})
+        })
         .collect();
     Ok(json!({
         "count": s.lang().figures().len(),

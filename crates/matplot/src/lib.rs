@@ -220,8 +220,10 @@ pub struct Axes {
     pub clim: Option<(f64, f64)>,
     /// `colorbar` — draw the colour scale beside the axes.
     pub colorbar: bool,
-    /// `axis ij`/`imagesc` — y axis increases downward (row 1 at top).
+    /// `axis ij`/`imagesc`/`ylim([hi lo])` — y axis increases downward.
     pub yrev: bool,
+    /// `xlim([hi lo])` — x axis increases leftward.
+    pub xrev: bool,
     /// `box on` (default) — draw the axes frame; `box off` hides it.
     pub boxed: bool,
     pub drawn: usize,
@@ -250,6 +252,7 @@ impl Axes {
         f.clim = self.clim;
         f.colorbar = self.colorbar;
         f.yrev = self.yrev;
+        f.xrev = self.xrev;
         f.boxed = self.boxed;
         f.drawn = self.drawn;
         f
@@ -278,6 +281,7 @@ impl Default for Axes {
             clim: None,
             colorbar: false,
             yrev: false,
+            xrev: false,
             boxed: true,
             drawn: 0,
         }
@@ -332,8 +336,10 @@ pub struct Figure {
     pub clim: Option<(f64, f64)>,
     /// `colorbar` — draw the colour scale beside the axes.
     pub colorbar: bool,
-    /// `imagesc`/`axis ij` — y axis increases downward.
+    /// `imagesc`/`axis ij`/`ylim([hi lo])` — y axis increases downward.
     pub yrev: bool,
+    /// `xlim([hi lo])` — x axis increases leftward.
+    pub xrev: bool,
     /// `box on` (default) — draw the axes frame; `box off` hides it.
     pub boxed: bool,
     /// `subplot` tiling; when set, `to_svg` renders one axes per tile.
@@ -428,6 +434,7 @@ impl Figure {
             clim: None,
             colorbar: false,
             yrev: false,
+            xrev: false,
             boxed: true,
             sub: None,
             drawn: 0,
@@ -437,6 +444,20 @@ impl Figure {
     /// `clf` — empty the figure, keep the window/number.
     pub fn clear(&mut self) {
         *self = Figure::new();
+    }
+
+    /// `cla`-level reset used when a plotting call replaces (hold off):
+    /// series and per-axes display state return to defaults — limits,
+    /// log/direction flags, labels and the colour cycle — while
+    /// figure-level choices (`hold`, `subplot`, `colormap`, `box`)
+    /// survive, matching how a fresh axes behaves.
+    pub fn reset_axes(&mut self) {
+        let (hold, sub, cmap, boxed) = (self.hold, self.sub.clone(), self.cmap, self.boxed);
+        *self = Figure::new();
+        self.hold = hold;
+        self.sub = sub;
+        self.cmap = cmap;
+        self.boxed = boxed;
     }
 
     /// Snapshot the flat axes-level fields into an `Axes`.
@@ -460,6 +481,7 @@ impl Figure {
             clim: self.clim,
             colorbar: self.colorbar,
             yrev: self.yrev,
+            xrev: self.xrev,
             boxed: self.boxed,
             drawn: self.drawn,
         }
@@ -485,6 +507,7 @@ impl Figure {
         self.clim = a.clim;
         self.colorbar = a.colorbar;
         self.yrev = a.yrev;
+        self.xrev = a.xrev;
         self.boxed = a.boxed;
         self.drawn = a.drawn;
     }
@@ -872,9 +895,11 @@ fn ticks(lo: f64, hi: f64, count: usize) -> Vec<f64> {
 }
 
 /// Axis limits: explicit override, else data min/max padded by 4%.
+/// Reversed explicit pairs are normalised — the *direction* lives in
+/// `xrev`/`yrev`, never in a negative span.
 fn limits(data_min: f64, data_max: f64, explicit: Option<(f64, f64)>) -> (f64, f64) {
-    if let Some(l) = explicit {
-        return l;
+    if let Some((a, b)) = explicit {
+        return if a <= b { (a, b) } else { (b, a) };
     }
     if !data_min.is_finite() || !data_max.is_finite() {
         return (0.0, 1.0);
@@ -968,8 +993,9 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
     let (x0, x1, y0, y1) = view2d(fig);
     let xspan = (x1 - x0).max(f64::EPSILON);
     let yspan = (y1 - y0).max(f64::EPSILON);
-    let sx = |v: f64| ax + (tx(v) - x0) / xspan * aw;
-    // `yrev` (imagesc / `axis ij`) puts the lowest y at the top.
+    // `xrev` (`xlim([hi lo])`) puts the largest x at the left; `yrev`
+    // (imagesc / `axis ij` / `ylim([hi lo])`) puts the lowest y at the top.
+    let sx = |v: f64| if fig.xrev { ax + aw - (tx(v) - x0) / xspan * aw } else { ax + (tx(v) - x0) / xspan * aw };
     let sy = |v: f64| if fig.yrev { ay + (ty(v) - y0) / yspan * ah } else { ay + ah - (ty(v) - y0) / yspan * ah };
 
     // Grid + ticks. Positions are in transformed space; log axes get one
@@ -980,7 +1006,7 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
     let yticks: Vec<(f64, String)> =
         if fig.ylog { log_ticks(y0, y1) } else { ticks(y0, y1, TICKS).into_iter().map(|t| (t, tick_label(t))).collect() };
     for (t, lab) in &xticks {
-        let p = ax + (t - x0) / xspan * aw;
+        let p = if fig.xrev { ax + aw - (t - x0) / xspan * aw } else { ax + (t - x0) / xspan * aw };
         if fig.grid {
             o.push_str(&format!("<line x1=\"{p:.2}\" y1=\"{ay:.2}\" x2=\"{p:.2}\" y2=\"{:.2}\" stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n", ay + ah));
         }
@@ -996,7 +1022,8 @@ fn draw_axes(o: &mut String, fig: &Figure, ax: f64, ay: f64, aw: f64, ah: f64, c
         ));
     }
     for (t, lab) in &yticks {
-        let p = ay + ah - (t - y0) / yspan * ah;
+        // Same mapping as `sy` on already-transformed tick values.
+        let p = if fig.yrev { ay + (t - y0) / yspan * ah } else { ay + ah - (t - y0) / yspan * ah };
         if fig.grid {
             o.push_str(&format!("<line x1=\"{ax:.2}\" y1=\"{p:.2}\" x2=\"{:.2}\" y2=\"{p:.2}\" stroke=\"#e0e0e0\" stroke-width=\"1\"/>\n", ax + aw));
         }

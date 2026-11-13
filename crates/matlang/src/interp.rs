@@ -6176,7 +6176,10 @@ impl Session {
                     _ if name == "bar" => SeriesKind::Bar,
                     _ => SeriesKind::Line,
                 };
+                let out = self.add_series(kind, args)?;
                 {
+                    // Set the scale *after* add_series — a `!hold` replace
+                    // resets axis state to linear defaults.
                     let fig = self.figure_mut();
                     match name {
                         "semilogx" => fig.xlog = true,
@@ -6188,7 +6191,7 @@ impl Session {
                         _ => {}
                     }
                 }
-                self.add_series(kind, args)
+                Ok(out)
             }
             "errorbar" => {
                 // errorbar(x, y, e [, spec]) — or errorbar(y, e).
@@ -6213,7 +6216,7 @@ impl Session {
                     _ => return Err(LangError::new("errorbar needs (y, e) or (x, y, e)", 0)),
                 };
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 self.figure_mut().push_err(SeriesKind::ErrorBar, x.data().to_vec(), y.data().to_vec(), Some(e.data().to_vec()), spec);
                 Ok(None)
@@ -6266,7 +6269,7 @@ impl Session {
                 let (counts, edges) = histcounts(&m, nb);
                 let centres: Vec<f64> = edges.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 self.figure_mut().push(SeriesKind::Bar, centres, counts, matplot::LineSpec::new());
                 Ok(None)
@@ -6334,13 +6337,16 @@ impl Session {
             "xlim" | "ylim" | "zlim" => {
                 let v = self.eval_args(args)?;
                 if v.is_empty() {
+                    // Report the limits in display order — a reversed axis
+                    // reports `[hi lo]` like it was set.
                     let fig = self.figure_mut();
-                    let lim = match name {
-                        "xlim" => fig.xlim,
-                        "ylim" => fig.ylim,
-                        _ => fig.zlim,
+                    let (lim, rev) = match name {
+                        "xlim" => (fig.xlim, fig.xrev),
+                        "ylim" => (fig.ylim, fig.yrev),
+                        _ => (fig.zlim, false),
                     };
                     let (a, b) = lim.unwrap_or((f64::NAN, f64::NAN));
+                    let (a, b) = if rev { (b, a) } else { (a, b) };
                     return Ok(Some(Value::Mat(Matrix::row_vector(vec![a, b]))));
                 }
                 let m = v[0].to_matrix()?;
@@ -6348,11 +6354,20 @@ impl Session {
                 if d.len() != 2 {
                     return Err(LangError::new(format!("{name} needs [lo hi]"), 0));
                 }
-                let lim = (d[0], d[1]);
+                // A reversed pair flips the axis direction (`xlim([4 1])`
+                // is `XDir='reverse'`); the stored range stays sorted.
+                let rev = d[0] > d[1];
+                let lim = if rev { (d[1], d[0]) } else { (d[0], d[1]) };
                 let fig = self.figure_mut();
                 match name {
-                    "xlim" => fig.xlim = Some(lim),
-                    "ylim" => fig.ylim = Some(lim),
+                    "xlim" => {
+                        fig.xlim = Some(lim);
+                        fig.xrev = rev;
+                    }
+                    "ylim" => {
+                        fig.ylim = Some(lim);
+                        fig.yrev = rev;
+                    }
                     _ => fig.zlim = Some(lim),
                 }
                 Ok(None)
@@ -6375,6 +6390,8 @@ impl Session {
                                 fig.xlim = None;
                                 fig.ylim = None;
                                 fig.zlim = None;
+                                fig.xrev = false;
+                                fig.yrev = false;
                             }
                             // equal/square/off/on/fill/image/vis3d/manual:
                             // accepted; no visible effect (documented gap).
@@ -6389,10 +6406,14 @@ impl Session {
                             return Err(LangError::new("axis needs [x0 x1 y0 y1]", 0));
                         }
                         let fig = self.figure_mut();
-                        fig.xlim = Some((d[0], d[1]));
-                        fig.ylim = Some((d[2], d[3]));
+                        // Same reversed-pair convention as `xlim`/`ylim`.
+                        let (xs, ys) = (d[0] > d[1], d[2] > d[3]);
+                        fig.xlim = Some(if xs { (d[1], d[0]) } else { (d[0], d[1]) });
+                        fig.xrev = xs;
+                        fig.ylim = Some(if ys { (d[3], d[2]) } else { (d[2], d[3]) });
+                        fig.yrev = ys;
                         if d.len() == 6 {
-                            fig.zlim = Some((d[4], d[5]));
+                            fig.zlim = Some(if d[4] > d[5] { (d[5], d[4]) } else { (d[4], d[5]) });
                         }
                         Ok(None)
                     }
@@ -6492,7 +6513,7 @@ impl Session {
                 let (rows, cols) = cm.shape();
                 check_elems(rows.saturating_mul(cols))?;
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 {
                     let fig = self.figure_mut();
@@ -6620,7 +6641,7 @@ impl Session {
                     }
                 };
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 {
                     let fig = self.figure_mut();
@@ -6654,7 +6675,7 @@ impl Session {
                     labels.push(format!("{}", labels.len() + 1));
                 }
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 self.figure_mut().push_pie(m.data().to_vec(), labels);
                 Ok(None)
@@ -6704,7 +6725,7 @@ impl Session {
                     None => Vec::new(),
                 };
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 self.figure_mut().push_grid(SeriesKind::Contour, xv, yv, zm.data().to_vec(), rows, cols, levels, matplot::LineSpec::new());
                 Ok(None)
@@ -6713,7 +6734,7 @@ impl Session {
                 // plot3(x,y,z[,spec]) per-triplet, like add_series.
                 let v = self.eval_args(args)?;
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 let mut i = 0;
                 let mut added = false;
@@ -6779,7 +6800,7 @@ impl Session {
                     }
                 }
                 if !self.figure_mut().hold {
-                    self.figure_mut().series.clear();
+                    self.figure_mut().reset_axes();
                 }
                 self.figure_mut().push_grid(kind, xf, yf, zm.data().to_vec(), rows, cols, Vec::new(), matplot::LineSpec::new());
                 Ok(None)
@@ -6831,7 +6852,7 @@ impl Session {
     fn add_series(&mut self, kind: matplot::SeriesKind, args: &[Expr]) -> Result<Option<Value>, LangError> {
         let v = self.eval_args(args)?;
         if !self.figure_mut().hold {
-            self.figure_mut().series.clear();
+            self.figure_mut().reset_axes();
         }
         // `plot(z)` on a single complex vector plots re vs im (documented
         // M-code behaviour) — unwrap that pair before the real path.
