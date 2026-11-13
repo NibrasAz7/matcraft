@@ -1372,6 +1372,9 @@ pub struct Session {
     /// True while a user `subsref`/`subsasgn` body is running, so its own
     /// property access bypasses the custom dot dispatch.
     subs_dot_guard: bool,
+    /// `get.`/`set.` accessors currently executing — self-access of the
+    /// same property inside its own accessor is an error.
+    accessor_stack: Vec<String>,
     /// Next `addlistener` id.
     next_listener_id: u64,
     /// `import pkg.*`/`import pkg.Name` specs recorded this session.
@@ -1426,6 +1429,7 @@ impl Session {
             cur_func_key: None,
             cur_class: None,
             subs_dot_guard: false,
+            accessor_stack: Vec::new(),
             next_listener_id: 1,
             imports: Vec::new(),
             defaults: HashMap::new(),
@@ -3263,6 +3267,23 @@ impl Session {
                 // `obj.prop = v` — write into the object's store (shared
                 // for handle classes, copy-on-write for value classes).
                 if let Value::Object(mut o) = cur {
+                    // A `set.prop` accessor owns plain `obj.prop = v`
+                    // writes (subscripted writes bypass it).
+                    if rest.is_empty() {
+                        if let Some(def) = self.find_method(&o.class_name, &format!("set.{field}"))? {
+                            let key = format!("set.{field}");
+                            if self.accessor_stack.iter().any(|k| k == &key) {
+                                return Err(LangError::new(
+                                    format!("cannot assign property '{field}' because it is assigned through its own access method"),
+                                    0,
+                                ));
+                            }
+                            self.accessor_stack.push(key.clone());
+                            let r = self.call_def(&key, &def, vec![Value::Object(o.clone()), v], 1, None);
+                            self.accessor_stack.pop();
+                            return Ok(r?.into_iter().next().unwrap_or_else(|| Value::Object(o)));
+                        }
+                    }
                     self.check_prop_access(&o, field, true)?;
                     let sub = o.prop(field).unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0)));
                     let new = self.path_set(sub, rest, v, root)?;
@@ -6637,7 +6658,15 @@ impl Session {
             }
             "randi" => {
                 let v = self.eval_args(args)?;
-                let imax = v.scalar_at(0)?.max(1.0) as u64;
+                // `randi([lo hi])` — a 2-element range bounds the output;
+                // `randi(imax)` yields 1..imax.
+                let (lo, span) = match v.first() {
+                    Some(Value::Mat(m)) if m.numel() == 2 => {
+                        let d = m.data();
+                        (d[0], (d[1] - d[0] + 1.0).max(1.0))
+                    }
+                    _ => (1.0, v.scalar_at(0)?.max(1.0)),
+                };
                 let (r, c) = if v.len() > 2 {
                     (v.scalar_at(1)? as usize, v.scalar_at(2)? as usize)
                 } else if v.len() == 2 {
@@ -6649,7 +6678,7 @@ impl Session {
                 check_elems(r.saturating_mul(c))?;
                 let mut data = Vec::with_capacity(r.saturating_mul(c));
                 for _ in 0..r.saturating_mul(c) {
-                    data.push((self.next_f64() * imax as f64).floor() + 1.0);
+                    data.push(lo + (self.next_f64() * span).floor());
                 }
                 Ok(Some(mat_or_num(Matrix::from_col_major(r, c, data).map_err(lang)?)))
             }
@@ -10447,6 +10476,18 @@ impl Session {
                 self.subs_dot_guard = saved;
                 return result?.into_iter().next().ok_or_else(|| LangError::new("subsref produced no value", 0)).map(Some);
             }
+        }
+        // `obj.f` with a `get.f` accessor — the accessor computes the
+        // value; accessing `f` inside it is an error (self-access).
+        if let Some(def) = self.find_method(&o.class_name, &format!("get.{name}"))? {
+            let key = format!("get.{name}");
+            if self.accessor_stack.iter().any(|k| k == &key) {
+                return Err(LangError::new(format!("cannot access property '{name}' because it is accessed through its own access method"), 0));
+            }
+            self.accessor_stack.push(key);
+            let r = self.call_def(&format!("get.{name}"), &def, vec![Value::Object(o.clone())], 1, None);
+            self.accessor_stack.pop();
+            return Ok(r?.into_iter().next());
         }
         if let Some(v) = o.prop(name) {
             self.check_prop_access(o, name, false)?;

@@ -510,10 +510,22 @@ impl Parser {
             }
             self.next(); // '='
         }
-        let name = match self.next() {
+        let mut name = match self.next() {
             Tok::Ident(n) => n,
             t => return self.err(format!("expected function name, found {t:?}")),
         };
+        // `get.prop`/`set.prop` — classdef property accessors are methods
+        // with dotted names.
+        while self.peek() == &Tok::Dot {
+            let part = match self.peek2() {
+                Tok::Ident(p) => p.clone(),
+                _ => break,
+            };
+            self.next();
+            self.next();
+            name.push('.');
+            name.push_str(&part);
+        }
         let mut params = Vec::new();
         if self.peek() == &Tok::LParen {
             self.next();
@@ -734,10 +746,20 @@ impl Parser {
             }
             self.next(); // '='
         }
-        let name = match self.next() {
+        let mut name = match self.next() {
             Tok::Ident(n) => n,
             t => return self.err(format!("expected a method name in the signature, found {t:?}")),
         };
+        while self.peek() == &Tok::Dot {
+            let part = match self.peek2() {
+                Tok::Ident(p) => p.clone(),
+                _ => break,
+            };
+            self.next();
+            self.next();
+            name.push('.');
+            name.push_str(&part);
+        }
         let mut params = Vec::new();
         if self.peek() == &Tok::LParen {
             self.next();
@@ -1116,6 +1138,8 @@ impl Parser {
                     loop {
                         match self.next() {
                             Tok::Ident(n) => params.push(n),
+                            // `@(~, x)` — ignored input slot.
+                            Tok::Tilde => params.push("~".into()),
                             Tok::Comma | Tok::Newline => {}
                             Tok::RParen => break,
                             t => return self.err(format!("expected parameter or ')' in anonymous function, found {t:?}")),
