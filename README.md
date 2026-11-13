@@ -36,7 +36,9 @@ and [`docs/gaps.md`](docs/gaps.md); the complete function dictionary is
 [`docs/functions.md`](docs/functions.md). Landed since the first sweep: `@`
 anonymous functions/handles, `classdef` OOP, N-D indexing, `global`/
 `persistent`, `import`, PNG image I/O, file I/O, regex, latin-1 sources.
-Not yet: most toolbox functions, object arrays/`subsref`, deferred
+Toolboxes are in: optimization, control (`tf`/`ss`/`bode`/`margin`/
+`pidtune`), statistics + clustering, t-SNE/UMAP, graphs, bioinformatics,
+HDF5/netCDF/xlsx I/O. Not yet: object arrays/`subsref`, deferred
 classdef attribute enforcement, and Simulink-style modeling (the SimCraft
 sibling — `sim.run`/`model.*` commands already bridge it). See
 [`ROADMAP.md`](ROADMAP.md).
