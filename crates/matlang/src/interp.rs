@@ -5997,7 +5997,7 @@ impl Session {
             }
             // --- DSP / image -------------------------------------------------------
             "fir1" | "fspecial" | "peaks" | "im2double" => {
-                let outs = self.dspimg_call(name, args)?;
+                let outs = self.dspimg_call(name, args, 1)?;
                 Ok(outs.into_iter().next())
             }
             "imread" | "imwrite" => self.image_io(name, args),
@@ -7720,7 +7720,7 @@ impl Session {
             | "drawnow" | "beep" | "waitbar" | "input" | "ishandle" | "findobj" | "findall" | "ishold" | "gca" | "help" | "doc" | "class"
             | "inline" | "optimset" | "optimget" | "nargchk" => self.sys_call(name, args)?,
             "cov" | "prctile" | "quantile" | "hist" | "histc" => self.stat_call(name, args)?,
-            "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args)?,
+            "fir1" | "fspecial" | "peaks" | "im2double" => self.dspimg_call(name, args, nout)?,
             "datenum" | "now" | "clock" | "etime" | "datestr" => self.date_call(name, args)?,
             "csvwrite" | "dlmwrite" | "dlmread" | "readmatrix" | "writematrix" => self.delim_call(name, args)?,
             "log2" => {
@@ -9589,7 +9589,9 @@ impl Session {
     }
 
     /// `fir1`/`fspecial`/`peaks`/`im2double` — small DSP/image generators.
-    fn dspimg_call(&mut self, name: &str, args: &[Expr]) -> Result<Vec<Value>, LangError> {
+    /// `nout` is the requested output count (`peaks` returns `z` alone for
+    /// ≤1 outputs, `[x y z]` for more).
+    fn dspimg_call(&mut self, name: &str, args: &[Expr], nout: usize) -> Result<Vec<Value>, LangError> {
         let v = self.eval_args(args)?;
         match name {
             "fir1" => {
@@ -9798,7 +9800,13 @@ impl Session {
                         let _ = z.set(r, c, zv);
                     }
                 }
-                Ok(vec![Value::Mat(x), Value::Mat(y), Value::Mat(z)])
+                // `peaks` alone / `Z = peaks(n)` returns the height field;
+                // `[X,Y,Z] = peaks(n)` returns the meshgrid too.
+                if nout <= 1 {
+                    Ok(vec![Value::Mat(z)])
+                } else {
+                    Ok(vec![Value::Mat(x), Value::Mat(y), Value::Mat(z)])
+                }
             }
             "im2double" => {
                 let m = v.first().ok_or_else(|| LangError::new("im2double needs an image", 0))?.to_numeric()?;

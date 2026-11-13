@@ -72,6 +72,15 @@ sibling — `sim.run`/`model.*` commands already bridge it). See
   inspector + variable editor, editor with MATLAB-style syntax colors and
   F5/F9, figure dock with pan/zoom, current-folder browser.
 
+## Figures
+
+Rendered by MatCraft's own `saveas` — the same SVG→PNG path the Studio
+figure dock and `exportgraphics` use:
+
+| `plot` + `text` | `surf(peaks)` | `imshow(peaks,[])` | `bar(magic(4))` |
+|---|---|---|---|
+| ![lines](docs/images/fig-lines.png) | ![surf](docs/images/fig-surf.png) | ![imshow](docs/images/fig-imshow.png) | ![bar](docs/images/fig-bar.png) |
+
 ## Getting started
 
 ```bash
