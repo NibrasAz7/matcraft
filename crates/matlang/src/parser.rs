@@ -222,6 +222,31 @@ impl Parser {
         if self.at_ident("classdef") {
             return self.parse_classdef(depth);
         }
+        if self.at_ident("arguments") && self.peek2() != &Tok::Eq {
+            // `arguments … end` — argument-validation block (R2019b+).
+            // Declarations and validators are tolerated, not enforced.
+            self.next();
+            let mut nest = 0i32;
+            loop {
+                match self.peek() {
+                    Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                        nest += 1;
+                        self.next();
+                    }
+                    Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                        nest -= 1;
+                        self.next();
+                    }
+                    Tok::Ident(k) if k == "end" && nest <= 0 => break,
+                    Tok::Eof => break,
+                    _ => {
+                        self.next();
+                    }
+                }
+            }
+            let _ = self.close_block();
+            return Ok(Stmt::Noop);
+        }
         if self.at_ident("try") {
             self.next();
             self.skip_inline_separators();
@@ -255,7 +280,12 @@ impl Parser {
             let dot_path = matches!(self.peek2(), Tok::Dot)
                 && self.ws_before(self.pos + 1)
                 && matches!(self.peek3(), Tok::Dot | Tok::Slash | Tok::Backslash | Tok::DotSlash);
-            if matches!(self.peek2(), Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) || dot_path {
+            // `mex -outdir …`: a `-flag` glued to a word is a command arg,
+            // not subtraction — the flag's letters must touch the `-`.
+            let flag_arg = matches!(self.peek2(), Tok::Minus) && matches!(self.peek3(), Tok::Ident(_) | Tok::Str(_)) && !self.ws_before(self.pos + 2);
+            // `cd ~` / `cd ~/x`: a `~`-rooted path is a command arg.
+            let tilde_arg = matches!(self.peek2(), Tok::Tilde);
+            if matches!(self.peek2(), Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) || dot_path || flag_arg || tilde_arg {
                 self.next();
                 let mut args = Vec::new();
                 loop {
@@ -276,6 +306,12 @@ impl Parser {
                         Tok::Minus => {
                             self.next();
                             "-".to_string()
+                        }
+                        // `cd ~/x` — the `~` opens the first word; glued
+                        // continuation absorbs `/x`.
+                        Tok::Tilde => {
+                            self.next();
+                            "~".to_string()
                         }
                         // Leading `.` of a `..`/`./` path arg; the glued-continuation
                         // loop below absorbs the rest (`..`, `../x`, `..\x`).
@@ -1126,6 +1162,8 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(e)
             }
+            // `?pkg.Class` — metaclass reference (meta.class object).
+            Tok::Question => Ok(Expr::MetaClass(self.dotted_name()?)),
             Tok::LBracket => Ok(Expr::Matrix(self.table_literal(depth, &Tok::RBracket)?)),
             Tok::LBrace => Ok(Expr::CellMat(self.table_literal(depth, &Tok::RBrace)?)),
             Tok::At => match self.next() {
@@ -1260,6 +1298,7 @@ fn tok_text(t: &Tok) -> Option<String> {
         Tok::DotApos => ".'".into(),
         Tok::Apostrophe => "'".into(),
         Tok::Tilde => "~".into(),
+        Tok::Question => "?".into(),
         Tok::LParen => "(".into(),
         Tok::RParen => ")".into(),
         Tok::LBracket => "[".into(),

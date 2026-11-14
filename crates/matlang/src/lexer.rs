@@ -60,6 +60,8 @@ pub enum Tok {
     PipePipe,
     /// `!` — shell escape at statement start (`!dir`, `!del f.txt`).
     Bang,
+    /// `?` — metaclass reference (`?MyClass`).
+    Question,
     Eof,
 }
 
@@ -74,6 +76,10 @@ pub struct Lexed {
 }
 
 /// Does this token allow a following `'` to mean transpose?
+/// Keywords that can never end an operand — a `'` glued to one opens a
+/// string (`case'2d'`), never a transpose.
+const QUOTE_AFTER_KEYWORD: &[&str] = &["case", "otherwise"];
+
 fn ends_operand(t: &Tok) -> bool {
     matches!(t, Tok::Num(_) | Tok::CNum(_) | Tok::Ident(_) | Tok::Str(_) | Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Apostrophe | Tok::DotApos)
 }
@@ -201,6 +207,7 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                         && (j == 0 || matches!(toks[j - 1].tok, Tok::Newline | Tok::Semicolon | Tok::Comma))
                 };
                 let open_string = !prev_ends_operand
+                    || matches!(toks.last().map(|l| &l.tok), Some(Tok::Ident(k)) if QUOTE_AFTER_KEYWORD.contains(&k.as_str()))
                     || (pending_ws && matches!(toks.last().map(|l| &l.tok), Some(Tok::Str(_))))
                     || (pending_ws && command_arg)
                     || (pending_ws && literal_depth > 0);
@@ -261,12 +268,16 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                 }
                 push!(Tok::Str(s));
             }
-            '#' if i == 0 && chars.get(1) == Some(&'!') => {
-                // `#!…` shebang line (Octave-style script headers): a
-                // comment through end of line when it opens the file.
+            '#' => {
+                // `#` — Octave-style line comment (the `#!` shebang is a
+                // special case of the same rule).
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
+            }
+            '?' => {
+                i += 1;
+                push!(Tok::Question);
             }
             '+' => {
                 i += 1;
@@ -420,14 +431,15 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
             i += 1;
         }
     }
-    // Exponent.
-    if matches!(chars.get(i), Some('e') | Some('E')) {
+    // Exponent — `e`/`E` and the Fortran `d`/`D` form Octave accepts
+    // (`0.5d-6` == `0.5e-6`); normalize `d`/`D` to `e` for the parse.
+    if matches!(chars.get(i), Some('e') | Some('E') | Some('d') | Some('D')) {
         let mut j = i + 1;
         if matches!(chars.get(j), Some('+') | Some('-')) {
             j += 1;
         }
         if chars.get(j).map(|c| c.is_ascii_digit()) == Some(true) {
-            text.push(chars[i]);
+            text.push('e');
             i += 1;
             if matches!(chars.get(i), Some('+') | Some('-')) {
                 text.push(chars[i]);

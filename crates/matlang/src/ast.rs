@@ -40,6 +40,8 @@ pub enum Expr {
     /// `@(a, b) expr` — an anonymous function; captures the workspace
     /// visible at definition time (M-code semantics).
     AnonFunc(Vec<String>, Box<Expr>),
+    /// `?pkg.Class` — a metaclass reference (`meta.class` object).
+    MetaClass(String),
     /// `expr@Super(args)` — explicit superclass call inside a method.
     /// `obj@Super(...)` invokes the superclass constructor on the object
     /// bound to `obj`; `name@Super(obj, ...)` (or `obj.name@Super(...)`)

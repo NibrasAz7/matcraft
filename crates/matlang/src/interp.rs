@@ -2905,6 +2905,12 @@ impl Session {
                 }
             }
             Expr::FuncRef(name) => Ok(Some(Value::Func(FuncHandle::Named(name.clone())))),
+            // `?pkg.Class` — a meta.class object carrying the class name.
+            Expr::MetaClass(name) => {
+                let mut props = StructArray::new();
+                props.set_field(0, "Name", Value::Str(name.clone()))?;
+                Ok(Some(Value::Object(MObject::new("meta.class".into(), props, false))))
+            }
             Expr::AnonFunc(params, body) => {
                 // The closure captures the whole visible workspace now —
                 // later edits to those variables don't reach it.
@@ -18365,7 +18371,7 @@ fn expr_idents(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
                 expr_idents(a, out);
             }
         }
-        Expr::Num(_) | Expr::CNum(_) | Expr::Str(_) | Expr::Colon | Expr::End | Expr::FuncRef(_) => {}
+        Expr::Num(_) | Expr::CNum(_) | Expr::Str(_) | Expr::Colon | Expr::End | Expr::FuncRef(_) | Expr::MetaClass(_) => {}
     }
 }
 
@@ -19125,6 +19131,7 @@ fn expr_text(e: &Expr) -> String {
         Expr::FuncRef(n) => format!("@{n}"),
         Expr::AnonFunc(params, body) => format!("@({}){}", params.join(","), expr_text(body)),
         Expr::SuperCall(c, s, args) => format!("{}@{}({})", pexpr(c), s, expr_text_args(args)),
+        Expr::MetaClass(n) => format!("?{n}"),
     }
 }
 
@@ -22064,8 +22071,9 @@ legend('sig'); grid on; saveas('{f}')"
         let mut s = Session::new();
         s.run("#! /usr/bin/octave -qf\nx = 42;").unwrap();
         assert_eq!(s.get("x"), Some(&Value::Num(42.0)));
-        // `#` elsewhere is still a syntax error.
-        assert!(s.run("x = 1\n# nope").is_err());
+        // `#` is an Octave-style line comment anywhere (not just shebangs).
+        s.run("x = 1\n# Octave-style comment\nx = x + 1").unwrap();
+        assert_eq!(s.get("x"), Some(&Value::Num(2.0)));
     }
 
     #[test]
