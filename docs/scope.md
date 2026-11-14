@@ -22,6 +22,7 @@ These are tracked as post-1.0 depth work, not as incomplete blocks.
 | Area | Status | Reason |
 | --- | --- | --- |
 | Deployment | macOS/Linux device QA, signing/notarization, public web hosting | Requires external machines, certificates and hosting credentials. |
+| Binary MEX plugins (`.mexw64`/`.mexa64`/`.mexmaci64`) | Out of scope | Existing MEX binaries link the MathWorks `mxArray`/`libmex` ABI, which cannot be supported without reverse-engineering a MathWorks installation — forbidden by the clean-room rule. `mex` the compiler builtin stays unsupported. Native interop is planned as `loadlibrary`/`calllib`-style C FFI (plain C signatures, no MATLAB ABI) — see `docs/gaps.md` G56. |
 
 ## Evidence
 

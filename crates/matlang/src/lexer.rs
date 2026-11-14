@@ -124,9 +124,57 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                 pending_ws = true;
             }
             '%' => {
-                // Comment to end of line.
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
+                // `%{` alone on a line opens a block comment; it ends at a
+                // line whose only content is `%}` (leading whitespace ok).
+                // Not nested — a `%{` inside is plain comment text.
+                let opens_block = chars.get(i + 1) == Some(&'{') && chars[i + 2..].iter().take_while(|c| **c != '\n').all(|c| c.is_whitespace());
+                if opens_block {
+                    let start_line = line;
+                    i += 2;
+                    // Finish the `%{` line; `i` lands on the next line start.
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                        line += 1;
+                    }
+                    let mut closed = false;
+                    while i < chars.len() && !closed {
+                        // `i` is a line start here.
+                        let mut j = i;
+                        while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
+                            j += 1;
+                        }
+                        if chars.get(j) == Some(&'%')
+                            && chars.get(j + 1) == Some(&'}')
+                            && chars[j + 2..].iter().take_while(|c| **c != '\n').all(|c| c.is_whitespace())
+                        {
+                            // Consume to end of the `%}` line, leaving the
+                            // newline for the main loop.
+                            i = j + 2;
+                            while i < chars.len() && chars[i] != '\n' {
+                                i += 1;
+                            }
+                            closed = true;
+                        } else {
+                            while i < chars.len() && chars[i] != '\n' {
+                                i += 1;
+                            }
+                            if i < chars.len() {
+                                i += 1;
+                                line += 1;
+                            }
+                        }
+                    }
+                    if !closed {
+                        return Err(LangError::new("unterminated '%{' block comment", start_line));
+                    }
+                } else {
+                    // Comment to end of line.
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
                 }
             }
             '.' if chars.get(i + 1) == Some(&'.') && chars.get(i + 2) == Some(&'.') => {
@@ -492,5 +540,14 @@ mod tests {
     fn continuation_skips_newline() {
         let t = kinds("a = 1 + ...\n2");
         assert_eq!(t.iter().filter(|k| **k == Tok::Newline).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod blk_tests {
+    #[test]
+    fn block_comment() {
+        let toks = super::lex("a = 1;\n%{\ncomment line\n%}\nb = 2;\n").unwrap();
+        assert!(toks.iter().any(|t| matches!(&t.tok, super::Tok::Ident(n) if n == "b")));
     }
 }

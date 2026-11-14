@@ -254,9 +254,11 @@ impl Parser {
             let (catch_var, catch_body) = if self.at_ident("catch") {
                 self.next();
                 // `catch e` binds the exception; bare `catch` doesn't.
-                // An identifier directly after `catch` is the variable.
+                // An identifier directly after `catch` is the variable —
+                // unless it's `catch x = …`, Octave dialect where the
+                // identifier starts the first catch-body statement.
                 let var = match self.peek() {
-                    Tok::Ident(n) => {
+                    Tok::Ident(n) if self.peek2() != &Tok::Eq => {
                         let n = n.clone();
                         self.next();
                         Some(n)
@@ -741,9 +743,11 @@ impl Parser {
                 }
                 Tok::Eof => return self.err("missing 'end' for 'methods'"),
                 Tok::Ident(k) if k == "function" => {
-                    // Inside `methods` a `function` keyword is the next
-                    // method, never a nested function (`nested = false`).
-                    let mut fns = self.parse_function(depth, SECTION_STOPS, false)?;
+                    // `nested = true`: a `function` inside a method body is a
+                    // nested function (end-terminated style); an unterminated
+                    // method hoists the absorbed `function` out as the next
+                    // sibling — which is the next method here.
+                    let mut fns = self.parse_function(depth, SECTION_STOPS, true)?;
                     if fns.is_empty() {
                         return self.err("internal: expected a function definition");
                     }
@@ -929,19 +933,21 @@ impl Parser {
     }
 
     fn compare(&mut self, depth: usize) -> Result<Expr, LangError> {
-        let left = self.add(depth)?;
-        let op = match self.peek() {
-            Tok::EqEq => BinOp::Eq,
-            Tok::Neq => BinOp::Neq,
-            Tok::Lt => BinOp::Lt,
-            Tok::Le => BinOp::Le,
-            Tok::Gt => BinOp::Gt,
-            Tok::Ge => BinOp::Ge,
-            _ => return Ok(left),
-        };
-        self.next();
-        let right = self.add(depth)?;
-        Ok(Expr::Binary(op, Box::new(left), Box::new(right)))
+        let mut left = self.add(depth)?;
+        loop {
+            let op = match self.peek() {
+                Tok::EqEq => BinOp::Eq,
+                Tok::Neq => BinOp::Neq,
+                Tok::Lt => BinOp::Lt,
+                Tok::Le => BinOp::Le,
+                Tok::Gt => BinOp::Gt,
+                Tok::Ge => BinOp::Ge,
+                _ => return Ok(left),
+            };
+            self.next();
+            let right = self.add(depth)?;
+            left = Expr::Binary(op, Box::new(left), Box::new(right));
+        }
     }
 
     fn add(&mut self, depth: usize) -> Result<Expr, LangError> {
