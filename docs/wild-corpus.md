@@ -32,38 +32,46 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **1,897** |
-| parse-ok / parse-fail | **10,071 / 27** | — / 33 |
-| unknown builtin/function | 1 | 506 |
-| runtime error | 6 | 95 |
-| missing data/env files | 0 | 99 |
-| timeout | 0 | 3 |
+| clean run | — | **1,907** |
+| parse-ok / parse-fail | **10,082 / 23** | — / 15 |
+| unknown builtin/function | 1 | 516 |
+| runtime error | 6 | 71 |
+| missing data/env files | 0 | 115 |
+| timeout | 0 | 2 |
 | **total** | 10,105 | 2,633 |
 
-- **Parser coverage: 10,071/10,105 function files (99.7%)** parse
-  cleanly. The latest grammar wave — `get.prop`/`set.prop` classdef
-  accessors, `~` placeholders in anonymous-function parameter lists
-  (`@(~,~) cb()`), and the `randi([lo hi])` range form — moved ~80
-  files out of the failure buckets (BPL and chebfun `@functionalBlock`
-  classes needed dotted accessor names; mexopencv GUI samples needed
-  `@(~,~)`).
-- **Remaining parse-fails (60) are almost all non-ASCII source** — the
-  lexer rejects stray bytes like `µ`, `²`, `?`-mojibake and mid-code
-  Latin-1 characters (~25 files), plus a small tail of genuine edge
-  syntax (`unexpected Eq` ×7 and singles). No class-level grammar gap
-  remains in this corpus.
-- **The 99 env-errors are all missing sibling data files** — scripts
-  that `load`/`imread` `*.mat`/`*.txt`/`*.jpg` files the harvest never
-  downloads (it collects `.m` only). Expected, not a gap.
-- **The 506 unknown-builtin failures are dominated by MEX/toolbox
+- **Parser coverage: 10,082/10,105 function files (99.8%)** parse
+  cleanly. Two grammar waves landed against this corpus: (1)
+  `get.prop`/`set.prop` classdef accessors, `~` in anonymous params
+  (`@(~,~) cb()`), `randi([lo hi])`; (2) `?ClassName` metaclass refs
+  (evaluating to `meta.class` objects), `arguments … end` validation
+  blocks (tolerated, not enforced), `#` Octave line comments,
+  command-form `-flag` args (`mex -outdir bin`) and `~` paths
+  (`cd ~/x`), `case'2d'` keyword-quote strings, Fortran `d`/`D`
+  exponents (`0.5d-6`), and `zeros(m,n,'uint8')`/`'like',x` type-spec
+  tails (accepted; all values are f64 — a documented deviation).
+- **Remaining parse-fails (38) are not grammar gaps** — macOS `._*`
+  AppleDouble junk (9), mojibake'd non-UTF8 source bytes (8), and
+  prose/comment lines that lost their `%` (`-> …`, bare paths,
+  statements with no separator) which MATLAB also rejects.
+- **The 115 env-errors are missing sibling files** — scripts that
+  `load`/`imread`/`fscanf` `*.mat`/`*.txt`/`*.jpg`/`*.fig` the harvest
+  never downloads, plus `cd` into lab-machine absolute paths.
+- **The 516 unknown-builtin failures are dominated by MEX/toolbox
   externals**: `mexopencv`/`cv` (123 hits — the mexopencv MEX layer),
   `iread`, `readNEMOH`, `readWAMIT`, `simulationClass`, `SerialLink`,
   `mdl_puma560` (Corke/WEC-Sim entry points), `cfg` (FieldTrip's MEX
-  config system), `kmeansRnd`, `randinit`, `modem` — functions that
-  live in repo-internal subdirectories (`+pkg`, `private/`, MEX
-  wrappers) that even MATLAB needs `addpath(genpath(pwd))` or compiled
-  binaries to find.
-- **3 timeouts** are heavy scripts genuinely computing for >15 s
+  config system), `kmeansRnd`, `randinit`, `modem`, `TestSuite`
+  (matlab.unittest) — functions that live in repo-internal
+  subdirectories (`+pkg`, `private/`, MEX wrappers) that even MATLAB
+  needs `addpath(genpath(pwd))` or compiled binaries to find.
+- **The 77 runtime errors** are a long tail: `A^B` matrix-exponent
+  calls that MATLAB rejects identically (8), deeper per-file semantic
+  gaps (struct→scalar coercion sites, `too few outputs`), the
+  documented `['a';'b']` multi-row char-array limitation (3), and
+  index/struct-boundary singles. `for s = structArray` column
+  iteration landed from this tail.
+- **2 timeouts** are heavy scripts genuinely computing for >15 s
   (FieldTrip/WEC-Sim pipelines), not hangs.
 
 ## What this corpus exercised that the old one didn't

@@ -2130,6 +2130,27 @@ impl Session {
                     }
                     return Ok(Flow::Normal);
                 }
+                if let Value::Struct(sa) = &it {
+                    // `for s = dirlist'` iterates the struct array's
+                    // columns; each loop value is a rows×1 struct.
+                    for c in 0..sa.cols() {
+                        let mut sub = StructArray::with_dims(sa.rows(), 1);
+                        for (name, vals) in &sa.fields {
+                            let col: Vec<Value> = (0..sa.rows())
+                                .map(|r| vals.get(r + c * sa.rows()).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))
+                                .collect();
+                            sub.fields.push((name.clone(), col));
+                        }
+                        self.put_var(var, Value::Struct(sub));
+                        match self.exec_block(body, out)? {
+                            Flow::Normal => {}
+                            Flow::Break => break,
+                            Flow::Continue => continue,
+                            Flow::Return => return Ok(Flow::Return),
+                        }
+                    }
+                    return Ok(Flow::Normal);
+                }
                 let m = it.to_numeric()?;
                 // The loop variable takes each column of `iter` in turn;
                 // for a row vector `1:n` each column is a scalar. On N-D
@@ -15634,6 +15655,13 @@ impl Session {
     /// Shared choke point for `zeros`/`ones`/`eye`/`rand`/`randn`/`Inf`/`NaN`:
     /// the element count is capped before any allocation is attempted.
     fn dim_vec(&mut self, args: &[Expr]) -> Result<Vec<usize>, LangError> {
+        // `zeros(dims…, 'uint8')` / `…, 'like', x` — a type-spec tail.
+        // MatCraft values are all f64; the type is accepted and ignored
+        // (documented deviation: no integer/single element types).
+        const TYPE_SPEC: &[&str] =
+            &["double", "single", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "logical", "char", "like"];
+        let cut = args.iter().position(|a| matches!(a, Expr::Str(s) if TYPE_SPEC.contains(&s.to_ascii_lowercase().as_str())));
+        let args = cut.map_or(args, |p| &args[..p]);
         let dims = match args.len() {
             0 => vec![1, 1],
             1 => {
