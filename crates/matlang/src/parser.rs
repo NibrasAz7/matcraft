@@ -433,14 +433,26 @@ impl Parser {
         }
     }
 
+    /// Condition expression for `if`/`elseif`/`while`: legacy M-code
+    /// tolerates a single `=` where `==` is meant (`if nargin = 3`).
+    fn cond_expr(&mut self, depth: usize) -> Result<Expr, LangError> {
+        let left = self.expr(depth)?;
+        if self.peek() == &Tok::Eq {
+            self.next();
+            let right = self.expr(depth)?;
+            return Ok(Expr::Binary(BinOp::Eq, Box::new(left), Box::new(right)));
+        }
+        Ok(left)
+    }
+
     fn parse_if(&mut self, depth: usize) -> Result<Stmt, LangError> {
         self.next(); // 'if'
-        let cond = self.expr(depth)?;
+        let cond = self.cond_expr(depth)?;
         self.skip_inline_separators();
         let mut arms = vec![(Some(cond), self.block(&["elseif", "else", "end"], depth)?)];
         while self.at_ident("elseif") {
             self.next();
-            let c = self.expr(depth)?;
+            let c = self.cond_expr(depth)?;
             self.skip_inline_separators();
             let body = self.block(&["elseif", "else", "end"], depth)?;
             arms.push((Some(c), body));
@@ -479,7 +491,7 @@ impl Parser {
 
     fn parse_while(&mut self, depth: usize) -> Result<Stmt, LangError> {
         self.next(); // 'while'
-        let cond = self.expr(depth)?;
+        let cond = self.cond_expr(depth)?;
         self.skip_inline_separators();
         let body = self.block(&["end"], depth)?;
         self.close_block()?;
@@ -587,7 +599,11 @@ impl Parser {
         loop {
             self.skip_separators();
             match self.peek() {
-                Tok::Ident(k) if Self::closes_block(k, &stops) => {
+                // Section stop keywords (`properties`, `methods`, …) only
+                // close the body where a section header can appear — a
+                // `properties = x` / `properties.x` statement inside the body
+                // is an ordinary identifier use.
+                Tok::Ident(k) if Self::closes_block(k, &stops) && (k == "end" || !matches!(self.peek2(), Tok::Eq | Tok::Dot)) => {
                     self.next();
                     terminated = true;
                     break;
