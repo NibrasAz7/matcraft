@@ -6,7 +6,9 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_else(|| "ci".into());
     match task.as_str() {
         "ci" => ci(),
-        "fmt" => run(&["fmt", "--all", "--", "--check"]),
+        // No `--all`: it would drag in every local path dep (craft-libs'
+        // ~200 crates) and overflow the Windows command-line limit.
+        "fmt" => run(&["fmt", "--", "--check"]),
         "test" => run(&["test", "--workspace"]),
         "clippy" => run(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
         "layers" => layers(),
@@ -20,7 +22,7 @@ fn main() -> ExitCode {
 
 fn ci() -> ExitCode {
     let steps: [&[&str]; 3] =
-        [&["fmt", "--all", "--", "--check"], &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], &["test", "--workspace"]];
+        [&["fmt", "--", "--check"], &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], &["test", "--workspace"]];
     for args in steps {
         if run(args) != ExitCode::SUCCESS {
             return ExitCode::FAILURE;

@@ -23,8 +23,8 @@ matplot = { path = "../matplot" }
 matcraft_engine = { path = "../engine" }
 craft-quit = { path = "../../../craft-libs/crates/quit", features = ["egui"] }
 craft-settings = { path = "../../../craft-libs/crates/settings" }
-egui = "0.36"
-eframe = "0.36"
+egui = "0.37"
+eframe = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

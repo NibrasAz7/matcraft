@@ -175,7 +175,7 @@ impl Editor {
         let mut close = false;
         ui.horizontal(|ui| {
             ui.label("Find:");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.find.query).desired_width(160.0).id(egui::Id::new(("find-query", salt))));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.find.query).desired_width(160.0).id(egui::Id::unique(("find-query", salt))));
             if std::mem::take(&mut self.find.want_focus) {
                 r.request_focus();
             }
@@ -293,14 +293,12 @@ impl Editor {
         let pause_ln = self.pause_line;
 
         // ---- buffer with gutter ------------------------------------------
-        let edit_id = egui::Id::new(("editor-text", salt));
+        let edit_id = egui::Id::unique(("editor-text", salt));
         let avail_h = ui.available_height().max(40.0);
-        let mut scroll_id = egui::Id::new(0u8);
         let (grect, gresp, output) = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (grect, gresp) = ui.allocate_exact_size(egui::vec2(30.0, avail_h), egui::Sense::click());
-                scroll_id = ui.make_persistent_id("editor-scroll");
                 let output = egui::ScrollArea::vertical()
                     .id_salt("editor-scroll")
                     .auto_shrink([false, false])
@@ -340,7 +338,7 @@ impl Editor {
                 let x = output.galley_pos.x + caret.left();
                 let y = output.galley_pos.y + caret.top();
                 let accent = egui::Color32::from_rgb(0x1E, 0x6F, 0xD9);
-                egui::Area::new(egui::Id::new(("param-hint", salt)))
+                egui::Area::new(egui::Id::unique(("param-hint", salt)))
                     .order(egui::Order::Foreground)
                     .interactable(false)
                     .pivot(egui::Align2::LEFT_BOTTOM)
@@ -439,11 +437,12 @@ impl Editor {
         if let Some(c) = want_char {
             let lc = output.galley.layout_from_cursor(egui::text::CCursor::new(c));
             if let Some(row) = output.galley.rows.get(lc.row) {
-                let mut st = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
                 // `galley_pos` already carries the current scroll offset —
-                // fold it back to content coordinates, minus a small margin.
-                st.offset.y = (st.offset.y + output.galley_pos.y + row.pos.y - output.text_clip_rect.top() - 4.0).max(0.0);
-                st.store(ui.ctx(), scroll_id);
+                // the row's screen rect folded back 4px keeps a small margin.
+                let top = output.galley_pos.y + row.pos.y - 4.0;
+                let row_rect =
+                    egui::Rect::from_min_max(egui::pos2(output.galley_pos.x, top), egui::pos2(output.galley_pos.x + 1.0, top + row.size.y + 8.0));
+                ui.scroll_to_rect_animation(row_rect, Some(egui::Align::TOP), egui::style::ScrollAnimation::none());
             }
         }
         if std::mem::take(&mut self.want_text_focus) {

@@ -155,7 +155,12 @@ pub fn handle(app: &mut MatApp, ctx: &egui::Context, req: ControlRequest) {
         }
         "ui.screenshot" => {
             let path = params.get("path").and_then(Json::as_str).map(str::to_string);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            let slot = app.shot_slot.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |image| {
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(image);
+                }
+            })));
             app.pending_shots.push((req, path));
             ctx.request_repaint();
         }

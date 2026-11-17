@@ -106,7 +106,7 @@ pub fn ui(ui: &mut egui::Ui, ff: &mut FindFiles, cwd: &Path) -> Option<(PathBuf,
     let mut go = false;
     ui.horizontal(|ui| {
         ui.label("Find:");
-        let r = ui.add(egui::TextEdit::singleline(&mut ff.query).desired_width(220.0).id(egui::Id::new("find-files-query")));
+        let r = ui.add(egui::TextEdit::singleline(&mut ff.query).desired_width(220.0).id(egui::Id::unique("find-files-query")));
         if std::mem::take(&mut ff.want_focus) {
             r.request_focus();
         }

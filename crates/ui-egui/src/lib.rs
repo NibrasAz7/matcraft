@@ -21,7 +21,6 @@ mod ribbon;
 mod workspace;
 
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 
 use serde_json::{json, Value as Json};
 
@@ -154,6 +153,8 @@ pub struct MatApp {
     pub raster: Rasterizer,
     /// `ui.screenshot` requests waiting for a presented frame.
     pub pending_shots: Vec<(ControlRequest, Option<String>)>,
+    /// Filled by the `Screenshot` viewport-command callback.
+    pub shot_slot: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>>>,
     control_rx: Option<Receiver<ControlRequest>>,
     repl: Repl,
     /// Open editor buffers — each owns one document tab.
@@ -239,6 +240,7 @@ impl MatApp {
             session: matcraft_engine::Session::new(),
             raster: Rasterizer::new(),
             pending_shots: Vec::new(),
+            shot_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             control_rx: opts.control_rx,
             repl: Repl::new(),
             editors: vec![Editor::new()],
@@ -568,19 +570,11 @@ impl MatApp {
     }
 
     /// When a `Screenshot` event lands, answer every queued `ui.screenshot`.
-    fn resolve_screenshots(&mut self, ctx: &egui::Context) {
+    fn resolve_screenshots(&mut self) {
         if self.pending_shots.is_empty() {
             return;
         }
-        let image: Option<Arc<egui::ColorImage>> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                    _ => None,
-                })
-                .next()
-        });
+        let image = self.shot_slot.lock().ok().and_then(|mut s| s.take());
         let Some(image) = image else { return };
         let shots = std::mem::take(&mut self.pending_shots);
         for (req, path) in shots {
@@ -869,7 +863,7 @@ impl MatApp {
         };
         let to_data = |t: f64, log: bool| if log { 10f64.powf(t) } else { t };
 
-        let resp = ui.interact(axr, ui.id().with(("fig-ax", idx)), egui::Sense::click_and_drag());
+        let resp = ui.interact(axr, ui.scope_id().with(("fig-ax", idx)), egui::Sense::click_and_drag());
         let mut new_lim: Option<(f64, f64, f64, f64)> = None;
         let mut auto = reset;
 
@@ -1190,7 +1184,7 @@ impl eframe::App for MatApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.drain_ai(ctx);
         self.sync_debug();
-        self.resolve_screenshots(ctx);
+        self.resolve_screenshots();
         if self.figs_dirty {
             self.rebuild_figures(ctx);
         }
@@ -1408,7 +1402,7 @@ impl eframe::App for MatApp {
                         cd_dirs.push((d, true));
                     }
                 });
-                if !ui.memory(|m| m.has_focus(egui::Id::new("cwd_edit"))) {
+                if !ui.memory(|m| m.has_focus(egui::Id::unique("cwd_edit"))) {
                     let shown = cwd.display().to_string();
                     if self.cwd_text != shown {
                         self.cwd_text = shown;
@@ -1416,7 +1410,7 @@ impl eframe::App for MatApp {
                 }
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.cwd_text)
-                        .id(egui::Id::new("cwd_edit"))
+                        .id(egui::Id::unique("cwd_edit"))
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace),
                 );
