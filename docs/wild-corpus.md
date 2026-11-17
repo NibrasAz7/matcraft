@@ -2,7 +2,7 @@
 
 ## Method
 
-- **Corpus:** 12,738 `.m` files from 38 public GitHub repositories, all
+- **Corpus:** 12,728 `.m` files from 38 public GitHub repositories, all
   last pushed **before 2022** — every file predates 2022. Sources mix
   star-ranked MATLAB repos (DeepLearnToolbox, faster_rcnn, DnCNN,
   mexopencv, PRMLT, MATLABRobotics, BPL, pdollar/toolbox, …) with a
@@ -34,15 +34,15 @@
 
 | Outcome | Function files | Script files |
 | --- | --- | --- |
-| clean run | — | **1,911** |
-| parse-ok / parse-fail | **10,092 / 7** | — / 18 |
-| unknown builtin/function | 0 | 454 |
-| runtime error | 6 | 117 |
-| missing data/env files | 0 | 129 |
-| timeout | 0 | 4 |
-| **total** | 10,105 | 2,633 |
+| clean run | — | **1,913** |
+| parse-ok / parse-fail | **10,095 / 4** | — / 5 |
+| unknown builtin/function | 0 | 515 |
+| runtime error | 6 | 68 |
+| missing data/env files | 0 | 119 |
+| timeout | 0 | 3 |
+| **total** | 10,105 | 2,623 |
 
-- **Parser coverage: 10,092/10,105 function files (99.9%)** parse
+- **Parser coverage: 10,095/10,105 function files (99.9%)** parse
   cleanly. Three grammar waves landed against this corpus: (1)
   `get.prop`/`set.prop` classdef accessors, `~` in anonymous params
   (`@(~,~) cb()`), `randi([lo hi])`; (2) `?ClassName` metaclass refs
@@ -55,16 +55,26 @@
   nested `function`s inside `end`-terminated method bodies
   (`classdef`/`methods` blocks share the file-local hoisting rule),
   `%{ … %}` block comments, `catch x = …` Octave-dialect disambiguation,
-  and left-associative chained comparisons (`a < b > c`).
-- **Remaining parse-fails (25) are not grammar gaps** — macOS `._*`
-  AppleDouble junk (9), mojibake'd non-UTF8 source bytes, and
-  prose/typo lines MATLAB also rejects (`endsourceTFR`, `-> …`,
-  Octave-only `a = b = expr` chained assignment, 2 files).
-- **The 129 env-errors are missing sibling files** — scripts that
+  and left-associative chained comparisons (`a < b > c`); (4) `=`/`==`
+  tolerance in `if`/`elseif`/`while` conditions (`if nargin = 3`),
+  `properties`/`methods` used as ordinary identifiers inside bodies;
+  (5) Octave compound assignment (`x += e`, `v .*= 2`), chained
+  `a = b = e` (binds right-to-left), and `[a, b]` ending a line with
+  `=` opening the next.
+- **Remaining parse-fails (9) are not grammar gaps** — each was
+  inspected: a truncated `fprintf` fragment (`MATVEC_to_WARP`), raw
+  data lines inside an `if(0)` block (`New_input`), a typo'd unclosed
+  `if` (`endsourceTFR`), statements glued with no separator
+  (`idisp(im)im`, `vector_form matrix_form(i,:)`), an Octave session
+  log (`octave_session.m`), a source with spaces inside identifiers
+  (`randInitializeWeights`), and an unbalanced `if` in an old unit
+  test. MATLAB rejects all of them too. The ten macOS `._*` AppleDouble
+  forks are now excluded at harvest time.
+- **The 119 env-errors are missing sibling files** — scripts that
   `load`/`imread`/`fscanf` `*.mat`/`*.txt`/`*.jpg`/`*.fig` the harvest
   never downloads, plus `cd` into lab-machine absolute paths. The
   count grew as the `addpath(genpath)` prelude let scripts run deeper.
-- **The 454 unknown-builtin failures split into two honest halves**:
+- **The 515 unknown-builtin failures split into two honest halves**:
   ~140 are real externals — `mexopencv`/`cv` (the OpenCV MEX bridge),
   `mex`, `syms` (Symbolic Toolbox), `sim`/`sl_*` (Simulink), `websave`
   — the rest are sibling-toolbox functions the harvest didn't capture
@@ -72,14 +82,12 @@
   FieldTrip preamble scripts that reference caller-workspace variables
   (`cfg`) when run standalone. The MEX binary decision is recorded in
   `scope.md` (out of scope) with `loadlibrary`-style FFI as G56.
-- **The 123 runtime errors** are a long tail: `A^B` matrix-exponent
+- **The 74 runtime errors** are a long tail: `A^B` matrix-exponent
   calls that MATLAB rejects identically, deeper per-file semantic gaps
   (struct→scalar coercion sites, `too few outputs`), the documented
   `['a';'b']` multi-row char-array limitation, and index/struct-
-  boundary singles. The count grew from 77 because `addpath(genpath)`
-  lets scripts reach deeper semantics — the same coverage gain that
-  cut unknown-builtin by 63.
-- **4 timeouts** are heavy scripts genuinely computing for >15 s
+  boundary singles.
+- **3 timeouts** are heavy scripts genuinely computing for >15 s
   (FieldTrip/WEC-Sim pipelines), not hangs.
 
 ## What this corpus exercised that the old one didn't
