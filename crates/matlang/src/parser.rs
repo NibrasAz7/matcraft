@@ -49,6 +49,12 @@ pub fn parse_lines(source: &str) -> Result<Vec<(usize, Stmt)>, LangError> {
     p.skip_separators();
     while p.peek() != &Tok::Eof {
         let line = p.line();
+        if p.peek() == &Tok::Eq {
+            let prev = out.pop().map(|(_, s): (usize, Stmt)| s);
+            out.push((line, p.continued_assign(prev, 0)?));
+            p.skip_separators();
+            continue;
+        }
         out.push((line, p.statement(0)?));
         // File-scope functions hoisted out of an unterminated body join
         // the top-level stream right after their nominal parent.
@@ -365,43 +371,109 @@ impl Parser {
         }
         // General statement: expression, optionally `lhs = rhs`.
         let lhs = self.expr(depth)?;
-        if self.peek() == &Tok::Eq {
-            self.next();
-            let value = self.expr(depth)?;
-            let suppress = self.stmt_end()?;
-            return match lhs {
-                Expr::Ident(name) => Ok(Stmt::Assign { name, index: None, braces: false, value, suppress }),
-                Expr::CallOrIndex(name, index) => Ok(Stmt::Assign { name, index: Some(index), braces: false, value, suppress }),
-                // `c{i} = v` — cell content assignment.
-                Expr::BraceIndex(name, index) => Ok(Stmt::Assign { name, index: Some(index), braces: true, value, suppress }),
-                // `s.f = v`, `s.a.b = v`, `s.f(i) = v`, `s.c{i} = v` — field
-                // assignment.
-                e @ (Expr::Field(..) | Expr::DynField(..) | Expr::Index(..) | Expr::BraceIdx(..)) => match field_lhs(e) {
-                    Some((name, path)) => Ok(Stmt::FieldAssign { name, path, value, suppress }),
-                    None => self.err("left side of '=' must be a variable or indexed variable"),
-                },
-                // `[a, b] = f(x)` — a bracketed list of targets. Each slot
-                // is a plain name or an lvalue path (`s.f`, `v(i)`,
-                // `c{1}.g`) — M-code assigns through those directly.
-                Expr::Matrix(rows) if rows.len() == 1 && rows[0].iter().all(|c| matches!(c, Expr::Ident(_)) || field_lhs(c.clone()).is_some()) => {
-                    let targets = rows[0]
-                        .iter()
-                        .map(|c| match c {
-                            Expr::Ident(n) => MultiTarget::Name(n.clone()),
-                            e => match field_lhs(e.clone()) {
-                                Some((n, path)) if !path.is_empty() => MultiTarget::Path(n, path),
-                                Some((n, _)) => MultiTarget::Name(n),
-                                None => MultiTarget::Name(String::new()),
-                            },
-                        })
-                        .collect();
-                    Ok(Stmt::AssignMany { targets, value, suppress })
+        // Octave compound assignment: `x += e` → `x = x + e`.
+        let compound = match Self::compound_op(self.peek()) {
+            Some(op) => {
+                self.next();
+                Some(op)
+            }
+            None => None,
+        };
+        if self.peek() == &Tok::Eq || compound.is_some() {
+            // Octave also chains `a = b = e` — collect the left sides.
+            let mut targets = vec![lhs];
+            let mut value = loop {
+                if self.peek() == &Tok::Eq {
+                    self.next();
                 }
-                _ => self.err("left side of '=' must be a variable or indexed variable"),
+                let v = self.expr(depth)?;
+                if self.peek() != &Tok::Eq {
+                    break v;
+                }
+                targets.push(v);
+            };
+            if let Some(op) = compound {
+                value = Expr::Binary(op, Box::new(targets[0].clone()), Box::new(value));
+            }
+            let suppress = self.stmt_end()?;
+            // `a = b = e` binds right-to-left: `b = e; a = b`.
+            let mut rhs = value;
+            let mut stmts = Vec::new();
+            while let Some(t) = targets.pop() {
+                let next_rhs = t.clone();
+                stmts.push(self.assign_stmt(t, rhs, suppress)?);
+                rhs = next_rhs;
+            }
+            return match stmts.as_slice() {
+                [s] => Ok(s.clone()),
+                _ => Ok(Stmt::Block(stmts)),
             };
         }
         let suppress = self.stmt_end()?;
         Ok(Stmt::Expr(lhs, suppress))
+    }
+
+    /// `=` starting a statement continues the previous expression as its
+    /// left side — `[a, b]` on one line, `= f()` on the next (Octave).
+    fn continued_assign(&mut self, prev: Option<Stmt>, depth: usize) -> Result<Stmt, LangError> {
+        self.next();
+        let value = self.expr(depth)?;
+        let suppress = self.stmt_end()?;
+        match prev {
+            Some(Stmt::Expr(lhs, _)) => self.assign_stmt(lhs, value, suppress),
+            _ => self.err("'=' has no left side"),
+        }
+    }
+
+    /// Octave `x op= e` operators — the token already carries the `=`.
+    fn compound_op(t: &Tok) -> Option<BinOp> {
+        Some(match t {
+            Tok::PlusEq => BinOp::Add,
+            Tok::MinusEq => BinOp::Sub,
+            Tok::StarEq => BinOp::Mul,
+            Tok::SlashEq => BinOp::Div,
+            Tok::BackslashEq => BinOp::Backslash,
+            Tok::CaretEq => BinOp::Pow,
+            Tok::DotStarEq => BinOp::ElemMul,
+            Tok::DotSlashEq => BinOp::ElemDiv,
+            Tok::DotCaretEq => BinOp::ElemPow,
+            _ => return None,
+        })
+    }
+
+    /// `lhs = value` — the left side may be a name, subscript, cell
+    /// subscript, field path or a bracketed target list.
+    fn assign_stmt(&mut self, lhs: Expr, value: Expr, suppress: bool) -> Result<Stmt, LangError> {
+        match lhs {
+            Expr::Ident(name) => Ok(Stmt::Assign { name, index: None, braces: false, value, suppress }),
+            Expr::CallOrIndex(name, index) => Ok(Stmt::Assign { name, index: Some(index), braces: false, value, suppress }),
+            // `c{i} = v` — cell content assignment.
+            Expr::BraceIndex(name, index) => Ok(Stmt::Assign { name, index: Some(index), braces: true, value, suppress }),
+            // `s.f = v`, `s.a.b = v`, `s.f(i) = v`, `s.c{i} = v` — field
+            // assignment.
+            e @ (Expr::Field(..) | Expr::DynField(..) | Expr::Index(..) | Expr::BraceIdx(..)) => match field_lhs(e) {
+                Some((name, path)) => Ok(Stmt::FieldAssign { name, path, value, suppress }),
+                None => self.err("left side of '=' must be a variable or indexed variable"),
+            },
+            // `[a, b] = f(x)` — a bracketed list of targets. Each slot
+            // is a plain name or an lvalue path (`s.f`, `v(i)`,
+            // `c{1}.g`) — M-code assigns through those directly.
+            Expr::Matrix(rows) if rows.len() == 1 && rows[0].iter().all(|c| matches!(c, Expr::Ident(_)) || field_lhs(c.clone()).is_some()) => {
+                let targets = rows[0]
+                    .iter()
+                    .map(|c| match c {
+                        Expr::Ident(n) => MultiTarget::Name(n.clone()),
+                        e => match field_lhs(e.clone()) {
+                            Some((n, path)) if !path.is_empty() => MultiTarget::Path(n, path),
+                            Some((n, _)) => MultiTarget::Name(n),
+                            None => MultiTarget::Name(String::new()),
+                        },
+                    })
+                    .collect();
+                Ok(Stmt::AssignMany { targets, value, suppress })
+            }
+            _ => self.err("left side of '=' must be a variable or indexed variable"),
+        }
     }
 
     /// Does `k` terminate a block expecting one of `keywords`? `end` and
@@ -418,6 +490,11 @@ impl Parser {
             match self.peek() {
                 Tok::Ident(k) if Self::closes_block(k, keywords) => return Ok(out),
                 Tok::Eof => return self.err(format!("missing 'end' (expected one of {keywords:?})")),
+                // Octave lets `[a, b]` end a line and `=` open the next.
+                Tok::Eq => {
+                    let prev = out.pop();
+                    out.push(self.continued_assign(prev, depth + 1)?);
+                }
                 _ => out.push(self.statement(depth + 1)?),
             }
         }
@@ -614,6 +691,10 @@ impl Parser {
                         break; // unterminated body ends at the next function
                     }
                     body.append(&mut self.parse_function(depth + 1, extra_stops, true)?);
+                }
+                Tok::Eq => {
+                    let prev = body.pop();
+                    body.push(self.continued_assign(prev, depth + 1)?);
                 }
                 _ => body.push(self.statement(depth + 1)?),
             }
@@ -1343,6 +1424,15 @@ fn tok_text(t: &Tok) -> Option<String> {
         Tok::AmpAmp => "&&".into(),
         Tok::PipePipe => "||".into(),
         Tok::Bang => "!".into(),
+        Tok::PlusEq => "+=".into(),
+        Tok::MinusEq => "-=".into(),
+        Tok::StarEq => "*=".into(),
+        Tok::SlashEq => "/=".into(),
+        Tok::BackslashEq => "\\=".into(),
+        Tok::CaretEq => "^=".into(),
+        Tok::DotStarEq => ".*=".into(),
+        Tok::DotSlashEq => "./=".into(),
+        Tok::DotCaretEq => ".^=".into(),
         Tok::Newline | Tok::Eof => return None,
     })
 }

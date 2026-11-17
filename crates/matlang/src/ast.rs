@@ -155,6 +155,9 @@ pub enum Stmt {
         catch_var: Option<String>,
         catch_body: Vec<Stmt>,
     },
+    /// Desugared statement group — e.g. Octave's chained `a = b = e`
+    /// becomes `b = e; a = b`. Executes the statements in order.
+    Block(Vec<Stmt>),
     /// A stray block-closer keyword used as a statement — Octave-dialect
     /// `endfunction`/`endif`/… appearing where M-code would not need it.
     /// Parses and executes as nothing.

@@ -2213,6 +2213,14 @@ impl Session {
                     }
                 }
             }
+            Stmt::Block(stmts) => {
+                for s in stmts {
+                    match self.exec_stmt(s, out)? {
+                        Flow::Normal => {}
+                        f => return Ok(f),
+                    }
+                }
+            }
             Stmt::Break => return Ok(Flow::Break),
             Stmt::Continue => return Ok(Flow::Continue),
             Stmt::Return => return Ok(Flow::Return),
@@ -24981,6 +24989,20 @@ end",
         std::fs::write(dir.join("mfp.m"), "function p = mfp()\np = mfilename('fullpath');\nend\n").unwrap();
         s.run("mp = mfp();").unwrap();
         assert!(matches!(s.get("mp"), Some(Value::Str(p)) if p.ends_with("mfp.m")));
+
+        // Octave dialect: `+=` family, chained `=`, leading-`=` continuation,
+        // single `=` as `==` in if/while conditions.
+        s.run("ca = 0; ca += 5; ca .*= 2; cb = cc = 7;").unwrap();
+        assert_eq!(scalar(&s, "ca"), 10.0);
+        assert_eq!(scalar(&s, "cb"), 7.0);
+        assert_eq!(scalar(&s, "cc"), 7.0);
+        s.run("cd_ = 0;\ncd_\n= 9;").unwrap();
+        assert_eq!(scalar(&s, "cd_"), 9.0);
+        s.run("ce = 0; if 1 = 1, ce = 3; end").unwrap();
+        assert_eq!(scalar(&s, "ce"), 3.0);
+        // `properties` is an ordinary identifier outside classdef headers.
+        s.run("properties = 41; properties = properties + 1;").unwrap();
+        assert_eq!(scalar(&s, "properties"), 42.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

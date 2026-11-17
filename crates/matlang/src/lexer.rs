@@ -22,6 +22,16 @@ pub enum Tok {
     DotStar,
     DotSlash,
     DotCaret,
+    /// Octave compound assignments: `+= -= *= /= \= ^= .*= ./= .^=`.
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    BackslashEq,
+    CaretEq,
+    DotStarEq,
+    DotSlashEq,
+    DotCaretEq,
     /// `.` — struct field access (`s.field`).
     Dot,
     /// `.'` non-conjugate transpose.
@@ -194,16 +204,31 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                 let next = chars.get(i + 1).copied();
                 match next {
                     Some('*') => {
-                        i += 2;
-                        push!(Tok::DotStar);
+                        if chars.get(i + 2) == Some(&'=') {
+                            i += 3;
+                            push!(Tok::DotStarEq);
+                        } else {
+                            i += 2;
+                            push!(Tok::DotStar);
+                        }
                     }
                     Some('/') => {
-                        i += 2;
-                        push!(Tok::DotSlash);
+                        if chars.get(i + 2) == Some(&'=') {
+                            i += 3;
+                            push!(Tok::DotSlashEq);
+                        } else {
+                            i += 2;
+                            push!(Tok::DotSlash);
+                        }
                     }
                     Some('^') => {
-                        i += 2;
-                        push!(Tok::DotCaret);
+                        if chars.get(i + 2) == Some(&'=') {
+                            i += 3;
+                            push!(Tok::DotCaretEq);
+                        } else {
+                            i += 2;
+                            push!(Tok::DotCaret);
+                        }
                     }
                     Some('\'') => {
                         i += 2;
@@ -328,28 +353,58 @@ pub fn lex(source: &str) -> Result<Vec<Lexed>, LangError> {
                 push!(Tok::Question);
             }
             '+' => {
-                i += 1;
-                push!(Tok::Plus);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::PlusEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Plus);
+                }
             }
             '-' => {
-                i += 1;
-                push!(Tok::Minus);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::MinusEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Minus);
+                }
             }
             '*' => {
-                i += 1;
-                push!(Tok::Star);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::StarEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Star);
+                }
             }
             '/' => {
-                i += 1;
-                push!(Tok::Slash);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::SlashEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Slash);
+                }
             }
             '\\' => {
-                i += 1;
-                push!(Tok::Backslash);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::BackslashEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Backslash);
+                }
             }
             '^' => {
-                i += 1;
-                push!(Tok::Caret);
+                if chars.get(i + 1) == Some(&'=') {
+                    i += 2;
+                    push!(Tok::CaretEq);
+                } else {
+                    i += 1;
+                    push!(Tok::Caret);
+                }
             }
             '~' => {
                 if chars.get(i + 1) == Some(&'=') {
