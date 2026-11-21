@@ -57,8 +57,13 @@ Everything is a multidimensional array of `f64` by default.
 - **Execution tiers:**
   1. *Tree-walk interpreter (current).* Direct AST traversal — easiest to
      debug, slow for unvectorized loops.
-  2. *Bytecode VM.* Compile AST to opcodes on a register machine.
-  3. *JIT tier.* Cranelift (the Wasmtime code generator) for loop hotspots.
+  2. *Bytecode VM (landed for loop bodies).* `interp/vm.rs` compiles
+     `for`/`while` bodies to `Op`/`EOp` sequences once per loop entry and
+     runs them on a `Value` stack, sharing the tree-walk's value helpers so
+     semantics cannot drift. `Flow` carries break/continue/return. Non-
+     compilable statements fall back to `exec_stmt` inside the same block.
+  3. *JIT tier.* Cranelift (the Wasmtime code generator) for loop hotspots —
+     `EOp` is the lift point.
 
 ## 3. GPU-accelerated plotting — `matplot` (Phase 3 landed, headless)
 
@@ -69,8 +74,10 @@ Everything is a multidimensional array of `f64` by default.
   `scatter`, `stem`, `bar` build the model; `saveas`/`exportgraphics`/`print`
   rasterise it to `.svg`. CI and the agent channel can verify figures
   visually with no window — same rule as the sibling apps' `ui.render`.
-- **Next, same model:** an interactive wgpu viewer renders `Figure` to a
-  window; PDF/PNG export, log axes, `imagesc`, `surf` extend it.
+- **Interactive viewport — landed (3-D):** the Studio dock renders 3-D
+  figures (`surf`/`mesh`/`plot3`/`contour3`/`quiver3`) through a wgpu
+  pipeline with orbit/zoom/pan bound to `fig.view`; 2-D figures keep the
+  SVG→texture path with pan/zoom.
 - **Immediate + retained rendering on wgpu:** millions of points, real-time
   streams, 3D surface meshes at 60+ FPS.
 

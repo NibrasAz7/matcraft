@@ -7,10 +7,10 @@
 | Dimension | Now | Target |
 | --- | --- | --- |
 | Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, 845 builtins | full M-code |
-| Execution | tree-walk interpreter | bytecode VM → Cranelift JIT |
-| Linear algebra | pure-Rust LU/QR/Cholesky/eig/SVD/pinv/cond/rank/rref/null/orth | faer-rs backend + complex eigensolver |
+| Execution | tree-walk interpreter + bytecode-compiled loop bodies | bytecode VM → Cranelift JIT |
+| Linear algebra | pure-Rust LU/QR/Cholesky/eig (incl. complex)/SVD/pinv/cond/rank/rref/null/orth + optional faer backend | faer-rs as the default backend |
 | Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
-| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs/clustergrams/streamlines, subplots, colormaps, colorbar, SVG/PNG/PDF export | wgpu 2D/3D interactive window |
+| Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs/clustergrams/streamlines, subplots, colormaps, colorbar, SVG/PNG/PDF export; interactive wgpu 3-D viewport in the Studio | full interactive window |
 | Toolboxes | DSP, optimization, control, statistics, distances/clustering, graph algorithms, chemistry/reaction/GPR and sequence I/O, xlsx/table + HDF5/NetCDF I/O, image processing | interactive figures and the remaining toolbox breadth |
 
 ## Phases
@@ -468,3 +468,30 @@
   `evalclusters` (silhouette/Davies-Bouldin/Calinski-Harabasz), `zscore`,
   graph `incidence` matrices, `clustergram` clustered heatmaps, and
   `streamline`/`streamslice` vector-field integration.
+- FFI wave (G56): `loadlibrary`/`calllib`/`unloadlibrary`/`libpointer`/
+  `libisloaded`/`libfunctions`/`libfunctionsview` — plain-C dynamic-library
+  calls via the new `matffi` crate (libloading + libffi-style packed
+  signatures, Windows `#[cfg]`-gated `stdcall`), `lib.pointer` objects,
+  `voidPtr`/`doublePtr`/`singlePtr`/`int32Ptr` pointer marshalling with
+  write-back. MEX binaries stay out of scope per the gap decision.
+- Corpus wave 7 (runtime errors): `2.^[6:10]` decimal-power lexing, empty-
+  array concat/elementwise semantics, `randi`/`repmat` dims vectors, `tic`
+  scalar return, `imshow` figure-handle return, least-squares `A\b` via QR,
+  `eval` expression values, multi-output `sort` `[s,i]` on all dims.
+- G26 viewport: interactive wgpu 3-D figure in the Studio dock — orbit
+  (`fig.view` az/el write-back), zoom, pan, painter-sorted surface/mesh/
+  plot3 geometry with colormap shading and axis box, `view` builtin synced.
+  Desktop and WASM builds verified; `surf(peaks(35))` screenshot-tested
+  through the TCP control channel.
+- Numerics wave: complex eigensolver — `[V,D]=eig(A)` for complex spectra
+  via a real stacked 2n×2n null-space solve per eigenvalue (residuals at
+  machine precision); optional `matcore/faer` feature routes `matmul`,
+  `svd`, `eigvals` and `eig` through faer 0.24 (dense-only features).
+- Bytecode seam: `interp/vm.rs` compiles `for`/`while` bodies to `Op`/
+  `EOp` once per loop entry and executes on a `Value` stack, delegating
+  all value semantics to the shared interpreter helpers (`binary`,
+  `unary_op`, `eval_ident`, `range_mat`). `Flow` propagates break/
+  continue/return identically; `for` iterates columns per type as before.
+  Benchmarks: for-loop parity (~1.4–1.6 s @ 9e5 iters), ~15% faster
+  `while`; the win is the compile seam + deduplicated loop code and the
+  Cranelift lift point, not raw speed yet.

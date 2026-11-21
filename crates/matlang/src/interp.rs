@@ -36,6 +36,7 @@ mod stats;
 mod streams;
 mod tsne;
 mod umap;
+mod vm;
 mod xlsx;
 
 /// Hard caps so hostile or buggy scripts terminate.
@@ -70,7 +71,7 @@ pub const DEBUG_PAUSE_ID: &str = "matcraft:debug:pause";
 
 /// Control-flow signal threading through statement execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Flow {
+pub(crate) enum Flow {
     Normal,
     Break,
     Continue,
@@ -2103,86 +2104,17 @@ impl Session {
             }
             Stmt::For { var, iter, body } => {
                 let it = self.eval(iter)?;
-                if let Value::Cell(ca) = &it {
-                    // `for x = c` iterates the cell array's columns; the loop
-                    // variable is a rows×1 cell each time.
-                    for c in 0..ca.cols {
-                        let mut items = Vec::with_capacity(ca.rows);
-                        for r in 0..ca.rows {
-                            items.push(ca.get(r, c).cloned().unwrap_or_else(CellArray::empty));
-                        }
-                        self.put_var(var, Value::Cell(CellArray { rows: ca.rows, cols: 1, items }));
-                        match self.exec_block(body, out)? {
-                            Flow::Normal => {}
-                            Flow::Break => break,
-                            Flow::Continue => continue,
-                            Flow::Return => return Ok(Flow::Return),
-                        }
-                    }
-                    return Ok(Flow::Normal);
-                }
-                // Chars promote: `for c = 'abc'` iterates the code points
-                // (MATLAB yields 1x1 chars — the loop var's class is a
-                // documented deviation).
-                // Complex iterates complex columns.
-                if let Value::Cplx(cm) = &it {
-                    for c in 0..cm.cols() {
-                        let mut colv = Vec::with_capacity(cm.rows());
-                        for r in 0..cm.rows() {
-                            colv.push(cm.get(r, c).unwrap_or(CNum::real(0.0)));
-                        }
-                        let colm = CMatrix::from_col_major(cm.rows(), 1, colv).map_err(lang)?;
-                        self.put_var(var, cmat_or_value(colm));
-                        match self.exec_block(body, out)? {
-                            Flow::Normal => {}
-                            Flow::Break => break,
-                            Flow::Continue => continue,
-                            Flow::Return => return Ok(Flow::Return),
-                        }
-                    }
-                    return Ok(Flow::Normal);
-                }
-                if let Value::Struct(sa) = &it {
-                    // `for s = dirlist'` iterates the struct array's
-                    // columns; each loop value is a rows×1 struct.
-                    for c in 0..sa.cols() {
-                        let mut sub = StructArray::with_dims(sa.rows(), 1);
-                        for (name, vals) in &sa.fields {
-                            let col: Vec<Value> = (0..sa.rows())
-                                .map(|r| vals.get(r + c * sa.rows()).cloned().unwrap_or_else(|| Value::Mat(Matrix::zeros(0, 0))))
-                                .collect();
-                            sub.fields.push((name.clone(), col));
-                        }
-                        self.put_var(var, Value::Struct(sub));
-                        match self.exec_block(body, out)? {
-                            Flow::Normal => {}
-                            Flow::Break => break,
-                            Flow::Continue => continue,
-                            Flow::Return => return Ok(Flow::Return),
-                        }
-                    }
-                    return Ok(Flow::Normal);
-                }
-                let m = it.to_numeric()?;
+                // Bytecode scaffold: the body compiles once and runs as an
+                // op stream every iteration (`Op::Exec`/`EOp::Eval` fall
+                // back to this same code for anything outside the subset).
+                let ops = vm::compile_block(body);
                 // The loop variable takes each column of `iter` in turn;
-                // for a row vector `1:n` each column is a scalar. On N-D
-                // arrays the tail dims merge into the column count.
-                let ncols = if m.ndims() > 2 {
-                    if m.rows() > 0 {
-                        m.numel() / m.rows()
-                    } else {
-                        0
-                    }
-                } else {
-                    m.cols()
-                };
+                // for a row vector `1:n` each column is a scalar.
+                let ncols = self.for_ncols(&it)?;
                 for c in 0..ncols {
-                    let mut colv = Vec::with_capacity(m.rows());
-                    for r in 0..m.rows() {
-                        colv.push(m.get_linear(c.saturating_mul(m.rows()).saturating_add(r)).unwrap_or(0.0));
-                    }
-                    self.put_var(var, Value::Mat(Matrix::col_vector(colv)));
-                    match self.exec_block(body, out)? {
+                    let v = self.for_col(&it, c)?;
+                    self.put_var(var, v);
+                    match self.vm_block(&ops, out)? {
                         Flow::Normal => {}
                         Flow::Break => break,
                         Flow::Continue => continue,
@@ -2191,13 +2123,14 @@ impl Session {
                 }
             }
             Stmt::While { cond, body } => {
+                let ops = vm::compile_block(body);
                 let mut n = 0usize;
                 while self.eval(cond)?.truthy()? {
                     n += 1;
                     if n > MAX_LOOP_ITERS {
                         return Err(LangError::new("loop iteration limit exceeded", 0));
                     }
-                    match self.exec_block(body, out)? {
+                    match self.vm_block(&ops, out)? {
                         Flow::Normal => {}
                         Flow::Break => break,
                         Flow::Continue => continue,
@@ -2377,28 +2310,75 @@ impl Session {
         self.eval_inner(e)?.ok_or_else(|| LangError::new("expression produced no value", 0))
     }
 
+    /// Unary operators on an evaluated operand, shared with the bytecode
+    /// scaffold — object overloads (`uminus`/`uplus`/`not`), sparse,
+    /// complex, then numeric.
+    fn unary_op(&mut self, op: UnOp, v: Value) -> Result<Option<Value>, LangError> {
+        // Operator overload: `-obj`/`+obj`/`~obj` route to the
+        // class's `uminus`/`uplus`/`not` methods when defined.
+        if let Value::Object(o) = &v {
+            let mname = match op {
+                UnOp::Neg => "uminus",
+                UnOp::Pos => "uplus",
+                UnOp::Not => "not",
+            };
+            let o = o.clone();
+            return match self.find_method(&o.class_name, mname)? {
+                Some(def) => Ok(self.call_def(mname, &def, vec![Value::Object(o)], 1, None)?.into_iter().next()),
+                None => Err(LangError::new(format!("'{mname}' is not defined for class '{}'", o.class_name), 0)),
+            };
+        }
+        if let Value::Sparse(s) = &v {
+            return match op {
+                UnOp::Neg => Ok(Some(Value::Sparse(s.map(|x| -x)))),
+                UnOp::Pos => Ok(Some(v)),
+                UnOp::Not => Ok(Some(mat_or_num(s.full().map(|x| if x == 0.0 { 1.0 } else { 0.0 })))),
+            };
+        }
+        if let Value::Cplx(m) = &v {
+            return match op {
+                UnOp::Neg => Ok(Some(cmat_or_value(m.map(|z| z.neg())))),
+                UnOp::Pos => Ok(Some(v)),
+                UnOp::Not => Err(LangError::new("logical NOT requires a real operand (complex input)", 0)),
+            };
+        }
+        let m = v.to_numeric()?;
+        let out = match op {
+            UnOp::Neg => m.map(|x| -x),
+            UnOp::Pos => m,
+            UnOp::Not => m.map(|x| if x == 0.0 { 1.0 } else { 0.0 }),
+        };
+        Ok(Some(mat_or_num(out)))
+    }
+
+    /// The `Ident` arm of `eval_inner`, shared with the bytecode scaffold:
+    /// binding → constant → zero-arg call.
+    fn eval_ident(&mut self, name: &str) -> Result<Option<Value>, LangError> {
+        match self.var_get(name) {
+            // Workspace bindings shadow constants — `pi = 3` is legal.
+            Some(v) => Ok(Some(v.clone())),
+            None => match self.constant(name) {
+                Some(v) => Ok(Some(v)),
+                // Unbound names are zero-arg calls: `x = rand`, `nargin`
+                // inside a function, bare `who`.
+                None => {
+                    if self.is_function(name)? {
+                        let outs = self.call_function(name, &[], 1)?;
+                        Ok(outs.into_iter().next())
+                    } else {
+                        self.builtin(name, &[])
+                    }
+                }
+            },
+        }
+    }
+
     fn eval_inner(&mut self, e: &Expr) -> Result<Option<Value>, LangError> {
         match e {
             Expr::Num(v) => Ok(Some(Value::Num(*v))),
             Expr::CNum(v) => Ok(Some(Value::Cplx(CMatrix::scalar(CNum::new(0.0, *v))))),
             Expr::Str(s) => Ok(Some(Value::Str(s.clone()))),
-            Expr::Ident(name) => match self.var_get(name) {
-                // Workspace bindings shadow constants — `pi = 3` is legal.
-                Some(v) => Ok(Some(v.clone())),
-                None => match self.constant(name) {
-                    Some(v) => Ok(Some(v)),
-                    // Unbound names are zero-arg calls: `x = rand`, `nargin`
-                    // inside a function, bare `who`.
-                    None => {
-                        if self.is_function(name)? {
-                            let outs = self.call_function(name, &[], 1)?;
-                            Ok(outs.into_iter().next())
-                        } else {
-                            self.builtin(name, &[])
-                        }
-                    }
-                },
-            },
+            Expr::Ident(name) => self.eval_ident(name),
             Expr::Colon => Err(LangError::new("':' used outside indexing", 0)),
             Expr::End => Err(LangError::new("'end' used outside indexing", 0)),
             Expr::Range(a, step, b) => {
@@ -2408,29 +2388,7 @@ impl Session {
                     Some(s) => self.eval(s)?.scalar()?,
                     None => 1.0,
                 };
-                if st == 0.0 {
-                    return Err(LangError::new("range step cannot be zero", 0));
-                }
-                let mut v = Vec::new();
-                let mut x = lo;
-                if st > 0.0 {
-                    while x <= hi + st * 1e-9 {
-                        v.push(x);
-                        x = lo + st * (v.len() as f64);
-                        if v.len() >= MAX_RANGE_LEN {
-                            return Err(LangError::new("range too long", 0));
-                        }
-                    }
-                } else {
-                    while x >= hi + st * 1e-9 {
-                        v.push(x);
-                        x = lo + st * (v.len() as f64);
-                        if v.len() >= MAX_RANGE_LEN {
-                            return Err(LangError::new("range too long", 0));
-                        }
-                    }
-                }
-                Ok(Some(Value::Mat(Matrix::row_vector(v))))
+                Ok(Some(range_mat(lo, st, hi)?))
             }
             Expr::Matrix(rows) => {
                 // Evaluate elements first — if any is a cell, all must be
@@ -2804,41 +2762,7 @@ impl Session {
             }
             Expr::Unary(op, e) => {
                 let v = self.eval(e)?;
-                // Operator overload: `-obj`/`+obj`/`~obj` route to the
-                // class's `uminus`/`uplus`/`not` methods when defined.
-                if let Value::Object(o) = &v {
-                    let mname = match op {
-                        UnOp::Neg => "uminus",
-                        UnOp::Pos => "uplus",
-                        UnOp::Not => "not",
-                    };
-                    let o = o.clone();
-                    return match self.find_method(&o.class_name, mname)? {
-                        Some(def) => Ok(self.call_def(mname, &def, vec![Value::Object(o)], 1, None)?.into_iter().next()),
-                        None => Err(LangError::new(format!("'{mname}' is not defined for class '{}'", o.class_name), 0)),
-                    };
-                }
-                if let Value::Sparse(s) = &v {
-                    return match op {
-                        UnOp::Neg => Ok(Some(Value::Sparse(s.map(|x| -x)))),
-                        UnOp::Pos => Ok(Some(v)),
-                        UnOp::Not => Ok(Some(mat_or_num(s.full().map(|x| if x == 0.0 { 1.0 } else { 0.0 })))),
-                    };
-                }
-                if let Value::Cplx(m) = &v {
-                    return match op {
-                        UnOp::Neg => Ok(Some(cmat_or_value(m.map(|z| z.neg())))),
-                        UnOp::Pos => Ok(Some(v)),
-                        UnOp::Not => Err(LangError::new("logical NOT requires a real operand (complex input)", 0)),
-                    };
-                }
-                let m = v.to_numeric()?;
-                let out = match op {
-                    UnOp::Neg => m.map(|x| -x),
-                    UnOp::Pos => m,
-                    UnOp::Not => m.map(|x| if x == 0.0 { 1.0 } else { 0.0 }),
-                };
-                Ok(Some(mat_or_num(out)))
+                self.unary_op(*op, v)
             }
             Expr::Transpose(e, conj) => {
                 let v = self.eval(e)?;
@@ -16807,6 +16731,34 @@ fn mat_or_num(m: Matrix) -> Value {
 }
 
 /// Complex result → `Value`; a fully-real result collapses to Mat/Num.
+/// `lo:st:hi` as a row vector — shared by `eval`'s Range arm and the
+/// bytecode scaffold's `EOp::Range`.
+fn range_mat(lo: f64, st: f64, hi: f64) -> Result<Value, LangError> {
+    if st == 0.0 {
+        return Err(LangError::new("range step cannot be zero", 0));
+    }
+    let mut v = Vec::new();
+    let mut x = lo;
+    if st > 0.0 {
+        while x <= hi + st * 1e-9 {
+            v.push(x);
+            x = lo + st * (v.len() as f64);
+            if v.len() >= MAX_RANGE_LEN {
+                return Err(LangError::new("range too long", 0));
+            }
+        }
+    } else {
+        while x >= hi + st * 1e-9 {
+            v.push(x);
+            x = lo + st * (v.len() as f64);
+            if v.len() >= MAX_RANGE_LEN {
+                return Err(LangError::new("range too long", 0));
+            }
+        }
+    }
+    Ok(Value::Mat(Matrix::row_vector(v)))
+}
+
 fn cmat_or_value(m: CMatrix) -> Value {
     if let Some(r) = m.real_if_real() {
         return mat_or_num(r);
@@ -25192,6 +25144,49 @@ end",
         s.run("[Vr, Dr] = eig([1 2; 0 3]); rr = max(abs([1 2; 0 3]*Vr - Vr*Dr), [], 'all');").unwrap();
         assert!(matches!(s.get("Vr"), Some(Value::Mat(_))));
         assert!(scalar(&s, "rr") < 1e-12);
+    }
+
+    #[test]
+    fn vm_loop_bodies() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // Compiled loop bodies keep tree-walk semantics: break/continue,
+        // nested loops, ranges with steps, short-circuit conditions.
+        s.run("a=0; for k=1:10, a=a+k^2; end;").unwrap();
+        assert_eq!(scalar(&s, "a"), 385.0);
+        s.run("b=0; for k=1:2:20, if k>10, break; end; if k==5, continue; end; b=b+k; end;").unwrap();
+        assert_eq!(scalar(&s, "b"), 1.0 + 3.0 + 7.0 + 9.0);
+        s.run("t=0; for i=1:3, for j=1:3, if j>i, break; end; t=t+i*j; end; end;").unwrap();
+        assert_eq!(scalar(&s, "t"), 1.0 * 1.0 + 2.0 * (1.0 + 2.0) + 3.0 * (1.0 + 2.0 + 3.0));
+        s.run("w=0; k=1; while k<=5, if k~=4, w=w+k; end; k=k+1; end;").unwrap();
+        assert_eq!(scalar(&s, "w"), 1.0 + 2.0 + 3.0 + 5.0);
+        s.run("w2=0; k=1; while k<=4 && k~=3, w2=w2+k; k=k+1; end;").unwrap();
+        assert_eq!(scalar(&s, "w2"), 3.0);
+
+        // Per-type iteration: cells, complex, struct arrays, chars.
+        s.run("n=0; for c={7 'x' [1 2]}, n=n+1; end;").unwrap();
+        assert_eq!(scalar(&s, "n"), 3.0);
+        s.run("acc=0; for z=[1+2i 3+4i], acc=acc+imag(z); end;").unwrap();
+        assert_eq!(scalar(&s, "acc"), 6.0);
+        s.run("st.a=[1 2]; st2=st; ss=[st st2]; cnt=0; for v=ss, cnt=cnt+v.a(1); end;").unwrap();
+        assert_eq!(scalar(&s, "cnt"), 2.0);
+        s.run("chsum=0; for ch='abc', chsum=chsum+double(ch); end;").unwrap();
+        assert_eq!(scalar(&s, "chsum"), 294.0);
+
+        // `return` propagates out of a compiled loop inside a function.
+        s.run("function r=f7(); for k=1:9, if k==4, r=k; return; end; end; r=-1; end; g7=f7();").unwrap();
+        assert_eq!(scalar(&s, "g7"), 4.0);
+
+        // Non-compilable statements inside a compiled loop still run.
+        s.run("u=0; for k=1:3, try, u=u+k; end; end;").unwrap();
+        assert_eq!(scalar(&s, "u"), 6.0);
+
+        // Echo output is unchanged: `f=k,` echoes each iteration,
+        // `e=k;` is suppressed.
+        let out = s.run("for k=1:2, e=k; f=k, end;").unwrap();
+        assert!(!out.contains("e ="), "{out}");
+        assert!(out.contains("f ="), "{out}");
     }
 
     #[test]
