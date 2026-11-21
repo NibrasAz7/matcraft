@@ -1,5 +1,7 @@
 # MatCraft
 
+[![I did my own MATLAB](https://idmo.app/badge/matcraft)](https://idmo.app/p/matcraft)
+
 A clean-room, Rust-native numerical computing environment — the ArtCraft
 ecosystem's answer to MATLAB. Instant launch, memory-safe, zero bloat: a real
 `.m`-language engine with a column-major matrix core, built the way the craft
