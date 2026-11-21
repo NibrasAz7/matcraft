@@ -81,21 +81,21 @@ what's next (Cranelift JIT, Jupyter transport, wasm Studio hosting).
 Rendered by MatCraft's own `saveas` — the same SVG→PNG path the Studio
 figure dock and `exportgraphics` use:
 
-| `plot` + `text` | `surf(peaks)` | `imshow(peaks,[])` | `bar(magic(4))` |
-|---|---|---|---|
+| `plot` + `text`                     | `surf(peaks)`                     | `imshow(peaks,[])`                    | `bar(magic(4))`                 |
+| ----------------------------------- | --------------------------------- | ------------------------------------- | ------------------------------- |
 | ![lines](docs/images/fig-lines.png) | ![surf](docs/images/fig-surf.png) | ![imshow](docs/images/fig-imshow.png) | ![bar](docs/images/fig-bar.png) |
 
 ## Interfaces — pick your driver
 
-| Interface | What it gives you |
-| --- | --- |
-| `matcraft` Studio | HOME/PLOTS/EDITOR/VIEW ribbon, command window, workspace inspector, editor with signature hints, figure dock, debugger |
-| `matcraft-cli` | `run` / `eval` / `repl` / `functions` / `commands` / `--cmd` |
-| `matcraft-cli lsp` | LSP 3.17 for editors: diagnostics, completion, hover, symbols |
-| `matcraft-cli mcp` | MCP server (JSON-RPC stdio) for agents |
-| `--control PORT` | JSON-lines TCP channel: `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot` |
-| `matcraft-web` | WASM Studio shell |
-| SimCraft bridge | `sim.run`, `model.set_param`, `sim.check` engine commands |
+| Interface          | What it gives you                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `matcraft` Studio  | HOME/PLOTS/EDITOR/VIEW ribbon, command window, workspace inspector, editor with signature hints, figure dock, debugger |
+| `matcraft-cli`     | `run` / `eval` / `repl` / `functions` / `commands` / `--cmd`                                                           |
+| `matcraft-cli lsp` | LSP 3.17 for editors: diagnostics, completion, hover, symbols                                                          |
+| `matcraft-cli mcp` | MCP server (JSON-RPC stdio) for agents                                                                                 |
+| `--control PORT`   | JSON-lines TCP channel: `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`                                     |
+| `matcraft-web`     | WASM Studio shell                                                                                                      |
+| SimCraft bridge    | `sim.run`, `model.set_param`, `sim.check` engine commands                                                              |
 
 ## Getting started
 
@@ -109,21 +109,21 @@ cargo run -p matcraft                                # the Studio
 
 ## Layout
 
-| Path | What |
-| --- | --- |
-| `crates/matcore` | matrix type + linear algebra (pure Rust; optional `faer` backend) |
-| `crates/matffi` | plain-C dynamic-library FFI (the only `unsafe` boundary) |
-| `crates/matplot` | figure model + headless SVG renderer |
-| `crates/matlang` | lexer, parser, interpreter (tree-walk + bytecode loop bodies), builtins |
-| `crates/engine` | command registry + guarded `Session` |
-| `crates/mcp` | JSON-RPC 2.0 server over stdio |
-| `crates/lsp` | LSP 3.17 language server for `.m` files |
-| `crates/jupyter` | Jupyter kernel core (wire + semantics; ZMQ transport pending) |
-| `crates/ui-egui` | Studio UI: command window, workspace, editor, figure dock, control dispatch |
-| `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` / `lsp` |
-| `apps/matcraft` | MatCraft Studio (`--control PORT` for the JSON-lines channel) |
-| `docs/` | architecture, language reference, function dictionary |
-| `xtask` | `cargo xtask ci` — fmt, clippy, tests |
+| Path                | What                                                                        |
+| ------------------- | --------------------------------------------------------------------------- |
+| `crates/matcore`    | matrix type + linear algebra (pure Rust; optional `faer` backend)           |
+| `crates/matffi`     | plain-C dynamic-library FFI (the only `unsafe` boundary)                    |
+| `crates/matplot`    | figure model + headless SVG renderer                                        |
+| `crates/matlang`    | lexer, parser, interpreter (tree-walk + bytecode loop bodies), builtins     |
+| `crates/engine`     | command registry + guarded `Session`                                        |
+| `crates/mcp`        | JSON-RPC 2.0 server over stdio                                              |
+| `crates/lsp`        | LSP 3.17 language server for `.m` files                                     |
+| `crates/jupyter`    | Jupyter kernel core (wire + semantics; ZMQ transport pending)               |
+| `crates/ui-egui`    | Studio UI: command window, workspace, editor, figure dock, control dispatch |
+| `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` / `lsp`             |
+| `apps/matcraft`     | MatCraft Studio (`--control PORT` for the JSON-lines channel)               |
+| `docs/`             | architecture, language reference, function dictionary                       |
+| `xtask`             | `cargo xtask ci` — fmt, clippy, tests                                       |
 
 ## Design
 
