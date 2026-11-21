@@ -1572,6 +1572,10 @@ impl Session {
 
     /// Open figures; index is figure number minus one (empty slots are
     /// not kept, so numbers can shift after `close`).
+    pub fn figures_mut(&mut self) -> &mut Vec<matplot::Figure> {
+        &mut self.figs
+    }
+
     pub fn figures(&self) -> &[matplot::Figure] {
         &self.figs
     }

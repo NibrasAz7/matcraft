@@ -37,7 +37,7 @@ pub struct Series {
 
 impl Series {
     /// True for kinds drawn by the 3-D projected path.
-    fn is_3d(&self) -> bool {
+    pub fn is_3d(&self) -> bool {
         matches!(
             self.kind,
             SeriesKind::Line3 | SeriesKind::Mesh | SeriesKind::Surf | SeriesKind::Contour3 | SeriesKind::Contour3Base | SeriesKind::Quiver3
@@ -125,7 +125,7 @@ pub enum Marker {
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    fn scale(self, f: f64) -> Self {
+    pub fn scale(self, f: f64) -> Self {
         let f = f.clamp(0.0, 2.0);
         Rgb(
             (self.0 as f64 * f).round().clamp(0.0, 255.0) as u8,
@@ -140,7 +140,7 @@ impl Rgb {
 }
 
 /// The default axis colour order (MATLAB-style seven-colour cycle).
-const CYCLE: [Rgb; 7] = [
+pub const CYCLE: [Rgb; 7] = [
     Rgb(0x00, 0x72, 0xBD),
     Rgb(0xD9, 0x53, 0x19),
     Rgb(0xED, 0xB1, 0x20),
@@ -981,6 +981,12 @@ pub fn is_xy_view(fig: &Figure) -> bool {
     fig.sub.is_none() && !fig.series.iter().any(Series::is_3d) && (fig.series.is_empty() || !fig.series.iter().all(|s| s.kind == SeriesKind::Pie))
 }
 
+/// Whether the figure is a single axes holding 3-D content — the GPU
+/// viewport's criterion; subplots and pie-only figures are excluded.
+pub fn is_3d_view(fig: &Figure) -> bool {
+    fig.sub.is_none() && fig.series.iter().any(Series::is_3d)
+}
+
 /// Resolved 2-D view limits `(x0, x1, y0, y1)` in *drawn* (axis) space —
 /// log axes are already log10-transformed; explicit `xlim`/`ylim` win over
 /// the padded data extent. This is exactly what `draw_axes` maps through.
@@ -1086,7 +1092,8 @@ fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Compact tick label: `3`, `0.5`, `1e-06`.
-fn tick_label(v: f64) -> String {
+/// Compact tick label (`0.5`, `1e-3`).
+pub fn tick_label(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
@@ -1114,7 +1121,8 @@ fn nice_step(raw: f64) -> f64 {
     10.0 * base
 }
 
-fn ticks(lo: f64, hi: f64, count: usize) -> Vec<f64> {
+/// `count` nicely-rounded tick positions spanning `[lo, hi]`.
+pub fn ticks(lo: f64, hi: f64, count: usize) -> Vec<f64> {
     if !lo.is_finite() || !hi.is_finite() || lo >= hi {
         return vec![lo];
     }
@@ -1133,7 +1141,9 @@ fn ticks(lo: f64, hi: f64, count: usize) -> Vec<f64> {
 /// Axis limits: explicit override, else data min/max padded by 4%.
 /// Reversed explicit pairs are normalised — the *direction* lives in
 /// `xrev`/`yrev`, never in a negative span.
-fn limits(data_min: f64, data_max: f64, explicit: Option<(f64, f64)>) -> (f64, f64) {
+/// Resolve `(lo, hi)` for an axis — explicit limits win, else the
+/// padded data extent.
+pub fn limits(data_min: f64, data_max: f64, explicit: Option<(f64, f64)>) -> (f64, f64) {
     if let Some((a, b)) = explicit {
         return if a <= b { (a, b) } else { (b, a) };
     }
@@ -1841,7 +1851,8 @@ fn half_step(v: &[f64]) -> f64 {
 }
 
 /// Colour limits: explicit `clim`, else the min/max of all grid data.
-fn caxis(fig: &Figure) -> (f64, f64) {
+/// Colour-axis limits `(clim)` — data `z` extent unless `clim` is set.
+pub fn caxis(fig: &Figure) -> (f64, f64) {
     if let Some(l) = fig.clim {
         return l;
     }
@@ -1868,7 +1879,8 @@ fn caxis(fig: &Figure) -> (f64, f64) {
 
 /// Contour levels: explicit `series.levels`, else ~7 nice values spanning the
 /// colour range.
-fn contour_levels(s: &Series, lo: f64, hi: f64) -> Vec<f64> {
+/// Iso levels for a contour series — explicit levels, else ~10 auto.
+pub fn contour_levels(s: &Series, lo: f64, hi: f64) -> Vec<f64> {
     if !s.levels.is_empty() {
         return s.levels.clone();
     }
@@ -1893,7 +1905,8 @@ fn contour_levels(s: &Series, lo: f64, hi: f64) -> Vec<f64> {
 /// Marching squares over the series grid at `lv` — returns line segments in
 /// data coordinates. `z` is column-major `rows × cols`; `x`/`y` hold the
 /// column/row coordinates.
-fn contour_segments(s: &Series, lv: f64) -> Vec<((f64, f64), (f64, f64))> {
+/// Marching-squares segments for a contour level over the series grid.
+pub fn contour_segments(s: &Series, lv: f64) -> Vec<((f64, f64), (f64, f64))> {
     let (rows, cols) = s.zshape;
     let mut out = Vec::new();
     let z = |r: usize, c: usize| s.z.get(c * rows + r).copied().unwrap_or(f64::NAN);
@@ -2022,7 +2035,8 @@ fill=\"{col}\" stroke=\"#ffffff\" stroke-width=\"1\"/>\n"
 }
 
 /// The 8 corners of the data box, indexed `x*4 + y*2 + z` (lo=0/hi=1 each).
-fn box_corners(x0: f64, x1: f64, y0: f64, y1: f64, z0: f64, z1: f64) -> Vec<(f64, f64, f64)> {
+/// The 8 corners of the 3-D axes box, indexed `x*4 + y*2 + z`.
+pub fn box_corners(x0: f64, x1: f64, y0: f64, y1: f64, z0: f64, z1: f64) -> Vec<(f64, f64, f64)> {
     let mut out = Vec::with_capacity(8);
     for &x in &[x0, x1] {
         for &y in &[y0, y1] {

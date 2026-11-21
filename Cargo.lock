@@ -2523,12 +2523,14 @@ name = "matcraft-ui-egui"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bytemuck",
  "craft-ai",
  "craft-atomic",
  "craft-quit",
  "craft-settings",
  "eframe",
  "egui",
+ "egui-wgpu",
  "matcraft_engine",
  "matlang",
  "matplot",
@@ -2537,6 +2539,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "wgpu",
 ]
 
 [[package]]

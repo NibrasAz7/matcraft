@@ -61,7 +61,7 @@ See [`scope.md`](scope.md) for the block/post-1.0 boundary.
 | ~~G23~~ | ~~`imagesc`, `pie`, `contour`~~ | **Done:** `imagesc`/`image` (grid cells via colormap, y-reverse axis), `pie` (wedges + labels), `contour` (marching squares, auto/explicit levels, `(Z)`, `(Z,n|v)`, `(X,Y,Z[,…])`). Filled `contourf`/3-D `contour3` and `heatmap` also landed. |
 | ~~G24~~ | ~~PNG/PDF export~~ | **Done:** `matplot::to_png` (resvg rasterizer) + `to_pdf` (raster embedded as FlateDecode image); `saveas`/`exportgraphics` dispatch on extension (`.svg`/`.png`/`.pdf`), `print` accepts `-dsvg`/`-dpng`/`-dpdf`. |
 | ~~G25~~ | ~~3-D: `plot3`, `surf`, `mesh`~~ | **Done:** orthographic projection under `view(az,el)` (default −37.5/30; `view(2)`/`view(3)` presets), `plot3` multi-triplets, `surf` painter's-order shaded quads, `mesh` wireframe — both `(Z)` and `(X,Y,Z)` with vector or meshgrid X/Y. Plus `zlim`/`zlabel`, `colormap` (parula/jet/hot/gray), `colorbar`, `caxis`/`clim`, `axis ij`-style `yrev`. Lighting, `surfc`, `contour3`, `surfl` and `quiver3` also landed; remaining: interactive rotate. |
-| G26 | Interactive wgpu figure window | Phase 5 GUI work; pairs with Studio. |
+| ~~G26~~ | ~~Interactive wgpu figure window~~ | **Done:** `ui-egui/src/gpufig.rs` — figures holding 3-D series (`plot3`/`mesh`/`surf`/`quiver3`/`contour3`) get a live wgpu viewport in the Studio figure dock via `egui_wgpu` paint callbacks: drag orbits `fig.view` (written back to session state like `xlim` in the 2-D path), scroll zooms, Shift/right-drag pans, surf faces painter-sort per frame matching `to_svg`. Falls back to the bitmap scene when no wgpu backend. |
 
 ## P5 — toolboxes (separate crates, later)
 

@@ -15,6 +15,8 @@ mod editor;
 pub mod figure;
 mod files;
 mod findfiles;
+/// wgpu-rendered 3-D figure viewport (gaps.md G26).
+pub mod gpufig;
 mod history;
 mod repl;
 mod ribbon;
@@ -183,6 +185,17 @@ pub struct MatApp {
     fig_scene: Option<(usize, egui::Rect)>,
     /// Rubber-band anchor while box-zooming a figure axes.
     fig_box_from: Option<egui::Pos2>,
+    /// Screen-space zoom/pan of the 3-D GPU viewport, per figure index
+    /// (orbit lives in `fig.view` — session state).
+    fig_3d: std::collections::HashMap<usize, gpufig::View3d>,
+    /// Cached GPU vertex lists per figure, rebuilt with `figs_dirty`.
+    fig_gpu: std::collections::HashMap<usize, std::sync::Arc<gpufig::Geom>>,
+    /// Orbit origin (az, el) captured when a 3-D drag begins.
+    fig_3d_from: Option<(f64, f64)>,
+    /// Pan origin captured when a 3-D pan drag begins.
+    fig_3d_pan_from: Option<[f32; 2]>,
+    /// eframe is running on the wgpu backend (G26 viewport available).
+    has_wgpu: bool,
     /// View-menu toggles for the docked panels.
     show_left: bool,
     show_right: bool,
@@ -258,6 +271,11 @@ impl MatApp {
             var_edits: std::collections::HashMap::new(),
             fig_scene: None,
             fig_box_from: None,
+            fig_3d: std::collections::HashMap::new(),
+            fig_gpu: std::collections::HashMap::new(),
+            fig_3d_from: None,
+            fig_3d_pan_from: None,
+            has_wgpu: false,
             show_left: true,
             show_right: true,
             show_cmdwin: true,
@@ -603,6 +621,7 @@ impl MatApp {
     /// figure raises its document tab (like a figure window appearing).
     fn rebuild_figures(&mut self, ctx: &egui::Context) {
         self.figs_dirty = false;
+        self.fig_gpu.clear();
         let had = self.fig_tex.len();
         self.fig_tex.clear();
         for (i, fig) in self.session.lang().figures().iter().enumerate() {
@@ -749,6 +768,9 @@ impl MatApp {
     /// single x/y axes (3-D, subplots, pie-only) keep the pixel pan/zoom
     /// `Scene`.
     fn figure_view(&mut self, ui: &mut egui::Ui, idx: usize, popped: bool) {
+        // 3-D figures get the live wgpu viewport when the backend is
+        // available; otherwise they fall through to the bitmap scene.
+        let is3d = self.session.lang().figures().get(idx).is_some_and(matplot::is_3d_view) && self.has_wgpu;
         let Some(tex) = self.fig_tex.get(idx).and_then(|t| t.as_ref()) else { return };
         let (id, size) = (tex.id(), tex.size_vec2());
         let view = self.session.lang().figures().get(idx).and_then(|f| {
@@ -791,6 +813,8 @@ impl MatApp {
             }
             if view.is_some() {
                 ui.weak("drag to pan · scroll to zoom · right-drag box zoom · double-click reset");
+            } else if is3d {
+                ui.weak("drag to orbit · scroll to zoom · shift/right-drag to pan");
             } else {
                 ui.weak("drag to pan · scroll to zoom");
             }
@@ -814,6 +838,10 @@ impl MatApp {
             self.figure_xy(ui, idx, id, v, zoom_k, reset);
             return;
         }
+        if is3d {
+            self.figure_3d(ui, idx, zoom_k, reset);
+            return;
+        }
         if reset {
             self.fig_scene = Some((idx, egui::Rect::from_min_size(egui::Pos2::ZERO, size)));
         }
@@ -826,6 +854,90 @@ impl MatApp {
         egui::Scene::new().zoom_range(0.05..=20.0).show(ui, bounds, |ui| {
             ui.image(egui::load::SizedTexture::new(id, size));
         });
+    }
+
+    /// Interactive GPU viewport for figures holding 3-D series (G26):
+    /// drag orbits `fig.view` — written back to the session like `xlim` in
+    /// the 2-D path, so `view`, `saveas` and scripts see the camera —
+    /// scroll zooms, Shift/right-drag pans, reset restores `view(-37.5,30)`.
+    /// Triangles are painter-sorted per frame in the callback; axis ticks
+    /// and labels are painted by egui over the wgpu output.
+    fn figure_3d(&mut self, ui: &mut egui::Ui, idx: usize, zoom_k: f64, reset: bool) {
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let cur = self.session.lang().figures().get(idx).map(|f| f.view).unwrap_or((-37.5, 30.0));
+        let view3d = *self.fig_3d.entry(idx).or_default();
+        if resp.drag_started_by(egui::PointerButton::Primary) || resp.drag_started_by(egui::PointerButton::Secondary) {
+            self.fig_3d_from = Some((cur.0, cur.1));
+            self.fig_3d_pan_from = Some(view3d.pan);
+        }
+        let mut next_view = cur;
+        let shift = ui.input(|i| i.modifiers.shift);
+        if resp.dragged_by(egui::PointerButton::Primary) && !shift {
+            let (az0, el0) = self.fig_3d_from.unwrap_or(cur);
+            let d = resp.drag_delta();
+            next_view = (az0 + f64::from(d.x) * 0.5, (el0 - f64::from(d.y) * 0.5).clamp(-90.0, 90.0));
+        }
+        if (resp.dragged_by(egui::PointerButton::Secondary) || (shift && resp.dragged_by(egui::PointerButton::Primary))) && rect.height() > 0.0 {
+            let d = resp.drag_delta();
+            let base = self.fig_3d_pan_from.unwrap_or(view3d.pan);
+            let pan = [base[0] + d.x * 2.0 / rect.width().max(1.0), base[1] - d.y * 2.0 / rect.height().max(1.0)];
+            self.fig_3d.entry(idx).or_default().pan = pan;
+        }
+        if next_view != cur {
+            if let Some(f) = self.session.lang_mut().figures_mut().get_mut(idx) {
+                f.view = next_view;
+            }
+        }
+        if resp.hovered() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                let z = self.fig_3d.entry(idx).or_default();
+                z.zoom = (z.zoom * (1.0 + dy * 0.001)).clamp(0.05, 20.0);
+            }
+        }
+        if zoom_k != 0.0 {
+            self.fig_3d.entry(idx).or_default().zoom = (view3d.zoom / zoom_k as f32).clamp(0.05, 20.0);
+        }
+        if reset {
+            if let Some(f) = self.session.lang_mut().figures_mut().get_mut(idx) {
+                f.view = (-37.5, 30.0);
+            }
+            *self.fig_3d.entry(idx).or_default() = gpufig::View3d::default();
+        }
+        let view3d = *self.fig_3d.entry(idx).or_default();
+        let azel = self.session.lang().figures().get(idx).map(|f| f.view).unwrap_or((-37.5, 30.0));
+        if !self.fig_gpu.contains_key(&idx) {
+            if let Some(f) = self.session.lang().figures().get(idx) {
+                self.fig_gpu.insert(idx, std::sync::Arc::new(gpufig::build_geom(f)));
+            }
+        }
+        let Some(geom) = self.fig_gpu.get(&idx).cloned() else { return };
+        let aspect = (rect.width() / rect.height().max(1.0)).max(1e-3);
+        let cb = gpufig::GpuFig { geom: geom.clone(), az: azel.0, el: azel.1, view: view3d, aspect };
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+        // Tick labels on the three near-camera box edges — same edge
+        // selection as `to_svg` — painted over the GPU output.
+        let (_, _, cdir) = gpufig::view_basis(azel.0, azel.1);
+        let [x0, x1, y0, y1, z0, z1] = geom.bounds;
+        let (xn_e, yn_e) = (if cdir[0] > 0.0 { x1 } else { x0 }, if cdir[1] > 0.0 { y1 } else { y0 });
+        let norm = |v: f64, lo: f64, hi: f64| (v - (lo + hi) / 2.0) / (hi - lo).abs().max(f64::EPSILON) * 2.0;
+        let px_of = |x: f64, y: f64, z: f64| {
+            let n = (norm(x, x0, x1), norm(y, y0, y1), norm(z, z0, z1));
+            let (nx, ny) = gpufig::to_ndc(azel.0, azel.1, view3d, aspect, n);
+            egui::pos2(rect.center().x + nx * rect.width() / 2.0, rect.center().y - ny * rect.height() / 2.0)
+        };
+        let label = |ui: &egui::Ui, p: egui::Pos2, s: String, off: egui::Vec2| {
+            ui.painter().text(p + off, egui::Align2::CENTER_CENTER, s, egui::FontId::proportional(10.0), ui.visuals().text_color());
+        };
+        for tv in matplot::ticks(x0, x1, 4) {
+            label(ui, px_of(tv, yn_e, z0), matplot::tick_label(tv), egui::vec2(0.0, 12.0));
+        }
+        for tv in matplot::ticks(y0, y1, 4) {
+            label(ui, px_of(xn_e, tv, z0), matplot::tick_label(tv), egui::vec2(0.0, 12.0));
+        }
+        for tv in matplot::ticks(z0, z1, 5) {
+            label(ui, px_of(xn_e, yn_e, tv), matplot::tick_label(tv), egui::vec2(-14.0, 0.0));
+        }
     }
 
     /// Interactive single 2-D axes: the texture is fit to the dock and the
@@ -1179,7 +1291,11 @@ fn same_path(a: &str, b: &str) -> bool {
 impl eframe::App for MatApp {
     /// Non-painting work: control requests, screenshot replies, figure
     /// texture refresh. Runs before `ui`, also while the window is hidden.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.has_wgpu = frame.wgpu_render_state().is_some();
+        if let Some(rs) = frame.wgpu_render_state() {
+            gpufig::insert_pipes(rs);
+        }
         self.drain_control(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.drain_ai(ctx);

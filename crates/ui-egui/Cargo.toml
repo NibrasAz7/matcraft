@@ -25,6 +25,9 @@ craft-quit = { path = "../../../craft-libs/crates/quit", features = ["egui"] }
 craft-settings = { path = "../../../craft-libs/crates/settings" }
 egui = "0.37"
 eframe = "0.37"
+egui-wgpu = "0.37"
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
