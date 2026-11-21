@@ -8,6 +8,7 @@ templates or sample files — ever.
 | --- | --- | --- | --- | --- |
 | `assets/app-icon/matcraft-*.png`, `matcraft.ico` | ArtCraft contributors | generated in code (plotted-curve motif, navy/cyan) | MIT OR Apache-2.0 | Original art; regenerate by drawing, never copied. |
 | `docs/images/*.png` | MatCraft contributors | MatCraft's own renderer (`exportgraphics`/`saveas`) and the Studio's `ui.screenshot` channel | MIT OR Apache-2.0 | Generated docs images — Studio capture and figure exports. |
+| `docs/brand/artcraft-logo*.svg`, `docs/brand/LICENSE-brand.txt` | ArtCraft Team | ArtCraft brand set (shared with the sibling craft apps) | LicenseRef-Storyteller-Trademark | Trademark — not open source; use only unmodified and only as part of MatCraft. Forks must remove them. |
 | `crates/matlang/tests/fixtures/h5_v0_gzip.h5` | MatCraft contributors | generated from deterministic 0..23 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v0, gzip, B-tree v1 chunks |
 | `crates/matlang/tests/fixtures/h5_v2_contiguous.h5` | MatCraft contributors | generated from deterministic 0..5 test vectors with h5py 3.16 / HDF5 2.0 | CC0-1.0 | HDF5 v2, contiguous dataset |
 | `crates/matlang/tests/fixtures/netcdf4_sample.nc` | MatCraft contributors | generated with netCDF4 1.7.5.1 / netCDF-C 4.10.1 from deterministic 1..12, 10..30 and 0..11 test vectors | CC0-1.0 | NetCDF-4/HDF5 container: 2-D variable, coordinate variable, scalar variable and int16 variable |
