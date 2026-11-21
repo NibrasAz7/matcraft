@@ -90,7 +90,15 @@ Everything is a multidimensional array of `f64` by default.
   - `--control PORT` JSON-lines channel + `matcraft-cli mcp`, identical in
     spirit to the other craft apps — an agent must be able to drive a live
     session (`engine.execute` for `eval.line`, `workspace.get`, `ui.screenshot`).
-  - LSP backend for editors; Jupyter kernel protocol for notebooks.
+  - `matcraft-cli lsp` — `crates/lsp` serves editors over LSP 3.17:
+    full-sync documents, parser-backed diagnostics, builtin/keyword/
+    identifier completion, signature hover and `function` symbols.
+  - `crates/jupyter` — Jupyter kernel *core*: connection-file parsing,
+    the multipart wire message model with HMAC-SHA256 signing, and
+    `kernel_info`/`execute`/`is_complete`/`complete`/`shutdown` semantics
+    mapped onto `matlang::Session`. Transport-agnostic by design — the
+    ZeroMQ adapter (the canonical Jupyter transport; libzmq is a native
+    dependency) is the remaining piece.
 
 ## 5. Domain toolboxes — separate crates
 

@@ -99,6 +99,7 @@ fn layers() -> ExitCode {
             "matlang" => 2,
             "engine" | "matcraft_engine" => 5,
             "mcp" | "ui-egui" | "matcraft_mcp" | "matcraft_ui_egui" => 6,
+            "lsp" | "matcraft_lsp" | "jupyter" | "matcraft_jupyter" => 6,
             n if n.ends_with("-cli") || n == "matcraft" || n == "matcraft-web" => 7,
             _ => return None,
         })

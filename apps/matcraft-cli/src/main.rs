@@ -27,6 +27,7 @@ USAGE:
   matcraft-cli functions                           list the builtin function library
   matcraft-cli commands                            list engine commands
   matcraft-cli mcp                                 serve MCP (JSON-RPC on stdio)
+  matcraft-cli lsp                                 serve LSP (language server on stdio)
   matcraft-cli --version                           print version
 
 --cmd takes `'id {json}'` (id plus a space and a JSON object) and is
@@ -111,6 +112,15 @@ fn run_main() -> ExitCode {
             match server.serve(stdin.lock(), stdout.lock()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&format!("mcp: {e}")),
+            }
+        }
+        Some("lsp") => {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let mut server = matcraft_lsp::Server::new();
+            match server.serve(stdin.lock(), stdout.lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&format!("lsp: {e}")),
             }
         }
         Some("--version") | Some("-V") => {

@@ -9,7 +9,7 @@
 | Language subset | matrices, ops, logical indexing, control flow, functions, `varargin`/`varargout`, cells, struct arrays, complex, sparse, CSL, `@` handles, `classdef` OOP, N-D arrays, `global`/`persistent`, `import`, 845 builtins | full M-code |
 | Execution | tree-walk interpreter + bytecode-compiled loop bodies | bytecode VM → Cranelift JIT |
 | Linear algebra | pure-Rust LU/QR/Cholesky/eig (incl. complex)/SVD/pinv/cond/rank/rref/null/orth + optional faer backend | faer-rs as the default backend |
-| Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp), `matcraft` Studio + control channel | web app, LSP, Jupyter kernel |
+| Interface | `matcraft-cli` (run/eval/repl/--cmd/mcp/lsp), `matcraft` Studio + control channel, LSP server | web app, Jupyter kernel transport |
 | Plotting | `matplot`: 2-D + 3-D (plot3/surf/mesh/quiver3), imagesc/pie/contour/contourf, dendrograms/venn/graphs/clustergrams/streamlines, subplots, colormaps, colorbar, SVG/PNG/PDF export; interactive wgpu 3-D viewport in the Studio | full interactive window |
 | Toolboxes | DSP, optimization, control, statistics, distances/clustering, graph algorithms, chemistry/reaction/GPR and sequence I/O, xlsx/table + HDF5/NetCDF I/O, image processing | interactive figures and the remaining toolbox breadth |
 
@@ -77,7 +77,8 @@
 - Bytecode VM, then Cranelift JIT for loop hotspots.
 - Toolboxes as separate crates: signal (rustfft), control, data I/O
   (`.mat` v5/v7.3, CSV/Parquet), optimization (LM curve fitting).
-- LSP backend + Jupyter kernel protocol.
+- Jupyter kernel transport: `crates/jupyter` holds the wire/core layer —
+  a ZeroMQ adapter (libzmq, native-only) is the remaining piece.
 - WASM target (craftrules: never break wasm).
 
 ## Progress log
@@ -495,3 +496,12 @@
   Benchmarks: for-loop parity (~1.4–1.6 s @ 9e5 iters), ~15% faster
   `while`; the win is the compile seam + deduplicated loop code and the
   Cranelift lift point, not raw speed yet.
+- Interface wave: `matcraft_lsp` — `matcraft-cli lsp` serves LSP 3.17
+  (full-sync docs, parser diagnostics, completion over builtins/keywords/
+  document identifiers, signature hover, `function` symbols). The builtin
+  signature table moved from `ui-egui` to `matlang::signatures` so the
+  editor hint and the language server share it. `matcraft_jupyter` holds
+  the kernel core — connection-file parsing, wire frames with HMAC-SHA256,
+  and `kernel_info`/`execute`/`is_complete`/`complete`/`shutdown` on a
+  `matlang::Session`; the ZeroMQ transport is a deliberate follow-up
+  (libzmq is a native dependency call).

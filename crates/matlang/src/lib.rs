@@ -16,6 +16,7 @@ pub mod matfile;
 mod mcos;
 mod netcdf;
 pub mod parser;
+pub mod signatures;
 mod xlsx;
 
 pub use interp::{describe, fmt_num, fmt_value, read_m_source, Breakpoint, CellArray, PauseInfo, Session, Value, BUILTIN_NAMES, DEBUG_PAUSE_ID};

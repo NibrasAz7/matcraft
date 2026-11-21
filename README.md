@@ -99,11 +99,14 @@ cargo run -p matcraft-cli -- repl                    # interactive
 
 | Path | What |
 | --- | --- |
-| `crates/matcore` | matrix type + linear algebra (pure Rust; `faer` planned) |
+| `crates/matcore` | matrix type + linear algebra (pure Rust; optional `faer` backend) |
+| `crates/matffi` | plain-C dynamic-library FFI (the only `unsafe` boundary) |
 | `crates/matplot` | figure model + headless SVG renderer |
-| `crates/matlang` | lexer, parser, tree-walk interpreter, builtins |
+| `crates/matlang` | lexer, parser, interpreter (tree-walk + bytecode loop bodies), builtins |
 | `crates/engine` | command registry + guarded `Session` |
 | `crates/mcp` | JSON-RPC 2.0 server over stdio |
+| `crates/lsp` | LSP 3.17 language server for `.m` files |
+| `crates/jupyter` | Jupyter kernel core (wire + semantics; ZMQ transport pending) |
 | `crates/ui-egui` | Studio UI: command window, workspace, editor, figure dock, control dispatch |
 | `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` |
 | `apps/matcraft` | MatCraft Studio (`--control PORT` for the JSON-lines channel) |
