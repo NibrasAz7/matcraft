@@ -99,6 +99,7 @@ pub const FUNCTION_GROUPS: &[(&str, &str)] = &[
     ("file io", "fopen fclose fread fwrite fseek ftell feof frewind ferror fgetl fgets delete copyfile movefile rmdir"),
     ("dates", "now clock datenum datestr etime"),
     ("system", "version computer ispc isunix ismac getenv setenv system dos unix ver license diary beep"),
+    ("ffi", "loadlibrary unloadlibrary libisloaded libpointer calllib libfunctions libfunctionsview"),
     ("graphics objects", "get set drawnow waitbar gca ishandle findobj findall ishold"),
     ("image io", "imread imwrite im2double fspecial"),
     ("workspace/env", "eval evalc evalin assignin error warning lasterror exist which clc home tic toc pause nargin nargout narginchk nargoutchk nargchk disp display format fprintf sprintf input who whos clear assert rng normrnd mfilename help doc global persistent import argv"),

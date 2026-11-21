@@ -1,0 +1,26 @@
+[package]
+name = "matffi"
+description = "MatCraft FFI core: dynamic library loading and typed C calls (loadlibrary/calllib backend)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate is the project's single unsafe boundary: dlopen/dlsym and
+# calling raw function pointers are inherently unsafe. Every unsafe block
+# is boxed inside a safe public API. (Cargo does not allow overriding a
+# single workspace lint, so the table is spelled out here — same rules as
+# the workspace except `unsafe_code`, which is the point of this crate.)
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+
+[dependencies]
+libloading = "0.8"
+object = { version = "0.36", default-features = false, features = ["read"] }

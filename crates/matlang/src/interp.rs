@@ -20,6 +20,7 @@ mod bio;
 mod com;
 mod control;
 mod corpus;
+mod ffi;
 mod ga;
 mod gpu;
 mod graphs;
@@ -1346,6 +1347,11 @@ pub struct Session {
     /// Stopwatch for `tic`/`toc`. `Instant` doesn't exist on wasm.
     #[cfg(not(target_arch = "wasm32"))]
     tic: Option<std::time::Instant>,
+    /// `loadlibrary` handles (alias → library + declared signatures).
+    /// Shared across `Clone` snapshots like `files`; the underlying
+    /// `dlclose` runs when the last owner drops.
+    #[cfg(not(target_arch = "wasm32"))]
+    libs: std::rc::Rc<std::cell::RefCell<HashMap<String, ffi::LibEntry>>>,
     /// `fopen` file table (fid → entry). Shared across `Clone` snapshots
     /// via `Rc` — a panic-guard restore keeps the same open files.
     files: std::rc::Rc<std::cell::RefCell<HashMap<u32, FileEnt>>>,
@@ -1419,6 +1425,8 @@ impl Session {
             cur_fig: 0,
             #[cfg(not(target_arch = "wasm32"))]
             tic: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            libs: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             files: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             next_fid: std::rc::Rc::new(std::cell::Cell::new(3)),
             file_stack: Vec::new(),
@@ -4312,10 +4320,11 @@ impl Session {
             }
             BinOp::Backslash => {
                 // mldivide: A\B solves A*x = B; scalars broadcast.
+                // Non-square A falls back to QR least squares.
                 if ma.is_scalar() || mb.is_scalar() {
                     mb.broadcast(&ma, |x, y| x / y).map(mat_or_num).map_err(lang)
                 } else {
-                    ma.solve(&mb).map(mat_or_num).map_err(lang)
+                    ma.lstsq(&mb).map(mat_or_num).map_err(lang)
                 }
             }
             BinOp::Pow => {
@@ -6317,8 +6326,18 @@ impl Session {
             }
             "repmat" => {
                 let v = self.eval_args(args)?;
-                let r = v.scalar_at(1)? as usize;
-                let c = if v.len() > 2 { v.scalar_at(2)? as usize } else { r };
+                // `repmat(A, m, n)` per-arg or `repmat(A, [m n])` as a
+                // dims vector (first two entries win).
+                let (r, c) = match v.get(1) {
+                    Some(Value::Mat(m)) if m.numel() >= 2 && v.len() == 2 => {
+                        let d = m.data();
+                        (d[0].max(0.0) as usize, d.get(1).copied().unwrap_or(0.0).max(0.0) as usize)
+                    }
+                    _ => {
+                        let r = v.scalar_at(1)? as usize;
+                        (r, if v.len() > 2 { v.scalar_at(2)? as usize } else { r })
+                    }
+                };
                 match v.first() {
                     Some(Value::Cell(ca)) => ca.repmat(r, c).map(Value::Cell).map(Some),
                     // Character/string data is scalar `Str` here, so tiling it
@@ -6702,11 +6721,21 @@ impl Session {
                     }
                     _ => (1.0, v.scalar_at(0)?.max(1.0)),
                 };
+                // Dims tail: `randi(imax, m, n)` per-arg, `randi(imax, [m n])`
+                // or a single `randi(imax, n)` → n×n.
                 let (r, c) = if v.len() > 2 {
                     (v.scalar_at(1)? as usize, v.scalar_at(2)? as usize)
                 } else if v.len() == 2 {
-                    let n = v.scalar_at(1)? as usize;
-                    (n, n)
+                    match v.get(1) {
+                        Some(Value::Mat(m)) if m.numel() >= 2 => {
+                            let d = m.data();
+                            (d[0].max(0.0) as usize, d.get(1).copied().unwrap_or(0.0).max(0.0) as usize)
+                        }
+                        _ => {
+                            let n = v.scalar_at(1)? as usize;
+                            (n, n)
+                        }
+                    }
                 } else {
                     (1, 1)
                 };
@@ -7646,9 +7675,19 @@ impl Session {
                 let v = self.eval_args(args)?;
                 match v.first() {
                     Some(Value::Str(code)) => {
-                        let out = self.run(code.clone().as_str())?;
-                        self.print_buf.push_str(&out);
-                        Ok(None)
+                        // `v = eval('expr')` yields the expression's value;
+                        // statement strings run for their side effects.
+                        match crate::parser::parse_lines(code)?.as_slice() {
+                            [(_, Stmt::Expr(e, _))] => {
+                                let e = e.clone();
+                                Ok(Some(self.eval(&e)?))
+                            }
+                            _ => {
+                                let out = self.run(code.clone().as_str())?;
+                                self.print_buf.push_str(&out);
+                                Ok(None)
+                            }
+                        }
                     }
                     _ => Err(LangError::new("eval needs a string", 0)),
                 }
@@ -8037,7 +8076,9 @@ impl Session {
                         self.tic = Some(std::time::Instant::now());
                     }
                 }
-                Ok(None)
+                // `t = tic` returns the timestamp value (opaque marker —
+                // elapsed time is tracked internally, like MATLAB's).
+                Ok(Some(Value::Num(0.0)))
             }
             "toc" => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -8123,6 +8164,13 @@ impl Session {
             | "questdlg"
             | "uimenu"
             | "actxserver"
+            | "loadlibrary"
+            | "unloadlibrary"
+            | "libisloaded"
+            | "libpointer"
+            | "calllib"
+            | "libfunctions"
+            | "libfunctionsview"
             | "rethrow"
             | "verLessThan"
             | "inputname"
@@ -9194,7 +9242,8 @@ impl Session {
                     let yv: Vec<f64> = (1..=rows).map(|k| k as f64).collect();
                     fig.push_rgba(xv, yv, rows, cols, rgba);
                 }
-                Ok(None)
+                // `h = imshow(…)` yields the hosting figure handle.
+                Ok(Some(Value::Num(self.cur_fig as f64)))
             }
             "pie" => {
                 // pie(x) | pie(x, labels) | pie(x, explode)
@@ -11127,6 +11176,34 @@ impl Session {
                 let (vals, idxs) = reduce_with_index(&m, dim, hi);
                 vec![mat_or_num(vals), mat_or_num(idxs)]
             }
+            "sort" => {
+                // `[B, I] = sort(A)` — values plus the permutation.
+                let v = self.eval_args(args)?;
+                let first = v.first().ok_or_else(|| LangError::new("sort needs an argument", 0))?;
+                let mut dim: Option<usize> = None;
+                let mut desc = false;
+                for extra in v.iter().skip(1) {
+                    match extra {
+                        Value::Str(s) => desc = s.trim() == "descend" || s.trim() == "descending",
+                        other => {
+                            let d = other.scalar()? as usize;
+                            dim = Some(d);
+                        }
+                    }
+                }
+                let dim = dim.unwrap_or(1);
+                match first {
+                    Value::Cplx(cm) => {
+                        let (sv, pi) = self.csort_idx(cm, dim, desc)?;
+                        vec![cmat_or_value(sv), mat_or_num(pi)]
+                    }
+                    other => {
+                        let m = other.to_matrix()?;
+                        let (sv, pi) = self.sort_idx(&m, dim, desc)?;
+                        vec![mat_or_num(sv), mat_or_num(pi)]
+                    }
+                }
+            }
             "find" => {
                 let v = self.eval_args(args)?;
                 if let Some(Value::Sparse(s)) = v.first() {
@@ -11331,6 +11408,13 @@ impl Session {
             | "questdlg"
             | "uimenu"
             | "actxserver"
+            | "loadlibrary"
+            | "unloadlibrary"
+            | "libisloaded"
+            | "libpointer"
+            | "calllib"
+            | "libfunctions"
+            | "libfunctionsview"
             | "rethrow"
             | "verLessThan"
             | "inputname"
@@ -13215,6 +13299,9 @@ impl Session {
                 let session = com::ComSession::start(&prog)?;
                 Ok(vec![Value::Object(MObject::com_object(&prog, session))])
             }
+            "loadlibrary" | "unloadlibrary" | "libisloaded" | "libpointer" | "calllib" | "libfunctions" | "libfunctionsview" => {
+                self.ffi_call(name, v)
+            }
             "version" => Ok(vec![Value::Str(format!("MatCraft {}", env!("CARGO_PKG_VERSION")))]),
             "ver" => {
                 // struct with Name/Version/Release fields.
@@ -15062,6 +15149,12 @@ impl Session {
 
     /// Complex sort — by magnitude, ties by phase (M-code ordering).
     fn csort(&mut self, m: &CMatrix, dim: usize, desc: bool) -> Result<Value, LangError> {
+        self.csort_idx(m, dim, desc).map(|(v, _)| cmat_or_value(v))
+    }
+
+    /// Complex `sort` plus the permutation (`[B,I] = sort(A)`). Ordering
+    /// is magnitude, then phase — same as the single-output path.
+    fn csort_idx(&mut self, m: &CMatrix, dim: usize, desc: bool) -> Result<(CMatrix, Matrix), LangError> {
         let cmp = |a: &CNum, b: &CNum| {
             let o = a
                 .abs()
@@ -15076,38 +15169,45 @@ impl Session {
         };
         let (rows, cols) = m.shape();
         if rows == 1 || cols == 1 {
-            let mut d = m.data().to_vec();
-            d.sort_by(cmp);
-            let out = if rows == 1 {
-                CMatrix::from_col_major(1, d.len(), d).map_err(lang)?
-            } else {
-                CMatrix::from_col_major(d.len(), 1, d).map_err(lang)?
-            };
-            return Ok(cmat_or_value(out));
+            let mut d: Vec<(usize, CNum)> = m.data().iter().copied().enumerate().collect();
+            d.sort_by(|a, b| cmp(&a.1, &b.1));
+            let vals: Vec<CNum> = d.iter().map(|p| p.1).collect();
+            let idx: Vec<f64> = d.iter().map(|p| (p.0 + 1) as f64).collect();
+            let (vr, vc) = if rows == 1 { (1, vals.len()) } else { (vals.len(), 1) };
+            return Ok((CMatrix::from_col_major(vr, vc, vals).map_err(lang)?, Matrix::from_col_major(vr, vc, idx).map_err(lang)?));
         }
         let mut out = CMatrix::zeros(rows, cols);
+        let mut perm = Matrix::zeros(rows, cols);
         if dim == 2 {
             for r in 0..rows {
-                let mut row: Vec<CNum> = (0..cols).map(|c| m.get(r, c).unwrap_or(CNum::real(0.0))).collect();
-                row.sort_by(cmp);
+                let mut row: Vec<(usize, CNum)> = (0..cols).map(|c| (c, m.get(r, c).unwrap_or(CNum::real(0.0)))).collect();
+                row.sort_by(|a, b| cmp(&a.1, &b.1));
                 for (c, v) in row.iter().enumerate() {
-                    let _ = out.set(r, c, *v);
+                    let _ = out.set(r, c, v.1);
+                    let _ = perm.set(r, c, (v.0 + 1) as f64);
                 }
             }
         } else {
             for c in 0..cols {
-                let mut col: Vec<CNum> = (0..rows).map(|r| m.get(r, c).unwrap_or(CNum::real(0.0))).collect();
-                col.sort_by(cmp);
+                let mut col: Vec<(usize, CNum)> = (0..rows).map(|r| (r, m.get(r, c).unwrap_or(CNum::real(0.0)))).collect();
+                col.sort_by(|a, b| cmp(&a.1, &b.1));
                 for (r, v) in col.iter().enumerate() {
-                    let _ = out.set(r, c, *v);
+                    let _ = out.set(r, c, v.1);
+                    let _ = perm.set(r, c, (v.0 + 1) as f64);
                 }
             }
         }
-        Ok(cmat_or_value(out))
+        Ok((out, perm))
     }
 
     /// Sort vectors or each column/row of a matrix; `desc` reverses.
     fn sort(&mut self, m: &Matrix, dim: usize, desc: bool) -> Result<Value, LangError> {
+        self.sort_idx(m, dim, desc).map(|(v, _)| mat_or_num(v))
+    }
+
+    /// `sort` plus the permutation that produced it (`[B,I] = sort(A)`);
+    /// indices are 1-based along the sorted dimension.
+    fn sort_idx(&mut self, m: &Matrix, dim: usize, desc: bool) -> Result<(Matrix, Matrix), LangError> {
         need_2d(m, "sort")?;
         let cmp = |a: &f64, b: &f64| {
             let o = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
@@ -15119,30 +15219,35 @@ impl Session {
         };
         let (rows, cols) = m.shape();
         if rows == 1 || cols == 1 || dim == 0 {
-            let mut d = m.data().to_vec();
-            d.sort_by(cmp);
-            let out = if rows == 1 { Matrix::row_vector(d) } else { Matrix::col_vector(d) };
-            return Ok(mat_or_num(out));
+            let mut d: Vec<(usize, f64)> = m.data().iter().copied().enumerate().collect();
+            d.sort_by(|a, b| cmp(&a.1, &b.1));
+            let vals: Vec<f64> = d.iter().map(|p| p.1).collect();
+            let idx: Vec<f64> = d.iter().map(|p| (p.0 + 1) as f64).collect();
+            let (vr, vc) = if rows == 1 { (1, vals.len()) } else { (vals.len(), 1) };
+            return Ok((Matrix::from_col_major(vr, vc, vals).map_err(lang)?, Matrix::from_col_major(vr, vc, idx).map_err(lang)?));
         }
         let mut out = Matrix::zeros(rows, cols);
+        let mut perm = Matrix::zeros(rows, cols);
         if dim == 2 {
             for r in 0..rows {
-                let mut row: Vec<f64> = (0..cols).map(|c| m.get(r, c).unwrap_or(0.0)).collect();
-                row.sort_by(cmp);
+                let mut row: Vec<(usize, f64)> = (0..cols).map(|c| (c, m.get(r, c).unwrap_or(0.0))).collect();
+                row.sort_by(|a, b| cmp(&a.1, &b.1));
                 for (c, v) in row.iter().enumerate() {
-                    let _ = out.set(r, c, *v);
+                    let _ = out.set(r, c, v.1);
+                    let _ = perm.set(r, c, (v.0 + 1) as f64);
                 }
             }
         } else {
             for c in 0..cols {
-                let mut col: Vec<f64> = (0..rows).map(|r| m.get(r, c).unwrap_or(0.0)).collect();
-                col.sort_by(cmp);
+                let mut col: Vec<(usize, f64)> = (0..rows).map(|r| (r, m.get(r, c).unwrap_or(0.0))).collect();
+                col.sort_by(|a, b| cmp(&a.1, &b.1));
                 for (r, v) in col.iter().enumerate() {
-                    let _ = out.set(r, c, *v);
+                    let _ = out.set(r, c, v.1);
+                    let _ = perm.set(r, c, (v.0 + 1) as f64);
                 }
             }
         }
-        Ok(mat_or_num(out))
+        Ok((out, perm))
     }
 
     /// Unary elementwise builtin on the first argument.
@@ -17974,6 +18079,13 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "questdlg",
     "uimenu",
     "actxserver",
+    "loadlibrary",
+    "unloadlibrary",
+    "libisloaded",
+    "libpointer",
+    "calllib",
+    "libfunctions",
+    "libfunctionsview",
     "importdata",
     "detectImportOptions",
     "rethrow",
@@ -22690,6 +22802,43 @@ end",
         assert_eq!(s.get("pid"), Some(&Value::Str("WScript.Shell".into())));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ffi_load_and_probe() {
+        let mut s = Session::new();
+        assert!(s.run("loadlibrary('definitely-no-such-lib-matcraft-9x');").is_err());
+        s.run("r = libisloaded('nope');").unwrap();
+        assert_eq!(s.get("r"), Some(&Value::Num(0.0)));
+    }
+
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    #[test]
+    fn ffi_calllib_msvcrt() {
+        let mut s = Session::new();
+        if s.run("loadlibrary('msvcrt');").is_err() {
+            return; // CRT not loadable in this environment
+        }
+        // Undeclared: string arg → char*, return defaults to int64.
+        s.run("n = calllib('msvcrt','strlen','hello world'); y = libisloaded('msvcrt');").unwrap();
+        assert_eq!(s.get("n"), Some(&Value::Num(11.0)));
+        assert_eq!(s.get("y"), Some(&Value::Num(1.0)));
+        // Inline signature extension: signed int in and out.
+        s.run("a = calllib('msvcrt','abs',-7, 'RetType','int32', 'ArgTypes',{'int32'});").unwrap();
+        assert_eq!(s.get("a"), Some(&Value::Num(7.0)));
+        // Declared signatures at loadlibrary time: doubles in XMM regs.
+        s.run("unloadlibrary('msvcrt'); sig.cos = {'double','double'}; sig.floor = {'double','double'}; sig.modf = {'double','double','doublePtr'}; loadlibrary('msvcrt', sig); c = calllib('msvcrt','cos',0.0); f = calllib('msvcrt','floor',2.7);")
+            .unwrap();
+        assert_eq!(s.get("c"), Some(&Value::Num(1.0)));
+        assert_eq!(s.get("f"), Some(&Value::Num(2.0)));
+        // lib.pointer output parameter: modf writes the integer part
+        // through doublePtr, returns the fraction.
+        s.run("p = libpointer('doublePtr', 0); frac = calllib('msvcrt','modf',3.75,p); pv = p.Value;").unwrap();
+        assert_eq!(s.get("frac"), Some(&Value::Num(0.75)));
+        assert_eq!(s.get("pv"), Some(&Value::Num(3.0)));
+        s.run("unloadlibrary('msvcrt'); z = libisloaded('msvcrt');").unwrap();
+        assert_eq!(s.get("z"), Some(&Value::Num(0.0)));
+    }
+
     #[test]
     fn classdef_inheritance_and_super_ctor() {
         let mut s = Session::new();
@@ -25005,6 +25154,58 @@ end",
         assert_eq!(scalar(&s, "properties"), 42.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_wave7_fixes() {
+        let mut s = Session::new();
+        let scalar = |s: &Session, name: &str| -> f64 { s.get(name).cloned().unwrap().to_matrix().unwrap().as_scalar().unwrap() };
+
+        // `N.^` lexes as elementwise power, not a `N.` literal with `^` —
+        // `10.^(x/10)` and `2.^[6:10]` are corpus idioms.
+        s.run("a = 2.^[1 2 3]; b = 10.^[2]; c = 10.^([0 10]/10); d = 2.^2;").unwrap();
+        assert_eq!(s.get("a").unwrap().to_matrix().unwrap().data(), &[2.0, 4.0, 8.0]);
+        assert_eq!(scalar(&s, "b"), 100.0);
+        assert_eq!(s.get("c").unwrap().to_matrix().unwrap().data(), &[1.0, 10.0]);
+        assert_eq!(scalar(&s, "d"), 4.0);
+
+        // Empty arrays are ignored in concatenation: `[15x1 find-empty]`
+        // (find yields 0x1) and `['str' []]` keep their non-empty operand.
+        s.run("both = [find([0 0 1]) find(zeros(0))]; st = ['abc' []];").unwrap();
+        assert_eq!(s.get("both").unwrap().to_matrix().unwrap().data(), &[3.0]);
+        assert_eq!(s.get("st"), Some(&Value::Str("abc".into())));
+
+        // Empty operands propagate in elementwise ops; a `0` dim is
+        // compatible with anything and dominates the result shape.
+        s.run("e = [] .* (1:130); f = zeros(0,5) .* ones(1,5); [fr,fc] = size(f); g = zeros(2,0) .* ones(2,3); [gr,gc] = size(g);").unwrap();
+        assert_eq!(s.get("e").unwrap().dims(), (0, 0));
+        assert_eq!((scalar(&s, "fr"), scalar(&s, "fc")), (0.0, 5.0));
+        assert_eq!((scalar(&s, "gr"), scalar(&s, "gc")), (2.0, 0.0));
+
+        // Dims-vector tails: `randi(imax, [m n])` and `repmat(A, [m n])`
+        // take their shape from a row vector, not scalar args.
+        s.run("r = randi([0 249], [1 4]); [rr, rc] = size(r); p = repmat([.1 3], [3 1]); [pr, pc] = size(p);").unwrap();
+        assert_eq!((scalar(&s, "rr"), scalar(&s, "rc")), (1.0, 4.0));
+        assert_eq!((scalar(&s, "pr"), scalar(&s, "pc")), (3.0, 2.0));
+
+        // `t = tic` returns a value; `h = imshow(A)` returns its figure.
+        s.run("t = tic; h = imshow(ones(3));").unwrap();
+        assert!(s.get("t").is_some());
+        assert_eq!(scalar(&s, "h"), 1.0);
+
+        // `A\b` on a tall system is QR least squares; b in col-space
+        // gives the exact [0; 0.5].
+        s.run("x = [1 2; 3 4; 5 6] \\ [1; 2; 3];").unwrap();
+        let xd = s.get("x").unwrap().to_matrix().unwrap().data().to_vec();
+        assert!(xd[0].abs() < 1e-12 && (xd[1] - 0.5).abs() < 1e-12);
+
+        // `[B, I] = sort(A)` yields values plus the permutation;
+        // `v = eval('expr')` yields the expression's value.
+        s.run("[sb, si] = sort([3 1 2]); [~, sj] = sort([2 1; 4 3], 2); ev = eval('-(1+2)');").unwrap();
+        assert_eq!(s.get("sb").unwrap().to_matrix().unwrap().data(), &[1.0, 2.0, 3.0]);
+        assert_eq!(s.get("si").unwrap().to_matrix().unwrap().data(), &[2.0, 3.0, 1.0]);
+        assert_eq!(s.get("sj").unwrap().to_matrix().unwrap().data(), &[2.0, 2.0, 1.0, 1.0]);
+        assert_eq!(scalar(&s, "ev"), -3.0);
     }
 
     #[test]

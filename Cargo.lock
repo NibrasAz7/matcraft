@@ -2576,6 +2576,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "matffi"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "object",
+]
+
+[[package]]
 name = "matlang"
 version = "0.1.0"
 dependencies = [
@@ -2584,6 +2592,7 @@ dependencies = [
  "flate2",
  "image",
  "matcore",
+ "matffi",
  "matplot",
  "pollster 0.4.0",
  "regex",
@@ -3184,6 +3193,15 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

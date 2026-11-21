@@ -329,15 +329,23 @@ impl Matrix {
         if !self.is_matrix() || !other.is_matrix() {
             return Err(MatError::DimsMismatch { a: self.dims.clone(), b: other.dims.clone() });
         }
-        let rows = self.rows().max(other.rows());
-        let cols = self.cols().max(other.cols());
-        if (self.rows() != rows && self.rows() != 1)
-            || (self.cols() != cols && self.cols() != 1)
-            || (other.rows() != rows && other.rows() != 1)
-            || (other.cols() != cols && other.cols() != 1)
-        {
+        // Per-dim implicit expansion: equal dims keep, `1` expands to the
+        // other's size, `0` is compatible with anything and dominates —
+        // `[] .* x` is `[]`, `zeros(0,5) .* ones(1,5)` is `0x5`.
+        let combine = |a: usize, b: usize| -> Option<usize> {
+            if a == b || a == 0 || b == 0 {
+                Some(if a == 0 || b == 0 { 0 } else { a })
+            } else if a == 1 {
+                Some(b)
+            } else if b == 1 {
+                Some(a)
+            } else {
+                None
+            }
+        };
+        let (Some(rows), Some(cols)) = (combine(self.rows(), other.rows()), combine(self.cols(), other.cols())) else {
             return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
-        }
+        };
         let mut out = Matrix::zeros(rows, cols);
         for c in 0..cols {
             for r in 0..rows {
@@ -490,6 +498,37 @@ impl Matrix {
         Ok(x)
     }
 
+    /// Least-squares `A \ b` for overdetermined systems (m > n): QR then
+    /// `R1 x = (Q'b)(1:n)`. Square inputs defer to [`Matrix::solve`];
+    /// underdetermined systems (m < n) are not supported.
+    pub fn lstsq(&self, b: &Matrix) -> Result<Matrix, MatError> {
+        if self.rows() == self.cols() {
+            return self.solve(b);
+        }
+        if !self.is_matrix() || !b.is_matrix() || b.rows() != self.rows() {
+            return Err(MatError::DimensionMismatch { a: self.shape(), b: b.shape() });
+        }
+        if self.rows() < self.cols() {
+            return Err(MatError::Other("mldivide: underdetermined systems are not supported".into()));
+        }
+        let n = self.cols();
+        let (q, r) = crate::linalg::qr(self)?;
+        let qb = q.transpose().matmul(b)?;
+        let mut r1 = Matrix::zeros(n, n);
+        for c in 0..n {
+            for row in 0..n {
+                let _ = r1.set(row, c, r.get(row, c).unwrap_or(0.0));
+            }
+        }
+        let mut q1 = Matrix::zeros(n, qb.cols());
+        for c in 0..qb.cols() {
+            for row in 0..n {
+                let _ = q1.set(row, c, qb.get(row, c).unwrap_or(0.0));
+            }
+        }
+        r1.solve(&q1)
+    }
+
     /// Inverse via repeated solves (columns of the identity).
     pub fn inverse(&self) -> Result<Matrix, MatError> {
         if !self.is_matrix() {
@@ -629,7 +668,15 @@ impl Matrix {
 
     /// Concatenate along 0-based dimension `dim` (`cat(dim+1, a, b)`).
     /// Every other dim must match after padding missing dims with 1s.
+    /// A completely empty operand (`numel == 0`) contributes nothing —
+    /// M-code ignores empty arrays in concatenation.
     pub fn cat(dim: usize, a: &Matrix, b: &Matrix) -> Result<Matrix, MatError> {
+        if a.numel() == 0 {
+            return Ok(b.clone());
+        }
+        if b.numel() == 0 {
+            return Ok(a.clone());
+        }
         let nd = a.dims.len().max(b.dims.len()).max(dim + 1).max(2);
         let mut rd = vec![1usize; nd];
         for (i, d) in rd.iter_mut().enumerate() {

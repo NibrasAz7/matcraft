@@ -94,6 +94,7 @@ fn layers() -> ExitCode {
         // silently drop the check.
         Some(match name {
             "matcore" => 0,
+            "matffi" => 0,
             "matplot" => 1,
             "matlang" => 2,
             "engine" | "matcraft_engine" => 5,

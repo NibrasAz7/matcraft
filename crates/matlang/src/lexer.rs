@@ -525,8 +525,10 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
         i += 1;
     }
     // Fractional part: consume '.' unless a second '.' follows (that would
-    // be the start of a `...` continuation).
-    if chars.get(i) == Some(&'.') && chars.get(i + 1) != Some(&'.') {
+    // be the start of a `...` continuation) or a dot-operator follows —
+    // `10.^(x/10)` is scalar `.^`, not a `10.` literal with `^`.
+    let dot_op = matches!(chars.get(i + 1), Some('^') | Some('*') | Some('/') | Some('\\') | Some('\''));
+    if chars.get(i) == Some(&'.') && chars.get(i + 1) != Some(&'.') && !dot_op {
         text.push('.');
         i += 1;
         while i < chars.len() && chars[i].is_ascii_digit() {

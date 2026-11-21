@@ -37,9 +37,9 @@
 | clean run | — | **1,913** |
 | parse-ok / parse-fail | **10,095 / 4** | — / 5 |
 | unknown builtin/function | 0 | 515 |
-| runtime error | 6 | 68 |
+| runtime error | 6 | 69 |
 | missing data/env files | 0 | 119 |
-| timeout | 0 | 3 |
+| timeout | 0 | 2 |
 | **total** | 10,105 | 2,623 |
 
 - **Parser coverage: 10,095/10,105 function files (99.9%)** parse
@@ -82,13 +82,30 @@
   FieldTrip preamble scripts that reference caller-workspace variables
   (`cfg`) when run standalone. The MEX binary decision is recorded in
   `scope.md` (out of scope) with `loadlibrary`-style FFI as G56.
-- **The 74 runtime errors** are a long tail: `A^B` matrix-exponent
+- **The 75 runtime errors** are a long tail: `A^B` matrix-exponent
   calls that MATLAB rejects identically, deeper per-file semantic gaps
-  (struct→scalar coercion sites, `too few outputs`), the documented
-  `['a';'b']` multi-row char-array limitation, and index/struct-
-  boundary singles.
-- **3 timeouts** are heavy scripts genuinely computing for >15 s
+  (struct→scalar coercion sites), the documented `['a';'b']` multi-row
+  char-array limitation, index/struct-boundary singles, and files that
+  now *reach* unsupported externals (`cv.*` mexopencv calls) after
+  wave-7 semantics fixes — an honest error class, not a regression.
+- **2 timeouts** are heavy scripts genuinely computing for >15 s
   (FieldTrip/WEC-Sim pipelines), not hangs.
+
+### Runtime-error waves
+
+Two execution waves landed after the grammar work:
+
+- **Wave 7a — empty-array semantics.** `Matrix::cat` skips zero-element
+  operands (`[find-empty, 15x1]` keeps the non-empty side), `broadcast`
+  treats a `0` dim as compatible-with-anything and empty-dominating,
+  and `N.^` lexes as elementwise power (not a `N.` literal).
+- **Wave 7b — call-shape fixes.** `randi(imax,[m n])` /
+  `repmat(A,[m n])` dims-vector tails, `t = tic` and `h = imshow(A)`
+  returning values, `A\b` QR least squares for tall systems,
+  `[B,I] = sort(A)` permutation output, and `v = eval('expr')`
+  returning the expression's value. Several files now run to
+  completion (`SolveMax.m`) or fail later on genuinely-unsupported
+  externals (`cv.*`, `fvecs_read`).
 
 ## What this corpus exercised that the old one didn't
 

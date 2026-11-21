@@ -52,6 +52,7 @@ files or depend on the host platform use a descriptive output.
 - [file io](#file-io) — 15 functions
 - [dates](#dates) — 5 functions
 - [system](#system) — 14 functions
+- [ffi](#ffi) — 7 functions
 - [graphics objects](#graphics-objects) — 9 functions
 - [image io](#image-io) — 4 functions
 - [workspace/env](#workspace-env) — 38 functions
@@ -998,6 +999,20 @@ files or depend on the host platform use a descriptive output.
 | **`license`** <code>license(feature)</code> | License availability. | <code>r = license('test','MATLAB');</code> | <code>[0]</code> |
 | **`diary`** <code>diary [on&#124;off&#124;file]</code> | Record console output to a file. | <code>diary('session.log')</code> | <code>diary toggles or redirects console logging.</code> |
 | **`beep`** <code>beep</code> | Play the system beep. | <code>beep</code> | <code>beep plays the system alert sound.</code> |
+
+## ffi
+
+<a id="ffi"></a>
+
+| Function / usage | Description | Example | Output / effect |
+| --- | --- | --- | --- |
+| **`loadlibrary`** <code>loadlibrary(name[,sigs])</code> | Load a shared library (`.dll`/`.so`/`.dylib`). `sigs` is a struct mapping each function name to a cellstr `{retType, argType, …}` (e.g. `s.add = {'int64','int64','int64'}`). | <code>loadlibrary('msvcrt')</code> | <code>loads msvcrt for calllib</code> |
+| **`unloadlibrary`** <code>unloadlibrary([name])</code> | Unload one library, or all when called without a name. | <code>unloadlibrary('msvcrt')</code> | <code>removes the library handle</code> |
+| **`libisloaded`** <code>libisloaded(name)</code> | True when the library is loaded. | <code>r = libisloaded('msvcrt');</code> | <code>[1]</code> |
+| **`libpointer`** <code>libpointer(type[,value])</code> | Create a typed pointer object for calllib outputs; read/write via `p.Value`. | <code>p = libpointer('doublePtr', 0);</code> | <code>lib.pointer object</code> |
+| **`calllib`** <code>calllib(lib,fn,args...)</code> | Call a C function in a loaded library. Scalar args marshal per the declared signature; without one, numbers pass as `double` and the return defaults to `int64`. Trailing `'RetType',t` and `'ArgTypes',{…}` pairs declare types inline (MatCraft extension). | <code>calllib('msvcrt','strlen','hello')</code> | <code>[5]</code> |
+| **`libfunctions`** <code>libfunctions(name)</code> | Cellstr of exported symbol names. | <code>f = libfunctions('msvcrt');</code> | <code>{'abs';'acos';…}</code> |
+| **`libfunctionsview`** <code>libfunctionsview(name)</code> | Print the export table and return it as a cellstr. | <code>libfunctionsview('msvcrt')</code> | <code>prints Functions in library msvcrt: …</code> |
 
 ## graphics objects
 

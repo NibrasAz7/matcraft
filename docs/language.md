@@ -114,7 +114,8 @@ by observing MathWorks software.
   collapses to a row). Chained writes `c{1}{1} = v`, `c{1}(i) = v`,
   `s.c{1}.f = v` work to any depth.
 - Operators: `+ - * / \ ^ '` and element-wise `.* ./ .^ .'`.
-  `A\b` solves `A*x = b`; `A/B` solves `x*B = A`.
+  `A\b` solves `A*x = b` (tall systems use QR least squares;
+  underdetermined systems are not supported); `A/B` solves `x*B = A`.
 - Comparisons `== ~= < <= > >=` are element-wise, returning `0`/`1`.
 - Logicals: `&` `|` element-wise; `&&` `||` short-circuit (scalar).
 - Unary `-`, `+`, `~` (logical not).
@@ -268,6 +269,26 @@ An unbound name in expression position is a zero-arg call: `x = rand`,
   numeric/string/boolean results and numeric arrays are converted;
   COM-object results report a clear error. The bridge is Windows-only
   (other platforms report that COM needs Windows).
+- Plain-C FFI (`loadlibrary`/`calllib`): `loadlibrary('name')` resolves a
+  shared library (`x.dll` / `libx.so` / `libx.dylib` are tried when the
+  name has no extension) and keeps it by file-stem alias;
+  `unloadlibrary`/`libisloaded` manage the table, `libfunctions`/
+  `libfunctionsview` list its exports. `calllib('lib','fn',args…)`
+  marshals scalar `intN`/`uintN`/`bool`/`single`/`double` arguments,
+  `cstring` strings, and `X*Ptr` pointer arguments — a
+  `libpointer('doublePtr',v)` object supplies the address of an encoded
+  buffer and receives the callee's writes back in `p.Value` (handle
+  semantics), while a plain matrix argument is copy-in only.
+  Signatures are declared at `loadlibrary` time with a struct
+  (`s.add = {'int64','int64','int64'}` — return type first) or inline
+  via trailing `'RetType',t`/`'ArgTypes',{…}` pairs (a MatCraft
+  extension). With no signature, numbers pass as `double` and the
+  return reads as `int64`, so `double`-returning functions need an
+  explicit signature. Not supported: structs-by-value, varargs,
+  `long double`, M-code callbacks, and binary `.mex` files (see
+  `docs/scope.md`). Native targets only — wasm reports the feature
+  unavailable. Buffers are bounded at 256 MiB, and pointer arguments
+  remain valid only for the duration of the call.
 
 ## Builtin library
 
@@ -280,7 +301,7 @@ runnable example, expected output) in [`functions.md`](functions.md).
 | Shape | `size numel length ndims` — `size(x)` returns the whole dims vector as a row, `size(x,d)` one dim, multi-output `[r,c,…] = size(A)` folds trailing dims into the last output; `ndims` counts stored dims (≥2) |
 | Linear algebra | `det inv norm eig svd qr lu chol rref pinv rank cond trace null orth` (multi-output `[V,D] = eig(A)`, `[U,S,V] = svd(A)`, `[Q,R] = qr(A)`, `[L,U,P] = lu(A)`) |
 | Reductions | `sum mean prod min max std var median any all` — dim-aware (`f(A)`, `f(A,2)`, `f(A,'all')`, `f(A,[],2)`); N-D arrays reduce along `dim` over the whole array (`sum(ones(2,3,4),3)` → 2×3×1) and default to the first non-singleton dim; two-output `[M,I] = max(A)`; elementwise `min(A,B)` |
-| Running | `cumsum cumprod diff sort unique find` (`find` multi-output; `cumsum`/`cumprod`/`diff` are 2-D-only) |
+| Running | `cumsum cumprod diff sort unique find` (`find` and `sort` multi-output — `[B,I] = sort(A)`; `cumsum`/`cumprod`/`diff` are 2-D-only) |
 | Statistics | `nansum nanmean nanprod nanmin nanmax nanstd nanvar nanmedian cov prctile quantile hist histc wmean` — `nan*` skips `NaN`s; `cov(X)`, `cov(x,y)`, `cov(X,1)`; `prctile(x,p)`/`quantile(x,q)` interpolate per column; `hist(x,n|edges)` (2nd output = centres), `histc(x,edges)` per column; `wmean(A,W)` is the weighted mean `sum(A.*W)/sum(W)` along the first non-singleton dim (`'all'`, `'dim',d`, `'omitnan'`/`'includenan'`) |
 | Sets | `ismember setdiff union intersect setxor` (`[tf,loc] = ismember(A,B)` — numeric, or whole-string
   membership when either side is a cellstr (`ismember('fp16',{'h','fp16'})`);
@@ -312,12 +333,13 @@ runnable example, expected output) in [`functions.md`](functions.md).
 | Constants | `pi eps inf nan true false` — constructor forms too: `Inf(n,m)`, `NaN(n)`, `eps(x)` |
 | Workspace | `who whos clear disp display format save load type assert rng normrnd global persistent` (`save 'f.mat'` writes tagged ASCII, `load` reads it back or a numeric table; `rng(n)`/`rng('shuffle')`/`rng('default')` seed `rand`/`randn`/`randperm`/`normrnd`;
   the legacy `rand('seed',v)`/`rand('state',v)`/`rand('twister',v)` forms set and `rand('state')` reads it; `global x` links to the shared global store per frame, `persistent x` inside a function keeps `x` between calls) |
-| Environment | `addpath rmpath savepath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `p = path` returns the joined path and `path(p)` sets it; `addpath(...,'-begin')` prepends (default) and `'-end'` appends; `savepath` persists the path (`MATCRAFT_PATH_FILE` overrides the platform location); `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `import pkg.*`/`import pkg.Name` resolve `+pkg` package members;
+| Environment | `addpath rmpath savepath path pwd cd dir ls mkdir genpath fullfile filesep csvread exist which eval evalc run error warning clc home tic toc pause import` (`cd ..`/`cd ../x` bare-dot command form; `addpath(genpath(pwd))` splits `;`-lists; `p = path` returns the joined path and `path(p)` sets it; `addpath(...,'-begin')` prepends (default) and `'-end'` appends; `savepath` persists the path (`MATCRAFT_PATH_FILE` overrides the platform location); `run 'file.m'` executes a script in the current session — shared workspace — and reports failures as `Error in <file> (line N)`; `t = evalc('…')` captures the echo instead of printing it; `v = eval('expr')` yields the expression's value while statement strings run for their side effects; `import pkg.*`/`import pkg.Name` resolve `+pkg` package members;
   `d = dir(pat)` returns a name/folder/date/bytes/isdir/datenum struct array
   (sorted, `.`/`..` first, 0x1 when nothing matches; `ls` prints the listing);
   `p = which('n')` returns the located path/description char or `''`) |
 | Parallel / GPU | `maxNumCompThreads parpool parfeval fetchOutputs onCleanup gpuArray gather canUseGPU existsOnGPU gpuDevice` - Rayon-backed parallel matrix kernels are enabled by `maxNumCompThreads(n)`/`parpool(n)`; `gpuArray`/`gather` use a wgpu compute matmul (`f32` precision — see `gpuArray` in functions.md) when built with `--features gpu`, otherwise they transparently fall back to CPU | 
 | System | `version ver computer ispc isunix ismac getenv setenv system dos unix fileparts copyfile movefile rmdir isdir isfile tempdir tempname evalin assignin mfilename help doc class license diary jsondecode jsonencode importdata detectImportOptions webread urlread web winopen uigetdir questdlg uimenu actxserver rethrow verLessThan validateattributes validatestring inputname optimset optimget` - `[st,msg] = copyfile/movefile/rmdir` return status+message rather than throwing; `[s,out] = system(cmd)` runs through the OS shell (native only); `dos`/`unix` are aliases, and statement-leading `!cmd` is the same shell escape; `evalin`/`assignin` treat `'base'`/`'caller'` as the one shared workspace; `optimset`/`optimget` build/read options structs (case-insensitive unique-prefix lookup); `license` always reports 0; `mfilename('fullpath')` returns the running file's path; `diary` appends console output to a file, JSON/import helpers cover configuration and numeric text, and `rethrow`/`verLessThan`/`validateattributes`/`validatestring`/`inputname` cover common error and validation paths; `actxserver` starts a Windows PowerShell COM bridge (properties, methods, `get`/`set`, `delete`) |
+| FFI | `loadlibrary unloadlibrary libisloaded libpointer calllib libfunctions libfunctionsview` — plain-C shared-library interop; see the FFI bullet above for the marshalling rules and declared-signature syntax |
 | UI | `input waitbar drawnow beep ishandle findobj findall ishold gca get set argv` — `input('p')` evaluates a typed expression, `input('p','s')` returns it verbatim; headless: `drawnow`/`beep` are no-ops, `waitbar` accepts and returns a dummy handle, `findobj`/`findall` return empty, `ishandle` tests figure numbers, `gca` returns the current figure number; `get(0,'ScreenSize')`/`'ScreenDepth'`/`'Children'` report a fixed virtual screen, `get(fig,'prop')`/`get(fig)` reads figure limits/labels/grid; `set(0,'Default*',v)` stores root defaults `get` reads back, `set(fig,'prop',v,…)` writes the same props; `argv()` returns an empty cellstr (scripts take no args) |
 | Debugger | `dbstop in <file> [at <line>]` / `dbstop if error`, `dbclear in <file> [at <line>]` / `dbclear all` / `dbclear if error`, `dbstatus [file]`, `dbcont`, `dbstep`, `dbquit` — breakpoints match top-level statements of files run via `run` (a line that isn't a statement start slides to the next one); a stop returns a `LangError` with id `matcraft:debug:pause` and the session exposes `is_paused`/`pause_info`/`resume`/`step`/`quit_debug` for the caller to drive it |
 | Output | `fprintf sprintf` (`fprintf(fid,fmt,…)` writes to an `fopen` file id, 1/2 = stdout/stderr;
