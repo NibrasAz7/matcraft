@@ -54,8 +54,8 @@
   and `matcraft-cli mcp` (JSON-RPC 2.0 stdio, tools + resources),
   `cargo xtask layers` in CI. Numerics: `matcore::linalg` — Householder QR,
   Cholesky, Jacobi symmetric eig, Hessenberg+QR `eigvals`, SVD, `pinv`,
-  `rank`, `cond`, `trace`, `rref`, `null`, `orth` (pure Rust; faer deferred —
-  not vendored here). Language: dim-aware reductions (`sum(A,2)`,
+  `rank`, `cond`, `trace`, `rref`, `null`, `orth` (pure Rust; optional
+  `matcore/faer` feature routes `matmul`/`svd`/`eig` through faer). Language: dim-aware reductions (`sum(A,2)`,
   `sum(A,'all')`), multi-output builtins (`size`/`min`/`max`/`find`/`eig`/
   `svd`/`qr`/`lu`/`meshgrid`/`histcounts`), logical indexing incl. masked
   assignment, M-code matrix-literal whitespace rule (`[0 -2 5]` vs

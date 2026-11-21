@@ -11281,42 +11281,15 @@ impl Session {
                     let cm = CMatrix::from_col_major(w.len(), 1, w).map_err(lang)?;
                     return Ok(Some(vec![cmat_or_value(cm)]));
                 }
-                // Symmetric fast path (Jacobi gives eigenvectors too).
-                if let Ok((w, v)) = matcore::eig_symmetric(&m) {
-                    let mut d = Matrix::zeros(w.len(), w.len());
-                    for (i, x) in w.iter().enumerate() {
-                        let _ = d.set(i, i, *x);
-                    }
-                    return Ok(Some(vec![Value::Mat(v), Value::Mat(d)]));
-                }
-                // General real spectrum: eigenvalues by Hessenberg+QR, then
-                // each eigenvector as null(A - λI). Complex spectra need
-                // complex eigenvector solves — not implemented yet.
-                let wc = matcore::eigvals_c(&m).map_err(lang)?;
-                let w: Vec<f64> = wc
-                    .iter()
-                    .map(|z| {
-                        if z.is_real() {
-                            Ok(z.re)
-                        } else {
-                            Err(LangError::new("[V,D] = eig(A) for a complex spectrum is not implemented yet; use eig(A)", 0))
-                        }
-                    })
-                    .collect::<Result<_, _>>()?;
+                // Right eigendecomposition — complex pairs come back as
+                // `Value::Cplx`; all-real spectra collapse to `Value::Mat`.
+                let (w, v) = matcore::eig_c(&m).map_err(lang)?;
                 let n = m.rows();
-                let mut v = Matrix::zeros(n, n);
-                let mut d = Matrix::zeros(n, n);
-                for (i, &lam) in w.iter().enumerate() {
-                    let shifted = m.elemwise(&Matrix::eye(n, n), |a, b| a - b * lam).map_err(lang)?;
-                    let s = matcore::svd(&shifted).map_err(lang)?;
-                    // Last column of V = smallest singular direction.
-                    let k = s.v.cols().saturating_sub(1);
-                    for r in 0..n {
-                        let _ = v.set(r, i, s.v.get(r, k).unwrap_or(0.0));
-                    }
-                    let _ = d.set(i, i, lam);
+                let mut d = CMatrix::zeros(n, n);
+                for (i, z) in w.iter().enumerate() {
+                    let _ = d.set(i, i, *z);
                 }
-                vec![Value::Mat(v), Value::Mat(d)]
+                vec![cmat_or_value(v), cmat_or_value(d)]
             }
             "svd" => {
                 let m = self.arg_matrix(args, 0)?;
@@ -25210,6 +25183,15 @@ end",
         assert_eq!(s.get("si").unwrap().to_matrix().unwrap().data(), &[2.0, 3.0, 1.0]);
         assert_eq!(s.get("sj").unwrap().to_matrix().unwrap().data(), &[2.0, 2.0, 1.0, 1.0]);
         assert_eq!(scalar(&s, "ev"), -3.0);
+
+        // [V,D] = eig(A) with a complex spectrum: V/D promote to complex
+        // and A·V == V·D; an all-real spectrum stays real.
+        s.run("[Vc, Dc] = eig([0 -1; 1 0]); rc = max(abs([0 -1; 1 0]*Vc - Vc*Dc), [], 'all');").unwrap();
+        assert!(matches!(s.get("Vc"), Some(Value::Cplx(_))));
+        assert!(scalar(&s, "rc") < 1e-12);
+        s.run("[Vr, Dr] = eig([1 2; 0 3]); rr = max(abs([1 2; 0 3]*Vr - Vr*Dr), [], 'all');").unwrap();
+        assert!(matches!(s.get("Vr"), Some(Value::Mat(_))));
+        assert!(scalar(&s, "rr") < 1e-12);
     }
 
     #[test]

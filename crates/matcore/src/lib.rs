@@ -18,8 +18,11 @@ pub mod stats;
 
 pub use complex::{CMatrix, CNum};
 pub use expm::expm;
+#[cfg(feature = "faer")]
+mod faer_backend;
+
 pub use linalg::Svd;
-pub use linalg::{chol, cond, eig_symmetric, eigvals, eigvals_c, lu, pinv, qr, rank, rref, singular_values, svd, trace};
+pub use linalg::{chol, cond, eig_c, eig_symmetric, eigvals, eigvals_c, lu, pinv, qr, rank, rref, singular_values, svd, trace};
 pub use sparse::SparseMat;
 
 /// Errors from matrix construction and algebra.
@@ -375,39 +378,46 @@ impl Matrix {
         if self.cols() != other.rows() {
             return Err(MatError::DimensionMismatch { a: self.shape(), b: other.shape() });
         }
-        let (m, k, n) = (self.rows(), self.cols(), other.cols());
-        let mut out = Matrix::zeros(m, n);
-        #[cfg(not(target_arch = "wasm32"))]
-        if m.saturating_mul(k).saturating_mul(n) > 50_000 {
-            use rayon::prelude::*;
-            out.data.par_chunks_mut(m).enumerate().for_each(|(c, col)| {
+        #[cfg(feature = "faer")]
+        {
+            faer_backend::matmul(self, other)
+        }
+        #[cfg(not(feature = "faer"))]
+        {
+            let (m, k, n) = (self.rows(), self.cols(), other.cols());
+            let mut out = Matrix::zeros(m, n);
+            #[cfg(not(target_arch = "wasm32"))]
+            if m.saturating_mul(k).saturating_mul(n) > 50_000 {
+                use rayon::prelude::*;
+                out.data.par_chunks_mut(m).enumerate().for_each(|(c, col)| {
+                    for i in 0..k {
+                        let b = other.get(i, c).unwrap_or(0.0);
+                        if b == 0.0 {
+                            continue;
+                        }
+                        for (r, slot) in col.iter_mut().enumerate() {
+                            *slot += self.get(r, i).unwrap_or(0.0) * b;
+                        }
+                    }
+                });
+                return Ok(out);
+            }
+            for c in 0..n {
                 for i in 0..k {
                     let b = other.get(i, c).unwrap_or(0.0);
                     if b == 0.0 {
                         continue;
                     }
-                    for (r, slot) in col.iter_mut().enumerate() {
-                        *slot += self.get(r, i).unwrap_or(0.0) * b;
-                    }
-                }
-            });
-            return Ok(out);
-        }
-        for c in 0..n {
-            for i in 0..k {
-                let b = other.get(i, c).unwrap_or(0.0);
-                if b == 0.0 {
-                    continue;
-                }
-                for r in 0..m {
-                    let a = self.get(r, i).unwrap_or(0.0);
-                    if let Some(slot) = out.data.get_mut(c * m + r) {
-                        *slot += a * b;
+                    for r in 0..m {
+                        let a = self.get(r, i).unwrap_or(0.0);
+                        if let Some(slot) = out.data.get_mut(c * m + r) {
+                            *slot += a * b;
+                        }
                     }
                 }
             }
+            Ok(out)
         }
-        Ok(out)
     }
 
     /// Transpose — defined on the 2-D view; callers must check

@@ -6,8 +6,9 @@
 //! correct and dependable at the matrix sizes MatCraft handles today;
 //! a blocked `faer` backend is the Phase-5 performance swap.
 
-use crate::{MatError, Matrix};
+use crate::{CMatrix, CNum, MatError, Matrix};
 
+#[cfg(not(feature = "faer"))]
 const MAX_QR_ITERS: usize = 1000;
 const JACOBI_ITERS: usize = 200;
 
@@ -319,92 +320,171 @@ pub fn eigvals_c(a: &Matrix) -> Result<Vec<crate::CNum>, MatError> {
     if is_symmetric(a) {
         return Ok(eig_symmetric(a)?.0.into_iter().map(crate::CNum::real).collect());
     }
-    let n = a.rows();
-    // Hessenberg reduction (Householder).
-    let mut h = a.clone();
-    for k in 0..n.saturating_sub(2) {
-        let mut v: Vec<f64> = (0..n).map(|i| if i <= k { 0.0 } else { h.get(i, k).unwrap_or(0.0) }).collect();
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
-            continue;
-        }
-        let sign = if v.get(k + 1).copied().unwrap_or(0.0) >= 0.0 { 1.0 } else { -1.0 };
-        if let Some(slot) = v.get_mut(k + 1) {
-            *slot += sign * norm;
-        }
-        let vnorm2: f64 = v.iter().map(|x| x * x).sum();
-        if vnorm2 == 0.0 {
-            continue;
-        }
-        // H = H - 2 (H v) v' / v'v ; then H = H - 2 v (v' H) / v'v
-        for j in 0..n {
-            let mut dot = 0.0;
-            for i in 0..n {
-                dot += h.get(i, j).unwrap_or(0.0) * v.get(i).copied().unwrap_or(0.0);
-            }
-            let coef = 2.0 * dot / vnorm2;
-            for i in 0..n {
-                let nv = h.get(i, j).unwrap_or(0.0) - coef * v.get(i).copied().unwrap_or(0.0);
-                let _ = h.set(i, j, nv);
-            }
-        }
-        for i in 0..n {
-            let mut dot = 0.0;
-            for j in 0..n {
-                dot += v.get(j).copied().unwrap_or(0.0) * h.get(j, i).unwrap_or(0.0);
-            }
-            let coef = 2.0 * dot / vnorm2;
-            for j in 0..n {
-                let nv = h.get(j, i).unwrap_or(0.0) - coef * v.get(j).copied().unwrap_or(0.0);
-                let _ = h.set(j, i, nv);
-            }
-        }
+    #[cfg(feature = "faer")]
+    {
+        crate::faer_backend::eigvals_c(a)
     }
-    // Unshifted QR iteration on the Hessenberg form.
-    let mut a_k = h;
-    for _ in 0..MAX_QR_ITERS {
-        // Convergence check on subdiagonals.
-        let mut converged = true;
-        for i in 0..n.saturating_sub(1) {
-            if a_k.get(i + 1, i).unwrap_or(0.0).abs() > 1e-10 {
-                converged = false;
+    #[cfg(not(feature = "faer"))]
+    {
+        let n = a.rows();
+        // Hessenberg reduction (Householder).
+        let mut h = a.clone();
+        for k in 0..n.saturating_sub(2) {
+            let mut v: Vec<f64> = (0..n).map(|i| if i <= k { 0.0 } else { h.get(i, k).unwrap_or(0.0) }).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm == 0.0 {
+                continue;
+            }
+            let sign = if v.get(k + 1).copied().unwrap_or(0.0) >= 0.0 { 1.0 } else { -1.0 };
+            if let Some(slot) = v.get_mut(k + 1) {
+                *slot += sign * norm;
+            }
+            let vnorm2: f64 = v.iter().map(|x| x * x).sum();
+            if vnorm2 == 0.0 {
+                continue;
+            }
+            // H = H - 2 (H v) v' / v'v ; then H = H - 2 v (v' H) / v'v
+            for j in 0..n {
+                let mut dot = 0.0;
+                for i in 0..n {
+                    dot += h.get(i, j).unwrap_or(0.0) * v.get(i).copied().unwrap_or(0.0);
+                }
+                let coef = 2.0 * dot / vnorm2;
+                for i in 0..n {
+                    let nv = h.get(i, j).unwrap_or(0.0) - coef * v.get(i).copied().unwrap_or(0.0);
+                    let _ = h.set(i, j, nv);
+                }
+            }
+            for i in 0..n {
+                let mut dot = 0.0;
+                for j in 0..n {
+                    dot += v.get(j).copied().unwrap_or(0.0) * h.get(j, i).unwrap_or(0.0);
+                }
+                let coef = 2.0 * dot / vnorm2;
+                for j in 0..n {
+                    let nv = h.get(j, i).unwrap_or(0.0) - coef * v.get(j).copied().unwrap_or(0.0);
+                    let _ = h.set(j, i, nv);
+                }
             }
         }
-        if converged {
-            break;
+        // Unshifted QR iteration on the Hessenberg form.
+        let mut a_k = h;
+        for _ in 0..MAX_QR_ITERS {
+            // Convergence check on subdiagonals.
+            let mut converged = true;
+            for i in 0..n.saturating_sub(1) {
+                if a_k.get(i + 1, i).unwrap_or(0.0).abs() > 1e-10 {
+                    converged = false;
+                }
+            }
+            if converged {
+                break;
+            }
+            let (q, r) = qr(&a_k)?;
+            a_k = r.matmul(&q)?;
         }
-        let (q, r) = qr(&a_k)?;
-        a_k = r.matmul(&q)?;
-    }
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        if i + 1 < n && a_k.get(i + 1, i).unwrap_or(0.0).abs() > 1e-8 {
-            // Stalled 2x2 block [[a,b],[c,d]] — eigenvalues solve
-            // λ² − (a+d)λ + (ad−bc) = 0.
-            let (x11, x12) = (a_k.get(i, i).unwrap_or(0.0), a_k.get(i, i + 1).unwrap_or(0.0));
-            let (x21, x22) = (a_k.get(i + 1, i).unwrap_or(0.0), a_k.get(i + 1, i + 1).unwrap_or(0.0));
-            let tr = x11 + x22;
-            let disc = (x11 - x22) * (x11 - x22) / 4.0 + x12 * x21;
-            if disc < 0.0 {
-                let im = (-disc).sqrt();
-                out.push(crate::CNum::new(tr / 2.0, im));
-                out.push(crate::CNum::new(tr / 2.0, -im));
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            if i + 1 < n && a_k.get(i + 1, i).unwrap_or(0.0).abs() > 1e-8 {
+                // Stalled 2x2 block [[a,b],[c,d]] — eigenvalues solve
+                // λ² − (a+d)λ + (ad−bc) = 0.
+                let (x11, x12) = (a_k.get(i, i).unwrap_or(0.0), a_k.get(i, i + 1).unwrap_or(0.0));
+                let (x21, x22) = (a_k.get(i + 1, i).unwrap_or(0.0), a_k.get(i + 1, i + 1).unwrap_or(0.0));
+                let tr = x11 + x22;
+                let disc = (x11 - x22) * (x11 - x22) / 4.0 + x12 * x21;
+                if disc < 0.0 {
+                    let im = (-disc).sqrt();
+                    out.push(crate::CNum::new(tr / 2.0, im));
+                    out.push(crate::CNum::new(tr / 2.0, -im));
+                } else {
+                    let s = disc.sqrt();
+                    out.push(crate::CNum::real(tr / 2.0 + s));
+                    out.push(crate::CNum::real(tr / 2.0 - s));
+                }
+                i += 2;
             } else {
-                let s = disc.sqrt();
-                out.push(crate::CNum::real(tr / 2.0 + s));
-                out.push(crate::CNum::real(tr / 2.0 - s));
+                out.push(crate::CNum::real(a_k.get(i, i).unwrap_or(0.0)));
+                i += 1;
             }
-            i += 2;
-        } else {
-            out.push(crate::CNum::real(a_k.get(i, i).unwrap_or(0.0)));
-            i += 1;
         }
+        out.sort_by(|x, y| {
+            x.re.partial_cmp(&y.re).unwrap_or(std::cmp::Ordering::Equal).then(y.im.partial_cmp(&x.im).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(out)
     }
-    out.sort_by(|x, y| {
-        x.re.partial_cmp(&y.re).unwrap_or(std::cmp::Ordering::Equal).then(y.im.partial_cmp(&x.im).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    Ok(out)
+}
+
+/// Smallest-singular-direction (last column of V from [`svd`]) of `m` —
+/// the unit null vector used to lift a known eigenvalue to an eigenvector.
+#[cfg(not(feature = "faer"))]
+fn null_dir(m: &Matrix) -> Result<Vec<f64>, MatError> {
+    let s = svd(m)?;
+    let k = s.v.cols().saturating_sub(1);
+    Ok((0..s.v.rows()).map(|r| s.v.get(r, k).unwrap_or(0.0)).collect())
+}
+
+/// Right eigendecomposition of a general real matrix: the spectrum plus
+/// one eigenvector column per eigenvalue (`A·V ≈ V·D`).
+///
+/// Symmetric inputs take the Jacobi path. Otherwise the spectrum comes
+/// from [`eigvals_c`] and each eigenvector is the null direction of
+/// `A − λI`. For a complex λ = a + bi the equation `(A − λI)(x + iy) = 0`
+/// expands to the stacked real homogeneous system
+/// `[(A − aI)   bI;  −bI   (A − aI)] [x; y] = 0`, so no complex SVD is
+/// needed; `v = x + iy` comes out unit-norm. Eigenvalue `i` maps to
+/// column `i` of `V`, in the same order [`eigvals_c`] emits.
+pub fn eig_c(a: &Matrix) -> Result<(Vec<CNum>, CMatrix), MatError> {
+    if a.rows() != a.cols() {
+        return Err(MatError::Singular);
+    }
+    if is_symmetric(a) {
+        let (w, v) = eig_symmetric(a)?;
+        return Ok((w.into_iter().map(CNum::real).collect(), CMatrix::from_real(&v)));
+    }
+    #[cfg(feature = "faer")]
+    {
+        crate::faer_backend::eig_c(a)
+    }
+    #[cfg(not(feature = "faer"))]
+    {
+        let n = a.rows();
+        let w = eigvals_c(a)?;
+        let mut cols: Vec<CNum> = vec![CNum::real(0.0); n * n];
+        for (i, lam) in w.iter().enumerate() {
+            if lam.is_real() {
+                let shifted = a.elemwise(&Matrix::eye(n, n), |x, b| x - b * lam.re)?;
+                let v = null_dir(&shifted)?;
+                for r in 0..n {
+                    if let Some(slot) = cols.get_mut(r + i * n) {
+                        *slot = CNum::real(v.get(r).copied().unwrap_or(0.0));
+                    }
+                }
+            } else {
+                // [(A−aI)  bI; −bI  (A−aI)] [x;y] = 0 with λ = a + bi.
+                let am = a.elemwise(&Matrix::eye(n, n), |x, b| x - b * lam.re)?;
+                let bi = Matrix::eye(n, n).map(|e| e * lam.im);
+                let mut stacked = Matrix::zeros(2 * n, 2 * n);
+                for r in 0..n {
+                    for c in 0..n {
+                        let _ = stacked.set(r, c, am.get(r, c).unwrap_or(0.0));
+                        let _ = stacked.set(r, n + c, bi.get(r, c).unwrap_or(0.0));
+                        let _ = stacked.set(n + r, c, -bi.get(r, c).unwrap_or(0.0));
+                        let _ = stacked.set(n + r, n + c, am.get(r, c).unwrap_or(0.0));
+                    }
+                }
+                let z = null_dir(&stacked)?;
+                for r in 0..n {
+                    let re = z.get(r).copied().unwrap_or(0.0);
+                    let im = z.get(n + r).copied().unwrap_or(0.0);
+                    if let Some(slot) = cols.get_mut(r + i * n) {
+                        *slot = CNum::new(re, im);
+                    }
+                }
+            }
+        }
+        Ok((w, CMatrix::from_col_major(n, n, cols)?))
+    }
 }
 
 /// Singular value decomposition A = U S V' (economy or full, m×n).
@@ -417,81 +497,89 @@ pub struct Svd {
 }
 
 pub fn svd(a: &Matrix) -> Result<Svd, MatError> {
-    let (m, n) = a.shape();
-    let ata = a.transpose().matmul(a)?;
-    let (w2, v) = eig_symmetric(&ata)?;
-    // Eigenvalues ascending from Jacobi; singular values descending.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&i, &j| w2.get(j).copied().unwrap_or(0.0).partial_cmp(&w2.get(i).copied().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
-    let mut svals: Vec<f64> = Vec::with_capacity(n);
-    let mut vsort = Matrix::zeros(n, n);
-    for (newc, &oldc) in order.iter().enumerate() {
-        svals.push(w2.get(oldc).copied().unwrap_or(0.0).max(0.0).sqrt());
-        for r in 0..n {
-            let _ = vsort.set(r, newc, v.get(r, oldc).unwrap_or(0.0));
-        }
+    #[cfg(feature = "faer")]
+    {
+        crate::faer_backend::svd(a)
     }
-    // U columns: A v_i / s_i; near-zero singulars get orthonormalised
-    // complements via Gram–Schmidt against the columns so far.
-    let mut u = Matrix::zeros(m, n.min(m));
-    for c in 0..n.min(m) {
-        let s = svals.get(c).copied().unwrap_or(0.0);
-        let mut col: Vec<f64> = Vec::with_capacity(m);
-        for r in 0..m {
-            let mut acc = 0.0;
-            for k in 0..n {
-                acc += a.get(r, k).unwrap_or(0.0) * vsort.get(k, c).unwrap_or(0.0);
+    #[cfg(not(feature = "faer"))]
+    {
+        let (m, n) = a.shape();
+        let ata = a.transpose().matmul(a)?;
+        let (w2, v) = eig_symmetric(&ata)?;
+        // Eigenvalues ascending from Jacobi; singular values descending.
+        let mut order: Vec<usize> = (0..n).collect();
+        order
+            .sort_by(|&i, &j| w2.get(j).copied().unwrap_or(0.0).partial_cmp(&w2.get(i).copied().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+        let mut svals: Vec<f64> = Vec::with_capacity(n);
+        let mut vsort = Matrix::zeros(n, n);
+        for (newc, &oldc) in order.iter().enumerate() {
+            svals.push(w2.get(oldc).copied().unwrap_or(0.0).max(0.0).sqrt());
+            for r in 0..n {
+                let _ = vsort.set(r, newc, v.get(r, oldc).unwrap_or(0.0));
             }
-            col.push(if s > 1e-12 { acc / s } else { 0.0 });
         }
-        if s <= 1e-12 {
-            // Fill with a unit vector orthogonal to previous columns.
-            for k in 0..m {
-                let mut e: Vec<f64> = vec![0.0; m];
-                if let Some(slot) = e.get_mut(k) {
-                    *slot = 1.0;
+        // U columns: A v_i / s_i; near-zero singulars get orthonormalised
+        // complements via Gram–Schmidt against the columns so far.
+        let mut u = Matrix::zeros(m, n.min(m));
+        for c in 0..n.min(m) {
+            let s = svals.get(c).copied().unwrap_or(0.0);
+            let mut col: Vec<f64> = Vec::with_capacity(m);
+            for r in 0..m {
+                let mut acc = 0.0;
+                for k in 0..n {
+                    acc += a.get(r, k).unwrap_or(0.0) * vsort.get(k, c).unwrap_or(0.0);
                 }
+                col.push(if s > 1e-12 { acc / s } else { 0.0 });
+            }
+            if s <= 1e-12 {
+                // Fill with a unit vector orthogonal to previous columns.
+                for k in 0..m {
+                    let mut e: Vec<f64> = vec![0.0; m];
+                    if let Some(slot) = e.get_mut(k) {
+                        *slot = 1.0;
+                    }
+                    for p in 0..c {
+                        let d: f64 = (0..m).map(|r| e.get(r).copied().unwrap_or(0.0) * u.get(r, p).unwrap_or(0.0)).sum();
+                        for r in 0..m {
+                            if let Some(x) = e.get_mut(r) {
+                                *x -= d * u.get(r, p).unwrap_or(0.0);
+                            }
+                        }
+                    }
+                    let en: f64 = e.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    if en > 1e-9 {
+                        col = e.iter().map(|x| x / en).collect();
+                        break;
+                    }
+                }
+            } else {
+                // Re-orthogonalise against previous columns (one pass suffices
+                // at these sizes).
                 for p in 0..c {
-                    let d: f64 = (0..m).map(|r| e.get(r).copied().unwrap_or(0.0) * u.get(r, p).unwrap_or(0.0)).sum();
+                    let d: f64 = (0..m).map(|r| col.get(r).copied().unwrap_or(0.0) * u.get(r, p).unwrap_or(0.0)).sum();
                     for r in 0..m {
-                        if let Some(x) = e.get_mut(r) {
+                        if let Some(x) = col.get_mut(r) {
                             *x -= d * u.get(r, p).unwrap_or(0.0);
                         }
                     }
                 }
-                let en: f64 = e.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if en > 1e-9 {
-                    col = e.iter().map(|x| x / en).collect();
-                    break;
-                }
-            }
-        } else {
-            // Re-orthogonalise against previous columns (one pass suffices
-            // at these sizes).
-            for p in 0..c {
-                let d: f64 = (0..m).map(|r| col.get(r).copied().unwrap_or(0.0) * u.get(r, p).unwrap_or(0.0)).sum();
-                for r in 0..m {
-                    if let Some(x) = col.get_mut(r) {
-                        *x -= d * u.get(r, p).unwrap_or(0.0);
+                let cn: f64 = col.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if cn > 0.0 {
+                    for x in col.iter_mut() {
+                        *x /= cn;
                     }
                 }
             }
-            let cn: f64 = col.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if cn > 0.0 {
-                for x in col.iter_mut() {
-                    *x /= cn;
-                }
+            for r in 0..m {
+                let _ = u.set(r, c, col.get(r).copied().unwrap_or(0.0));
             }
         }
-        for r in 0..m {
-            let _ = u.set(r, c, col.get(r).copied().unwrap_or(0.0));
+        let mut smat = Matrix::zeros(m.min(n), n);
+        for (i, s) in svals.iter().take(m.min(n)).enumerate() {
+            let _ = smat.set(i, i, *s);
         }
+        Ok(Svd { u, s: smat, v: vsort })
     }
-    let mut smat = Matrix::zeros(m.min(n), n);
-    for (i, s) in svals.iter().take(m.min(n)).enumerate() {
-        let _ = smat.set(i, i, *s);
-    }
-    Ok(Svd { u, s: smat, v: vsort })
 }
 
 /// Singular values only.
@@ -756,5 +844,41 @@ mod cplx_tests {
         let w = eigvals_c(&a).unwrap();
         assert!(w.iter().all(|z| z.is_real()));
         assert_eq!(w.iter().map(|z| z.re).collect::<Vec<_>>(), vec![2.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn eig_c_rotation_eigenvectors() {
+        // Rotation by 90°: A·V = V·D with λ = ±i.
+        let a = Matrix::from_row_major(2, 2, &[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let (w, v) = eig_c(&a).unwrap();
+        assert_eq!(v.shape(), (2, 2));
+        for (i, lam) in w.iter().enumerate() {
+            for r in 0..2 {
+                // (A v)_r vs λ v_r per component.
+                let mut av = CNum::real(0.0);
+                for k in 0..2 {
+                    av = av + CNum::real(a.get(r, k).unwrap_or(0.0)) * v.get(k, i).unwrap_or(CNum::real(0.0));
+                }
+                let lv = *lam * v.get(r, i).unwrap_or(CNum::real(0.0));
+                assert!((av - lv).abs() < 1e-10, "λ={lam:?} row {r}: {av:?} vs {lv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn eig_c_mixed_spectrum() {
+        // 1±2i pair plus a real 5; every column residual ~0.
+        let a = Matrix::from_row_major(3, 3, &[1.0, -2.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 5.0]).unwrap();
+        let (w, v) = eig_c(&a).unwrap();
+        for (i, lam) in w.iter().enumerate() {
+            for r in 0..3 {
+                let mut av = CNum::real(0.0);
+                for k in 0..3 {
+                    av = av + CNum::real(a.get(r, k).unwrap_or(0.0)) * v.get(k, i).unwrap_or(CNum::real(0.0));
+                }
+                let lv = *lam * v.get(r, i).unwrap_or(CNum::real(0.0));
+                assert!((av - lv).abs() < 1e-10, "λ={lam:?} row {r}: {av:?} vs {lv:?}");
+            }
+        }
     }
 }
