@@ -83,18 +83,21 @@ The ArtCraft name and logos in `docs/brand/` are trademarks of the ArtCraft Team
 <td width="33%" valign="top">
 
 ### Familiar
+
 Real M-code: column-major matrices, cell arrays, structs, function files, `end`-indexing, grow-on-assign — the semantics you expect, not approximations.
 
 </td>
 <td width="33%" valign="top">
 
 ### Fast and honest
+
 A bytecode-compiled loop tier under the tree-walk interpreter, a feature-gated `faer` backend for matmul/SVD/eig, and complex eigendecomposition — while the default stays pure Rust and wasm-clean.
 
 </td>
 <td width="33%" valign="top">
 
 ### Yours, and your agent's
+
 Every interface is headless-reachable: CLI, stdio LSP, newline JSON-RPC MCP, a TCP control channel, and the SimCraft engine bridge. No account, no telemetry, no cloud.
 
 </td>
@@ -105,8 +108,8 @@ Every interface is headless-reachable: CLI, stdio LSP, newline JSON-RPC MCP, a T
 
 ## A look around
 
-|                                  |                                 |                                    |                                |
-| -------------------------------- | ------------------------------- | ---------------------------------- | ------------------------------ |
+|                                     |                                   |                                       |                                 |
+| ----------------------------------- | --------------------------------- | ------------------------------------- | ------------------------------- |
 | ![lines](docs/images/fig-lines.png) | ![surf](docs/images/fig-surf.png) | ![imshow](docs/images/fig-imshow.png) | ![bar](docs/images/fig-bar.png) |
 
 <sub>`plot`/`loglog` with styled lines · `surf` in the interactive wgpu viewport · `imshow` of a complex field · `bar`/`histogram` — all produced by the headless `matplot` pipeline.</sub>
@@ -119,14 +122,14 @@ Every interface is headless-reachable: CLI, stdio LSP, newline JSON-RPC MCP, a T
 
 Every surface reaches the same engine session — drive it from wherever you work.
 
-| Interface          | What it gives you                                                                                                      |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `matcraft` Studio  | egui + wgpu desktop app — ribbon, command window, workspace/figure docks, interactive 3-D viewport, live editor hints     |
-| `matcraft-cli`     | `eval`, `run`, `repl`, `functions` — script and shell use                                                                 |
-| `matcraft-cli lsp` | stdio language server — parse diagnostics, builtin completion/hover, document symbols; point any editor at it             |
-| MCP server         | newline-delimited JSON-RPC 2.0 on stdio — `execute`, `eval`, `run_script`, command listing, `matcraft://workspace`        |
-| Control channel    | TCP JSON-lines when the Studio runs with `--control` — `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`          |
-| SimCraft bridge    | `sim.run`, `sim.check`, `model.set_param` — block-diagram simulation inside your session, scopes land as matplot figures   |
+| Interface          | What it gives you                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `matcraft` Studio  | egui + wgpu desktop app — ribbon, command window, workspace/figure docks, interactive 3-D viewport, live editor hints    |
+| `matcraft-cli`     | `eval`, `run`, `repl`, `functions` — script and shell use                                                                |
+| `matcraft-cli lsp` | stdio language server — parse diagnostics, builtin completion/hover, document symbols; point any editor at it            |
+| MCP server         | newline-delimited JSON-RPC 2.0 on stdio — `execute`, `eval`, `run_script`, command listing, `matcraft://workspace`       |
+| Control channel    | TCP JSON-lines when the Studio runs with `--control` — `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`        |
+| SimCraft bridge    | `sim.run`, `sim.check`, `model.set_param` — block-diagram simulation inside your session, scopes land as matplot figures |
 
 ## Quick start
 
@@ -141,18 +144,18 @@ cargo run --release -p matcraft                      # the Studio (--control 797
 
 ## The layout
 
-| Crate              | Role                                                                                            |
-| ------------------ | ----------------------------------------------------------------------------------------------- |
-| `crates/matcore`   | L0 — column-major `f64`/`complex`/`sparse` matrices, pure-Rust linalg, optional `faer` backend     |
-| `crates/matffi`    | L0 — `loadlibrary`/`calllib`/`libpointer` FFI into plain-C DLLs (the only `unsafe` boundary)       |
-| `crates/matlang`   | L1 — lexer, parser, interpreter (tree-walk + bytecode loop tier), builtins, signature metadata     |
-| `crates/matplot`   | L2 — figure model, headless SVG/PNG/PDF renderer, 3-D projection                                  |
-| `crates/engine`    | L5 — command/session layer; every user-visible behaviour is a command id                           |
-| `crates/lsp`       | L6 — language-server protocol on stdio                                                            |
-| `crates/jupyter`   | L6 — Jupyter kernel core (wire + semantics; ZMQ transport is a follow-up)                          |
-| `crates/ui-egui`   | L6 — Studio UI: ribbon, docks, wgpu figure viewport, editor                                       |
-| `crates/mcp`       | L6 — MCP server                                                                                   |
-| `apps/*`           | L7 — `matcraft` Studio, `matcraft-cli`, web shell                                                  |
+| Crate            | Role                                                                                           |
+| ---------------- | ---------------------------------------------------------------------------------------------- |
+| `crates/matcore` | L0 — column-major `f64`/`complex`/`sparse` matrices, pure-Rust linalg, optional `faer` backend |
+| `crates/matffi`  | L0 — `loadlibrary`/`calllib`/`libpointer` FFI into plain-C DLLs (the only `unsafe` boundary)   |
+| `crates/matlang` | L1 — lexer, parser, interpreter (tree-walk + bytecode loop tier), builtins, signature metadata |
+| `crates/matplot` | L2 — figure model, headless SVG/PNG/PDF renderer, 3-D projection                               |
+| `crates/engine`  | L5 — command/session layer; every user-visible behaviour is a command id                       |
+| `crates/lsp`     | L6 — language-server protocol on stdio                                                         |
+| `crates/jupyter` | L6 — Jupyter kernel core (wire + semantics; ZMQ transport is a follow-up)                      |
+| `crates/ui-egui` | L6 — Studio UI: ribbon, docks, wgpu figure viewport, editor                                    |
+| `crates/mcp`     | L6 — MCP server                                                                                |
+| `apps/*`         | L7 — `matcraft` Studio, `matcraft-cli`, web shell                                              |
 
 `cargo xtask layers` enforces the stack — nothing below L6 touches egui/wgpu/winit.
 
