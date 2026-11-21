@@ -1,11 +1,17 @@
 # MatCraft
 
+**A clean-room, Rust-native numerical computing environment — an open-source
+alternative to MATLAB, built the way the craft apps are built.**
+
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
+[![Listed on Remade](https://remade.wiki/badges/listed-on-remade.svg)](https://remade.wiki/projects/matcraft/)
 [![I did my own MATLAB](https://idmo.app/badge/matcraft)](https://idmo.app/p/matcraft)
 
-A clean-room, Rust-native numerical computing environment — the ArtCraft
-ecosystem's answer to MATLAB. Instant launch, memory-safe, zero bloat: a real
-`.m`-language engine with a column-major matrix core, built the way the craft
-apps are built.
+Real `.m`-language engine. Column-major matrix core. Instant launch,
+memory-safe, zero bloat — desktop Studio, CLI, LSP, MCP, and web, all driving
+the same command layer.
+
+![MatCraft Studio — interactive 3-D figure, workspace and command window](docs/images/studio.png)
 
 ```text
 matcraft> A = [2 1; 1 3];
@@ -18,32 +24,35 @@ x =
             1
 ```
 
+## Why MatCraft
+
+- **Runs `.m` code for real** — matrices, control flow, functions, `classdef`
+  OOP, N-D arrays, complex and sparse, struct/cell, `.mat` v5 files.
+- **845 builtins** — linear algebra, DSP, statistics, optimization, control,
+  clustering, graphs, bioinformatics, HDF5/NetCDF/xlsx I/O, image ops.
+- **Plots** — 2-D + 3-D figures with SVG/PNG/PDF export, and an interactive
+  wgpu viewport in the Studio (orbit/zoom/pan on `surf`/`mesh`/`plot3`).
+- **Hackable by design** — every user-visible action is a command id
+  reachable from the CLI, the TCP control channel, MCP, and (soon) Jupyter.
+  An agent can drive a live session end-to-end.
+- **Interconnected** — the [SimCraft](https://github.com/NibrasAz7/simcraft)
+  sibling brings Simulink-class block-diagram simulation: `sim` runs a model,
+  scope traces land in your workspace as figures.
+- **Clean-room & safe** — 100% Rust, one `unsafe` boundary (`matffi`), no
+  panics on untrusted input, MIT OR Apache-2.0.
+
 ## Status
 
-**Alpha** — Studio + engine + language/numerics + DSP + broad plotting are
-in. 845 builtins, `classdef` OOP (value + handle classes), N-D arrays,
-complex and sparse matrices, struct/cell arrays, `.mat` v5 I/O, 2D and 3D
-figures with SVG/PNG/PDF export, a MATLAB-style desktop Studio (ribbon
-toolstrip, docked panes, command window, workspace, editor, figure tabs,
-breakpoint debugger), CLI + MCP + a JSON-lines control channel, a WASM
-Studio shell, and a `craft-ai` panel (BYO endpoint or local models).
+**Alpha.** Studio + engine + language/numerics + DSP + broad plotting are in.
 
-**Compatibility, measured honestly:** in a sweep of 788 real-world `.m`
-files from 32 pre-2022 GitHub repos across 8 domains, **632/645 function
-files (98%) parse cleanly** — the only two parse failures in the corpus
-are prose files saved with a `.m` extension, and all sources decode
-(latin-1 fallback). Scripts fail mostly on repo-local helper functions
-and external toolboxes — see [`docs/wild-corpus.md`](docs/wild-corpus.md)
-and [`docs/gaps.md`](docs/gaps.md); the complete function dictionary is
-[`docs/functions.md`](docs/functions.md). Landed since the first sweep: `@`
-anonymous functions/handles, `classdef` OOP, N-D indexing, `global`/
-`persistent`, `import`, PNG image I/O, file I/O, regex, latin-1 sources.
-Toolboxes are in: optimization, control (`tf`/`ss`/`bode`/`margin`/
-`pidtune`), statistics + clustering, t-SNE/UMAP, graphs, bioinformatics,
-HDF5/netCDF/xlsx I/O. Not yet: object arrays/`subsref`, deferred
-classdef attribute enforcement, and Simulink-style modeling (the SimCraft
-sibling — `sim.run`/`model.*` commands already bridge it). See
-[`ROADMAP.md`](ROADMAP.md).
+**Compatibility, measured honestly:** in a sweep of 788 real-world `.m` files
+from 32 pre-2022 GitHub repos across 8 domains, **632/645 function files (98%)
+parse cleanly** — the only parse failures are prose files saved with a `.m`
+extension. Scripts fail mostly on repo-local helpers and external toolboxes —
+see [`docs/wild-corpus.md`](docs/wild-corpus.md) and
+[`docs/gaps.md`](docs/gaps.md); the complete function dictionary is
+[`docs/functions.md`](docs/functions.md). See [`ROADMAP.md`](ROADMAP.md) for
+what's next (Cranelift JIT, Jupyter transport, wasm Studio hosting).
 
 ## What runs today
 
@@ -57,26 +66,15 @@ sibling — `sim.run`/`model.*` commands already bridge it). See
   script-local functions, `<name>.m` function files (`addpath`/`genpath`),
   `nargin`/`nargout`, `varargin`/`varargout`, recursion.
 - Linear algebra: `det inv norm eig svd qr lu chol rref pinv rank cond
-  trace null orth` — pure Rust, no external BLAS; `eig` returns complex
-  pairs.
+  trace null orth` — pure Rust (optional `faer` backend); `eig` returns
+  complex eigenvalues and eigenvectors.
 - DSP: `fft ifft fft2 ifft2 fftshift ifftshift dftmtx filter xcorr freqz
   unwrap` + `hamming hann blackman bartlett rectwin triang kaiser
   gausswin` windows.
-- Figures: `plot scatter stem bar area stairs errorbar histogram pie
-  imagesc contour contourf plot3 surf mesh quiver quiver3 streamline clustergram dendrogram venn
-  graph volcano heatmap` with `'r--o'` specs, `semilog*`/`loglog`,
-  `meshgrid`, `view`/`zlim`/`zlabel`, `colormap`/`colorbar`/`caxis`, `grid`
-  `box` `axis`, `saveas`/`exportgraphics`/`print` to **SVG/PNG/PDF**.
-- `.mat` v5 `load`/`save`: numeric, complex, sparse, char.
-- Numerical methods: `fzero fminsearch integral quad interp1 trapz
-  polyval polyfit roots conv deconv` (complex roots).
-- Automation: `matcraft-cli --cmd 'id {json}'` engine commands;
-  `matcraft-cli mcp` JSON-RPC; Studio `--control 7979` JSON-lines
-  (`engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`).
-- **MatCraft Studio** (`matcraft`): HOME/PLOTS/EDITOR/VIEW toolstrip,
-  command window (colored errors, history, tab-completion), workspace
-  inspector + variable editor, editor with MATLAB-style syntax colors and
-  F5/F9, figure dock with pan/zoom, current-folder browser.
+- FFI: `loadlibrary`/`calllib`/`libpointer` calls plain-C functions in
+  DLLs/shared objects.
+- Execution: tree-walk interpreter with bytecode-compiled loop bodies;
+  Cranelift JIT is the roadmap's next tier.
 
 ## Figures
 
@@ -87,12 +85,26 @@ figure dock and `exportgraphics` use:
 |---|---|---|---|
 | ![lines](docs/images/fig-lines.png) | ![surf](docs/images/fig-surf.png) | ![imshow](docs/images/fig-imshow.png) | ![bar](docs/images/fig-bar.png) |
 
+## Interfaces — pick your driver
+
+| Interface | What it gives you |
+| --- | --- |
+| `matcraft` Studio | HOME/PLOTS/EDITOR/VIEW ribbon, command window, workspace inspector, editor with signature hints, figure dock, debugger |
+| `matcraft-cli` | `run` / `eval` / `repl` / `functions` / `commands` / `--cmd` |
+| `matcraft-cli lsp` | LSP 3.17 for editors: diagnostics, completion, hover, symbols |
+| `matcraft-cli mcp` | MCP server (JSON-RPC stdio) for agents |
+| `--control PORT` | JSON-lines TCP channel: `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot` |
+| `matcraft-web` | WASM Studio shell |
+| SimCraft bridge | `sim.run`, `model.set_param`, `sim.check` engine commands |
+
 ## Getting started
 
 ```bash
 cargo run -p matcraft-cli -- run examples/solve.m   # run a script
 cargo run -p matcraft-cli -- eval "mean(1:100)"      # one-shot
 cargo run -p matcraft-cli -- repl                    # interactive
+cargo run -p matcraft-cli -- lsp                     # language server
+cargo run -p matcraft                                # the Studio
 ```
 
 ## Layout
@@ -108,7 +120,7 @@ cargo run -p matcraft-cli -- repl                    # interactive
 | `crates/lsp` | LSP 3.17 language server for `.m` files |
 | `crates/jupyter` | Jupyter kernel core (wire + semantics; ZMQ transport pending) |
 | `crates/ui-egui` | Studio UI: command window, workspace, editor, figure dock, control dispatch |
-| `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` |
+| `apps/matcraft-cli` | `run` / `eval` / `repl` / `functions` / `--cmd` / `mcp` / `lsp` |
 | `apps/matcraft` | MatCraft Studio (`--control PORT` for the JSON-lines channel) |
 | `docs/` | architecture, language reference, function dictionary |
 | `xtask` | `cargo xtask ci` — fmt, clippy, tests |
