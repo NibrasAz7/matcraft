@@ -20,7 +20,7 @@
   <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-orange?style=flat-square">
   <br>
   <a href="https://remade.wiki/projects/matcraft/"><img alt="Listed on Remade" src="https://remade.wiki/badges/listed-on-remade.svg"></a>
-  <a href="https://idmo.app/playground/matcraft"><img alt="Playground on idmo.app" src="https://idmo.app/badges/playground-matlab-dark.svg"></a>
+  <a href="https://playground.daijro.dev/head/matcraft/"><img alt="Try MatCraft in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-0e7fa8?style=flat-square"></a>
 </p>
 
 <br>
