@@ -35,9 +35,11 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#highlights">Highlights</a> ·
   <a href="#a-look-around">A look around</a> ·
+  <a href="#why-not-gnu-octave">Why not Octave</a> ·
   <a href="#the-interfaces">Interfaces</a> ·
   <a href="#the-layout">Layout</a> ·
   <a href="#whats-next">What's next</a> ·
+  <a href="#contributing">Contributing</a> ·
   <a href="#sibling-projects">Siblings</a> ·
   <a href="#license-and-assets">License</a>
 </p>
@@ -105,6 +107,17 @@ Every interface is headless-reachable: CLI, stdio LSP, newline JSON-RPC MCP, a T
 - **The language is real.** ~750-file public M-code corpus run as a live test target; `eig` returns complex eigenpairs, `A\b` does least-squares, `loadlibrary`/`calllib` reaches plain-C libraries.
 - **Figures are data.** The same `matplot` pipeline serves the Studio, the CLI (`saveas` → PNG/SVG/PDF) and SimCraft scopes.
 
+## Why not GNU Octave?
+
+GNU Octave is the established free M-code environment — for sheer toolbox breadth it remains the larger codebase. MatCraft is a different bet, built for people who want the language inside something else.
+
+- **A permissive core.** MIT OR Apache-2.0, not GPL — the engine can live inside commercial and proprietary software. SimCraft's simulator already rides on it.
+- **Parallel by default.** Large matrix multiplies run on a Rayon thread pool, with an optional `faer` backend and an opt-in `gpu` feature on wgpu — where Octave's interpreter loop is largely single-threaded.
+- **Agent-first interfaces.** MCP, a stdio LSP, a TCP control channel and a headless CLI are core surfaces; every user-visible behaviour is an engine command, so anything that can open a socket can drive a session.
+- **One portable core.** The same session powers the desktop Studio and the WASM web shell — and it even tolerates Octave dialect (`#` comments, `x += e`) where public documentation allows.
+
+MatCraft is pre-alpha: Octave's maturity and coverage are far ahead today. If you need a complete, battle-tested M-code environment now, use Octave. If you want a Rust-native engine you can embed, automate and audit end to end, this is the one to watch.
+
 ## The interfaces
 
 Every surface reaches the same engine session — drive it from wherever you work.
@@ -137,7 +150,13 @@ Every surface reaches the same engine session — drive it from wherever you wor
 
 ## What's next
 
-`ROADMAP.md` is the one-page summary: headline numbers, progress log, the honest compatibility story. `docs/gaps.md` ranks the remaining work — Cranelift JIT for loop hotspots, the Jupyter ZMQ transport, broader plotting/toolbox coverage.
+[`ROADMAP.md`](ROADMAP.md) is the one-page summary: headline numbers, progress log, the honest compatibility story. [`docs/gaps.md`](docs/gaps.md) ranks the remaining work — Cranelift JIT for loop hotspots, the Jupyter ZMQ transport, broader plotting/toolbox coverage.
+
+## Contributing
+
+MatCraft is early and the work list is public. A good first move is one of the starter-sized issues drafted in [`plan/community-issues.md`](plan/community-issues.md); open threads also live in the ranked gap list, [`docs/gaps.md`](docs/gaps.md), and the "further out" list in [`ROADMAP.md`](ROADMAP.md). Pull requests are welcome on GitHub.
+
+Two house rules from [`AGENTS.md`](AGENTS.md): everything stays clean-room — behaviour comes from public documentation and published papers, never a MATLAB install or copyleft code — and `cargo xtask ci` (fmt, clippy, tests, layers) is the gate before every commit.
 
 ## Sibling projects
 
