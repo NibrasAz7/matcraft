@@ -26,6 +26,7 @@
   <img alt="Written in Rust" src="https://img.shields.io/badge/written%20in-Rust-0e7fa8?style=flat-square&logo=rust&logoColor=white">
   <img alt="Runs on macOS, Windows, Linux and the web" src="https://img.shields.io/badge/runs%20on-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20web-0f4c81?style=flat-square">
   <img alt="Agent-drivable over MCP" src="https://img.shields.io/badge/agents-MCP%20%C2%B7%20LSP%20%C2%B7%20control-0e7fa8?style=flat-square">
+  <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-orange?style=flat-square">
   <br>
   <a href="https://remade.wiki/projects/matcraft/"><img alt="Listed on Remade" src="https://remade.wiki/badges/listed-on-remade.svg"></a>
   <a href="https://idmo.app/playground/matcraft"><img alt="Playground on idmo.app" src="https://idmo.app/badges/playground-matlab-dark.svg"></a>
@@ -54,10 +55,10 @@
 > games &mdash; if you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
 <p align="center">
+  <a href="#quick-start">Quick start</a> ·
   <a href="#highlights">Highlights</a> ·
   <a href="#a-look-around">A look around</a> ·
   <a href="#the-interfaces">Interfaces</a> ·
-  <a href="#quick-start">Quick start</a> ·
   <a href="#the-layout">Layout</a> ·
   <a href="#whats-next">What's next</a> ·
   <a href="#the-crafting-apps">The Crafting Apps</a> ·
@@ -75,6 +76,18 @@ MatCraft is part of [ArtCraft](https://getartcraft.com). Come say hello, get hel
 - **Sibling simulator:** [github.com/NibrasAz7/simcraft](https://github.com/NibrasAz7/simcraft) — Simulink-style models that run inside MatCraft.
 
 The ArtCraft name and logos in `docs/brand/` are trademarks of the ArtCraft Team and are not open source. They may be used only unmodified, and only as part of MatCraft (see `docs/brand/LICENSE-brand.txt`). Forks and modified versions must remove them.
+
+## Quick start
+
+```console
+cargo run -p matcraft-cli -- repl                    # interactive session
+cargo run -p matcraft-cli -- run examples/solve.m    # run a script
+cargo run -p matcraft-cli -- eval "A = [1 2; 3 4]; det(A)"
+#   ans = -2
+cargo run -p matcraft-cli -- functions               # the builtin library
+cargo run -p matcraft-cli -- lsp                     # stdio language server
+cargo run --release -p matcraft                      # the Studio (--control 7979 for TCP)
+```
 
 ## Highlights
 
@@ -130,17 +143,6 @@ Every surface reaches the same engine session — drive it from wherever you wor
 | MCP server         | newline-delimited JSON-RPC 2.0 on stdio — `execute`, `eval`, `run_script`, command listing, `matcraft://workspace`       |
 | Control channel    | TCP JSON-lines when the Studio runs with `--control` — `engine.execute`, `ui.state`, `ui.render`, `ui.screenshot`        |
 | SimCraft bridge    | `sim.run`, `sim.check`, `model.set_param` — block-diagram simulation inside your session, scopes land as matplot figures |
-
-## Quick start
-
-```console
-cargo run -p matcraft-cli -- repl                    # interactive session
-cargo run -p matcraft-cli -- run examples/solve.m    # run a script
-cargo run -p matcraft-cli -- eval "A = [1 2; 3 4]; det(A)"
-cargo run -p matcraft-cli -- functions               # the builtin library
-cargo run -p matcraft-cli -- lsp                     # stdio language server
-cargo run --release -p matcraft                      # the Studio (--control 7979 for TCP)
-```
 
 ## The layout
 
